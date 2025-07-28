@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  local-configurator:
+    build:
+      context: ./local-configurator
+      dockerfile: Dockerfile
+    container_name: local-configurator
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    env_file:
+      - .env
+    networks:
+      - nervctf-net
+
+  remote-monitor:
+    build:
+      context: ./remote-monitor
+      dockerfile: Dockerfile
+    container_name: remote-monitor
+    restart: unless-stopped
+    environment:
+      - RUST_LOG=info
+    env_file:
+      - .env
+    networks:
+      - nervctf-net
+
+networks:
+  nervctf-net:
+    driver: bridge

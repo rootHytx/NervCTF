@@ -1,0 +1,53 @@
+# .github/workflows/security.yml
+name: Security Audit
+on: [push, pull_request, schedule]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build submissions image
+        run: |
+          docker build -t submissions:test -f services/submissions/Dockerfile .
+
+      - name: Run unit tests in container
+        run: |
+          docker run --rm \
+            -e FLAG_CIPHER_KEY=testkey \
+            submissions:test \
+            cargo test -- --test-threads=1
+
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run vulnerability scan
+        run: |
+          docker run --rm \
+            -v ${PWD}:/app \
+            -w /app \
+            rust:1.73-slim-bookworm \
+            sh -c "cargo install cargo-audit && cargo audit --ignore RUSTSEC-2020-0071"
+
+      - name: Filter high-risk CVEs
+        run: |
+          docker run --rm \
+            -v ${PWD}:/app \
+            -w /app \
+            rust:1.73-slim-bookworm \
+            sh -c "cargo audit json > audit.json"
+
+          jq '[.vulnerabilities[] | select(.advisory.cvss >= 7.1)] | length' audit.json > count.txt
+          HIGH_CVE_COUNT=$(cat count.txt)
+          if [ "$HIGH_CVE_COUNT" -gt 0 ]; then
+            echo "::error::Found $HIGH_CVE_COUNT CVEs with CVSS >7.0"
+            exit 1
+          fi

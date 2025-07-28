@@ -1,12 +1,23 @@
+use bollard::container::{
+    Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
+};
 use bollard::image::BuildImageOptions;
 use bollard::Docker;
 use futures_util::stream::TryStreamExt;
+use std::env;
 use tar::Builder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load environment variables from .env file if present
+    dotenv::dotenv().ok();
+
+    // Get DOCKER_HOST from environment variable
+    let docker_host = env::var("DOCKER_HOST").expect("DOCKER_HOST environment variable not set");
+    let docker_url = format!("http://{}:2375", docker_host);
+
     // Connect to remote Docker daemon
-    let docker = Docker::connect_with_http("http://testctf:2375", 4, bollard::API_DEFAULT_VERSION)?;
+    let docker = Docker::connect_with_http(&docker_url, 4, bollard::API_DEFAULT_VERSION)?;
 
     // Create a tarball of your build context (e.g., ./remote-monitor)
     let mut archive = Vec::new();
@@ -21,11 +32,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use hyper::Body;
     let archive_stream = Body::wrap_stream(once(async move { Ok::<_, std::io::Error>(archive) }));
 
-    // Set build options
+    // Set build options (no cache)
     let build_opts = BuildImageOptions {
         dockerfile: "Dockerfile",
         t: "remote-monitor:latest",
         rm: true,
+        nocache: true,
         ..Default::default()
     };
 
@@ -39,5 +51,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Image built on remote Docker daemon!");
+
+    // Remove any existing container with the same name
+    let container_name = "remote-monitor";
+    let _ = docker
+        .remove_container(
+            container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+
+    // Create the container from the newly built image
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: container_name,
+                platform: None,
+            }),
+            Config {
+                image: Some("remote-monitor:latest"),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    // Start the container
+    docker
+        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .await?;
+
+    println!("Container 'remote-monitor' started on remote Docker daemon!");
+
     Ok(())
 }

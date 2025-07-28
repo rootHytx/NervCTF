@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     environment:
       - RUST_LOG=info
+      - DOCKER_HOST=TARGET_IP
     env_file:
       - .env
     networks:

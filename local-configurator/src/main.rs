@@ -1,25 +1,147 @@
 use bollard::container::{
-    Config, CreateContainerOptions, RemoveContainerOptions, StartContainerOptions,
+    Config, CreateContainerOptions, InspectContainerOptions, StartContainerOptions,
 };
 use bollard::image::BuildImageOptions;
 use bollard::Docker;
 use futures_util::stream::TryStreamExt;
+use hyper::{Body, Client, Method, Request};
+use serde::{Deserialize, Serialize};
+use serde_json;
+use serde_yaml;
 use std::env;
+use std::fs;
+use std::path::Path;
 use tar::Builder;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load environment variables from .env file if present
+    // Load environment variables
     dotenv::dotenv().ok();
-
-    // Get DOCKER_HOST from environment variable
     let docker_host = env::var("DOCKER_HOST").expect("DOCKER_HOST environment variable not set");
     let docker_url = format!("http://{}:2375", docker_host);
 
     // Connect to remote Docker daemon
     let docker = Docker::connect_with_http(&docker_url, 4, bollard::API_DEFAULT_VERSION)?;
 
-    // Create a tarball of your build context (e.g., ./remote-monitor)
+    // Check container status
+    let container_name = "remote-monitor";
+    match get_container_status(&docker, container_name).await? {
+        ContainerStatus::Running => println!("Container is already running"),
+        ContainerStatus::Stopped => {
+            println!("Starting existing container");
+            docker
+                .start_container(container_name, None::<StartContainerOptions<String>>)
+                .await?;
+        }
+        ContainerStatus::NotFound => {
+            println!("Container not found, deploying new instance");
+            deploy_remote_monitor(&docker).await?;
+        }
+    }
+
+    // Now that container is running, load and send challenge configuration
+    let config = load_config().await?;
+    send_configuration(&config).await?;
+
+    Ok(())
+}
+
+enum ContainerStatus {
+    Running,
+    Stopped,
+    NotFound,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Challenge {
+    name: String,
+    category: String,
+    description: String,
+    value: u32,
+    flags: Vec<String>,
+    files: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ChallengeConfig {
+    challenges: Vec<Challenge>,
+    ctfd_url: String,
+    ctfd_api_key: String,
+}
+
+async fn get_container_status(
+    docker: &Docker,
+    container_name: &str,
+) -> Result<ContainerStatus, Box<dyn std::error::Error>> {
+    // Try to inspect the container
+    match docker
+        .inspect_container(container_name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(container_info) => {
+            if container_info
+                .state
+                .as_ref()
+                .and_then(|s| s.running)
+                .unwrap_or(false)
+            {
+                Ok(ContainerStatus::Running)
+            } else {
+                Ok(ContainerStatus::Stopped)
+            }
+        }
+        Err(e) => {
+            if e.to_string().contains("No such container") {
+                Ok(ContainerStatus::NotFound)
+            } else {
+                Err(e.into())
+            }
+        }
+    }
+}
+
+async fn load_config() -> Result<ChallengeConfig, Box<dyn std::error::Error>> {
+    let config_path = "config.yml";
+    if !Path::new(config_path).exists() {
+        return Err("config.yml file not found in project root".into());
+    }
+
+    let config_content = fs::read_to_string(config_path)?;
+    let mut config: ChallengeConfig = serde_yaml::from_str(&config_content)?;
+
+    // Add CTFd credentials from environment
+    config.ctfd_url = env::var("CTFD_URL")?;
+    config.ctfd_api_key = env::var("CTFD_API_KEY")?;
+
+    Ok(config)
+}
+
+async fn send_configuration(config: &ChallengeConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::new();
+    let uri = "http://remote-monitor:8000/configure";
+    let body = serde_json::to_string(config)?;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(body))?;
+
+    let resp = client.request(req).await?;
+
+    if resp.status().is_success() {
+        println!("Configuration sent successfully to remote-monitor");
+    } else {
+        let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+        let body_str = String::from_utf8(body_bytes.to_vec())?;
+        return Err(format!("Failed to send configuration: {}", body_str).into());
+    }
+
+    Ok(())
+}
+
+async fn deploy_remote_monitor(docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
+    // Create tarball of build context
     let mut archive = Vec::new();
     {
         let mut tar = Builder::new(&mut archive);
@@ -27,12 +149,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tar.finish()?;
     }
 
-    // Convert Vec<u8> to a stream of bytes for hyper Body
+    // Convert to stream for hyper Body
     use futures_util::stream::once;
     use hyper::Body;
     let archive_stream = Body::wrap_stream(once(async move { Ok::<_, std::io::Error>(archive) }));
 
-    // Set build options (no cache)
+    // Build options (no cache)
     let build_opts = BuildImageOptions {
         dockerfile: "Dockerfile",
         t: "remote-monitor:latest",
@@ -41,34 +163,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // Build the image on the remote Docker daemon
+    // Build image on remote Docker daemon
     let mut build_stream = docker.build_image(build_opts, None, Some(archive_stream));
-
     while let Some(msg) = build_stream.try_next().await? {
         if let Some(stream) = msg.stream {
             print!("{}", stream);
         }
     }
-
     println!("Image built on remote Docker daemon!");
 
-    // Remove any existing container with the same name
-    let container_name = "remote-monitor";
-    let _ = docker
-        .remove_container(
-            container_name,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await;
-
-    // Create the container from the newly built image
+    // Create container from the built image
     docker
         .create_container(
             Some(CreateContainerOptions {
-                name: container_name,
+                name: "remote-monitor",
                 platform: None,
             }),
             Config {
@@ -80,10 +188,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the container
     docker
-        .start_container(container_name, None::<StartContainerOptions<String>>)
+        .start_container("remote-monitor", None::<StartContainerOptions<String>>)
         .await?;
 
     println!("Container 'remote-monitor' started on remote Docker daemon!");
-
     Ok(())
 }

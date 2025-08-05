@@ -19,11 +19,10 @@ COPY ./src ./src
 RUN rm ./target/release/deps/remote_monitor*
 RUN cargo build --release
 
-# our final base
-FROM rust:slim
-
-# copy the build artifact from the build stage
-COPY --from=build /remote-monitor/target/release/remote-monitor .
-
-# set the startup command to run your binary
-CMD ["./remote-monitor"]
+# Runtime stage
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir ctfcli
+COPY --from=build /remote-monitor/target/release/remote-monitor /usr/local/bin/
+CMD ["remote-monitor"]

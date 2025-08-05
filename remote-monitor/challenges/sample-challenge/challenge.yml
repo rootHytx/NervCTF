@@ -1,0 +1,26 @@
+name: Sample Challenge
+category: Misc
+description: |
+  This is a sample challenge created by the CTFd Configurator.
+  Try to find the flag in the provided file!
+
+  **Hint:** The flag is in the format `CTFd{...}`
+
+value: 100
+type: standard
+
+flags:
+  - type: static
+    content: CTFd{s4mpl3_fl4g_f0r_t3st1ng}
+    data: case_insensitive
+
+files:
+  - sample-file.txt
+
+tags:
+  - sample
+  - easy
+
+hints:
+  - content: Check the provided file carefully
+    cost: 10

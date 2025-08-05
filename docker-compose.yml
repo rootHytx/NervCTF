@@ -12,6 +12,9 @@ services:
       - DOCKER_HOST=TARGET_IP
     env_file:
       - .env
+    volumes:
+      - ./config.yml:/app/config.yml
+      - ./challenges:/app/challenges
     networks:
       - nervctf-net
 

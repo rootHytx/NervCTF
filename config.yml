@@ -1,0 +1,28 @@
+challenges:
+  - name: "Example Web Challenge"
+    category: "Web"
+    description: "Find the hidden flag in this web application"
+    value: 100
+    flags:
+      - "flag{example_flag_1}"
+    files:
+      - "challenges/web-challenge/app.py"
+      - "challenges/web-challenge/Dockerfile"
+
+  - name: "Crypto Challenge"
+    category: "Cryptography"
+    description: "Decrypt this message to find the flag"
+    value: 200
+    flags:
+      - "flag{crypto_example_flag}"
+    files:
+      - "challenges/crypto-challenge/encrypted.txt"
+
+  - name: "Forensics Challenge"
+    category: "Forensics"
+    description: "Analyze this disk image to find the flag"
+    value: 300
+    flags:
+      - "flag{forensics_example}"
+    files:
+      - "challenges/forensics-challenge/image.dd"

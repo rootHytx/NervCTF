@@ -51,6 +51,7 @@ else
     echo "User 'docker' does NOT exist on the target machine."
     echo "Creating user 'docker'..."
     ssh $TARGET_HOST "useradd -m docker -g docker && echo 'docker:docker' | chpasswd"
+    ssh $TARGET_HOST "usermod -s $(which bash) docker && echo 'TERM=xterm' >> /home/docker/.bashrc"
     if [ $? -eq 0 ]; then
         echo "User 'docker' created successfully."
     else

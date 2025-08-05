@@ -22,6 +22,9 @@ RUN cargo build --release
 # our final base
 FROM rust:slim
 
+# Set working directory
+WORKDIR /app
+
 # copy the build artifact from the build stage
 COPY --from=build /local-configurator/target/release/local-configurator .
 

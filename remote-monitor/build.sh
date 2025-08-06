@@ -1,5 +1,3 @@
-#!/bin/bash
-
 # Build the remote-monitor Docker image
 docker build -t remote-monitor .
 

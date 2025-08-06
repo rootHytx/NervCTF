@@ -1,0 +1,147 @@
+---
+- hosts: ctfd
+  become: yes
+  vars:
+    ansible_python_interpreter: /usr/bin/python3.12
+    docker_user: docker
+    ctfd_dir: /home/docker/CTFd
+    plugin_repo: https://github.com/iosifache/ctfd-solve-webhook-plugin.git
+    plugin_dir: /home/docker/CTFd/CTFd/plugins/solve_webhook
+    webhook_url: "https://your-remote-host.com/webhook-endpoint" # <-- Set your webhook URL here
+    vpn_ip: "10.0.0.1" # <-- Set your VPN IP here
+    ssh_pubkey_path: "/path/to/your/public/key.pub" # <-- Set your SSH public key path here
+
+  tasks:
+    - name: Ensure docker group exists
+      group:
+        name: docker
+        state: present
+      tags: [docker_group]
+
+    - name: Install Docker dependencies
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+      tags: [docker_dependencies]
+
+    - name: Add Docker's official GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+      tags: [docker_gpg]
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+      tags: [docker_repo]
+
+    - name: Install Docker Engine and Compose
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+      tags: [docker_install]
+
+    - name: Create docker user
+      user:
+        name: "{{ docker_user }}"
+        groups: docker
+        shell: /bin/bash
+        state: present
+        create_home: yes
+      tags: [docker_user]
+
+    - name: Set up SSH authorized_keys for docker user
+      authorized_key:
+        user: "{{ docker_user }}"
+        state: present
+        key: "{{ lookup('file', ssh_pubkey_path) }}"
+      tags: [docker_ssh]
+
+    - name: Ensure .bashrc TERM setting for docker user
+      lineinfile:
+        path: "/home/{{ docker_user }}/.bashrc"
+        line: "TERM=xterm"
+        create: yes
+        state: present
+      tags: [docker_bashrc]
+
+    - name: Clone CTFd
+      git:
+        repo: https://github.com/CTFd/CTFd.git
+        dest: "{{ ctfd_dir }}"
+        version: master
+        update: yes
+      become_user: "{{ docker_user }}"
+      tags: [ctfd_clone]
+
+    - name: Create plugins directory
+      file:
+        path: "{{ ctfd_dir }}/CTFd/plugins"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      tags: [ctfd_plugins_dir]
+
+    - name: Install webhook plugin
+      git:
+        repo: "{{ plugin_repo }}"
+        dest: "{{ plugin_dir }}"
+        version: master
+        update: yes
+      become_user: "{{ docker_user }}"
+      tags: [webhook_plugin]
+
+    - name: Configure webhook plugin
+      copy:
+        dest: "{{ plugin_dir }}/config.py"
+        content: |
+          import os
+          os.environ['WEBHOOK_URL'] = '{{ webhook_url }}'
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+      tags: [webhook_config]
+
+    - name: Ensure Docker systemd override directory exists
+      file:
+        path: /etc/systemd/system/docker.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      tags: [docker_systemd_dir]
+
+    - name: Place Docker systemd override for VPN exposure
+      copy:
+        dest: "/etc/systemd/system/docker.service.d/override.conf"
+        content: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/dockerd -H fd:// -H tcp://{{ vpn_ip }}:2375
+        owner: root
+        group: root
+        mode: "0644"
+      tags: [docker_systemd_override]
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+      tags: [systemd_reload]
+
+    - name: Restart Docker daemon
+      systemd:
+        name: docker
+        state: restarted
+      tags: [docker_restart]

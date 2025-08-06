@@ -1,5 +1,3 @@
-#!/bin/bash
-
 # Check if Docker is running
 if ! docker info >/dev/null 2>&1; then
     echo "Error: Docker daemon is not running"

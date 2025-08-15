@@ -1,198 +1,136 @@
-show_spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='|/-\'
-    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
-        local temp=${spinstr#?}
-        printf " [%c] %s  " "$spinstr" "$message"
-        spinstr=$temp${spinstr%"$temp"}
-        sleep $delay
-        printf "\r"
-    done
-    printf "    \r"
-}
-search_remote_keys(){
-    REMOTE_AUTH_KEYS="/home/docker/.ssh/authorized_keys"
+ENV_FILE="./.env"
+persist_vars=("TARGET_IP" "TARGET_USER" "SSH_PUBKEY_PATH" "CTFD_PATH")
 
-    # List your local public keys
-    mapfile -t pubkeys < <(ls ~/.ssh/*.pub 2>/dev/null)
-    if [ ${#pubkeys[@]} -eq 0 ]; then
-        echo "No public keys found in ~/.ssh/"
-        return 1
+echo "=============================================="
+echo " NervCTF Setup: Automated CTFd Environment"
+echo "----------------------------------------------"
+echo "This script will:"
+echo " - Set up NervCTF on a remote machine using Ansible"
+echo " - Install Docker, CTFd, and the solve webhook plugin"
+echo " - Configure SSH access for the deployment user"
+echo
+echo "=============================================="
+echo
+
+# Source .env if it exists
+if [[ -f "$ENV_FILE" ]]; then
+    export $(grep -v '^#' "$ENV_FILE" | xargs)
+else
+    echo "No .env file found in the current directory."
+    echo "Creating a new .env file."
+    touch "$ENV_FILE"
+fi
+
+missing_vars=()
+for var in "${persist_vars[@]}"; do
+    if [[ -z "${!var}" ]]; then
+        missing_vars+=("$var")
     fi
+done
 
-    # Check if any local key is present on the remote
-    key_found=false
-    for keyfile in "${pubkeys[@]}"; do
-        key_content=$(cat "$keyfile")
-        # Use grep on the remote authorized_keys
-        ssh "$TARGET_HOST" "grep -Fxq '$key_content' $REMOTE_AUTH_KEYS" && key_found=true && break
-    done
+persist_all=""
+if [[ ${#missing_vars[@]} -eq 0 ]]; then
+    echo "All required environment variables are present. Proceeding with setup using current configuration..."
+    all_in_env=true
+    persist_all="n"
+else
+    all_in_env=false
+fi
 
-    if $key_found; then
-        echo "One of your public keys is already present on the remote machine. Skipping key addition."
-        return 0
-    else
-        echo "No matching public key found on the remote machine."
-        return 1
-    fi
+# Only ask about persisting if not all are present
+if ! $all_in_env; then
+    read -p "Do you want to persist all variables you enter to $ENV_FILE for future runs? (y/n): " persist_all
+fi
 
-}
-search_remote_ctfd() {
-    # Parse results: only keep directories that have a nested CTFd
-    mapfile -t ctfd_paths < <(
-        ssh "$TARGET_HOST" '
-            tmpfile=$(mktemp)
-            find / -type d -name "CTFd" 2>/dev/null > "$tmpfile"
-            while IFS= read -r parent_dir; do
-                if [ -d "$parent_dir/CTFd" ]; then
-                    echo "$parent_dir" > ctfd_dir
-                fi
-            done < "$tmpfile"
-            rm "$tmpfile"
-        '
-    ) &
-    find_pid=$!
-    show_spinner $find_pid "Searching for CTFd folders..."
-    wait $find_pid
-    scp $TARGET_HOST:ctfd_dir . 2>/dev/null
-    mapfile -t ctfd_paths < ctfd_dir
-    rm ctfd_dir
-    ssh $TARGET_HOST "rm -f ctfd_dir"
-    if [ ${#ctfd_paths[@]} -eq 0 ]; then
-        echo "No matching CTFd directories found on remote."
-        return 1
-    fi
-
-    echo "Select the CTFd directory you want to use (on remote):"
-    for i in "${!ctfd_paths[@]}"; do
-        echo "$((i+1)). ${ctfd_paths[$i]}"
-    done
-
-    read -p "Enter the number of your choice: " choice
-
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#ctfd_paths[@]}" ]; then
-        CTFD_DIR="${ctfd_paths[$((choice-1))]}"
-        export CTFD_DIR
-        return 0
-    else
-        echo "Invalid selection."
-        return 1
-    fi
-}
-
-echo "This script is intended to use BEFORE using NervCTF"
-echo "It will go through a multi-stage process installing the necessary components to run NervCTF on a remote machine."
-
-read -p "Enter your target machine IP address: " TARGET_IP
+# Only prompt for TARGET_IP if not already set
 if [ -z "$TARGET_IP" ]; then
-    echo "TARGET_IP is not set. Please set it to the target machine's IP address."
-    exit 1
+    read -p "Enter target machine IP address: " TARGET_IP
+else
+    echo "Using existing TARGET_IP: $TARGET_IP"
 fi
+[ -z "$TARGET_IP" ] && { echo "IP address required"; exit 1; }
 
-read -p "What remote user do you have sudo access on? (Empty for 'root') " TARGET_USER
+# Only prompt for TARGET_USER if not already set
 if [ -z "$TARGET_USER" ]; then
-    TARGET_USER="root"
-fi
-TARGET_HOST="${TARGET_USER}@${TARGET_IP}"
-
-# Generate a temporary inventory file
-INVENTORY=$(mktemp)
-echo "[ctfd]" > "$INVENTORY"
-echo "$TARGET_IP ansible_user=$TARGET_USER" >> "$INVENTORY"
-
-PLAYBOOK="./scripts/nervctf_playbook.yml"
-
-# 1) Docker group and install
-ssh $TARGET_HOST "getent group docker &>/dev/null"
-if [ $? -eq 0 ]; then
-    echo "Docker group exists on $TARGET_HOST."
+    read -p "Remote sudo user (default: root): " TARGET_USER
+    TARGET_USER=${TARGET_USER:-root}
 else
-    echo "Docker group does NOT exist. Running Ansible docker_group, docker_dependencies, docker_gpg, docker_repo, docker_install tasks..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "docker_group,docker_dependencies,docker_gpg,docker_repo,docker_install"
+    echo "Using existing TARGET_USER: $TARGET_USER"
 fi
 
-# 2) Docker user
-ssh $TARGET_HOST "id -u docker &>/dev/null"
-if [ $? -eq 0 ]; then
-    echo "User 'docker' exists on $TARGET_HOST."
-else
-    echo "User 'docker' does NOT exist. Running Ansible docker_user task..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "docker_user"
-fi
+TARGET_HOST="$TARGET_USER@$TARGET_IP"
 
-# 3) SSH key for docker user
-search_remote_keys
-if [ $? -eq 0 ]; then
-    echo "SSH key already exists for docker user."
-else
-    ssh $TARGET_HOST "test -f /home/docker/.ssh/authorized_keys"
-    if [ $? -eq 0 ]; then
-        echo "SSH authorized_keys exists for docker user."
-    else
-        echo "No SSH authorized_keys for docker user. Running Ansible docker_ssh task..."
-        ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "docker_ssh"
+# Only prompt for CTFD_PATH if not already set
+if [ -z "$CTFD_PATH" ]; then
+    read -p "Is CTFd already installed? (y/n): " CTFD_INSTALLED
+    CTFD_INSTALLED=${CTFD_INSTALLED,,}  # convert to lowercase
+    if [[ $CTFD_INSTALLED == "y" || $CTFD_INSTALLED == "yes" ]]; then
+        read -p "Enter the full path to the CTFd directory: " CTFD_PATH
     fi
-fi
-
-
-# 4) .bashrc TERM setting
-ssh $TARGET_HOST "grep -q 'TERM=xterm' /home/docker/.bashrc"
-if [ $? -eq 0 ]; then
-    echo "TERM=xterm already set in .bashrc."
 else
-    echo "Setting TERM=xterm in .bashrc. Running Ansible docker_bashrc task..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "docker_bashrc"
+    echo "Using existing CTFD_PATH: $CTFD_PATH"
 fi
 
-# 5) Docker systemd override
-ssh $TARGET_HOST "test -f /etc/systemd/system/docker.service.d/override.conf"
-if [ $? -eq 0 ]; then
-    echo "Docker systemd override already exists."
+CTFD_PATH="${CTFD_PATH:-}"
+
+# SSH key selection
+if [ -z "$SSH_PUBKEY_PATH" ]; then
+    echo
+    echo "Available SSH public keys in ~/.ssh:"
+    pubkeys=()
+    i=1
+    for keyfile in ~/.ssh/*.pub; do
+        [ -e "$keyfile" ] || continue
+        echo "  [$i] $keyfile"
+        pubkeys+=("$keyfile")
+        i=$((i+1))
+    done
+
+    if [ ${#pubkeys[@]} -eq 0 ]; then
+        echo "No existing SSH public keys found in ~/.ssh."
+        read -p "Do you want to generate a new SSH key? (y/n): " generate
+        generate=${generate,,}  # convert to lowercase
+        if [[ "$generate" =~ ^[Yy]$ ]]; then
+            ssh-keygen -t rsa -b 4096 -f ~/.ssh/nervctf_ansible_id_rsa -N ""
+            SSH_PUBKEY_PATH="$HOME/.ssh/nervctf_ansible_id_rsa.pub"
+        else
+            echo "No SSH key selected. Exiting."
+            exit 1
+        fi
+    else
+        read -p "Enter the number of the key to use, or type 'new' to generate a new key: " key_choice
+        if [[ "$key_choice" == "new" ]]; then
+            ssh-keygen -t rsa -b 4096 -f ~/.ssh/nervctf_ansible_id_rsa -N ""
+            SSH_PUBKEY_PATH="$HOME/.ssh/nervctf_ansible_id_rsa.pub"
+        elif [[ "$key_choice" =~ ^[0-9]+$ ]] && [ "$key_choice" -ge 1 ] && [ "$key_choice" -le "${#pubkeys[@]}" ]; then
+            SSH_PUBKEY_PATH="${pubkeys[$((key_choice-1))]}"
+        else
+            echo "Invalid choice. Exiting."
+            exit 1
+        fi
+    fi
 else
-    echo "Placing Docker systemd override. Running Ansible docker_systemd_dir,docker_systemd_override tasks..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "docker_systemd_dir,docker_systemd_override"
-    echo "Reloading and restarting Docker daemon. Running Ansible systemd_reload,docker_restart tasks..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "systemd_reload,docker_restart"
+    echo "Using existing SSH public key: $SSH_PUBKEY_PATH"
 fi
 
-# 6) CTFd install
-echo "Searching for existing CTFd directories on the remote machine..."
-search_remote_ctfd
-if [ $? -ne 0 ]; then
-    echo "No CTFd directory found. Installing CTFd on remote host..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "ctfd_clone"
-    echo "CTFd installation complete."
+# Persist variables if user agreed
+if [[ "$persist_all" =~ ^[Yy]$ ]]; then
+    # Only add if not already present
+    for var in "${missing_vars[@]}"; do
+        echo "$var=${!var}" >> "$ENV_FILE"
+    done
+    echo "Variable(s) persisted to $ENV_FILE."
 fi
 
-# 7) Plugins directory
-ssh $TARGET_HOST "test -d $CTFD_DIR/CTFd/plugins"
-if [ $? -eq 0 ]; then
-    echo "CTFd plugins directory exists."
-else
-    echo "Creating plugins directory. Running Ansible ctfd_plugins_dir task..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "ctfd_plugins_dir"
-fi
+INVENTORY=$(mktemp)
+cat <<EOF > "$INVENTORY"
+[ctfd]
+$TARGET_IP ansible_user=$TARGET_USER
+EOF
 
-# 8) Webhook plugin
-ssh $TARGET_HOST "test -d $CTFD_DIR/CTFd/plugins/solve_webhook"
-if [ $? -eq 0 ]; then
-    echo "Webhook plugin already installed."
-else
-    echo "Installing webhook plugin. Running Ansible webhook_plugin task..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "webhook_plugin"
-fi
+extra_vars="ssh_key=$SSH_PUBKEY_PATH ctfd_path=$CTFD_PATH"
 
-# 9) Webhook plugin config
-ssh $TARGET_HOST "test -f $CTFD_DIR/CTFd/plugins/solve_webhook/config.py"
-if [ $? -eq 0 ]; then
-    echo "Webhook plugin config already exists."
-else
-    echo "Configuring webhook plugin. Running Ansible webhook_config task..."
-    ansible-playbook -i "$INVENTORY" "$PLAYBOOK" --tags "webhook_config"
-fi
+ansible-playbook -i "$INVENTORY" ./utils/nervctf_playbook.yml --extra-vars "$extra_vars"
 
-echo "NervCTF setup complete!"
-
-# Clean up temporary inventory file
 rm "$INVENTORY"
+echo "NervCTF setup complete!"

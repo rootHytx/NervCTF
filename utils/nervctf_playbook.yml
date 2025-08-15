@@ -4,19 +4,32 @@
   vars:
     ansible_python_interpreter: /usr/bin/python3.12
     docker_user: docker
-    ctfd_dir: /home/docker/CTFd
+    #ctfd_path: "{{ lookup('env', 'CTFD_PATH') }}"
     plugin_repo: https://github.com/iosifache/ctfd-solve-webhook-plugin.git
-    plugin_dir: /home/docker/CTFd/CTFd/plugins/solve_webhook
-    webhook_url: "https://your-remote-host.com/webhook-endpoint" # <-- Set your webhook URL here
-    vpn_ip: "10.0.0.1" # <-- Set your VPN IP here
-    ssh_pubkey_path: "/path/to/your/public/key.pub" # <-- Set your SSH public key path here
+    vpn_ip: "{{ ansible_host }}"
+    webhook_url: "http://{{ ansible_host }}/webhook-endpoint"
+    #ssh_key: "{{ lookup('env', 'SSH_PUBKEY_PATH') }}"
+    remote_auth_keys: "/home/{{ docker_user }}/.ssh/authorized_keys"
+
+  handlers:
+    - name: reload systemd
+      systemd:
+        daemon_reload: yes
+      listen: "systemd reload"
+
+    - name: restart docker
+      systemd:
+        name: docker
+        state: restarted
+      listen: "restart docker"
 
   tasks:
-    - name: Ensure docker group exists
-      group:
-        name: docker
-        state: present
-      tags: [docker_group]
+    # Docker installation tasks
+    - name: Check if Docker group exists
+      command: grep -q docker /etc/group
+      register: docker_group_exists
+      changed_when: false
+      ignore_errors: yes
 
     - name: Install Docker dependencies
       apt:
@@ -27,18 +40,21 @@
           - lsb-release
         state: present
         update_cache: yes
+      when: not docker_group_exists.rc == 0
       tags: [docker_dependencies]
 
     - name: Add Docker's official GPG key
       apt_key:
         url: https://download.docker.com/linux/ubuntu/gpg
         state: present
+      when: not docker_group_exists.rc == 0
       tags: [docker_gpg]
 
     - name: Add Docker repository
       apt_repository:
         repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
         state: present
+      when: not docker_group_exists.rc == 0
       tags: [docker_repo]
 
     - name: Install Docker Engine and Compose
@@ -50,7 +66,22 @@
           - docker-compose-plugin
         state: present
         update_cache: yes
+      when: not docker_group_exists.rc == 0
       tags: [docker_install]
+
+    - name: Ensure docker group exists
+      group:
+        name: docker
+        state: present
+      when: not docker_group_exists.rc == 0
+      tags: [docker_group]
+
+    # Docker user tasks
+    - name: Check if docker user exists
+      command: id -u {{ docker_user }}
+      register: docker_user_exists
+      changed_when: false
+      ignore_errors: yes
 
     - name: Create docker user
       user:
@@ -59,14 +90,38 @@
         shell: /bin/bash
         state: present
         create_home: yes
+      when: docker_user_exists.rc != 0
       tags: [docker_user]
 
-    - name: Set up SSH authorized_keys for docker user
+    # SSH key tasks
+    # Gather the contents of the remote authorized_keys file
+    - name: Read remote authorized_keys file
+      slurp:
+        src: "{{ remote_auth_keys }}"
+      register: remote_auth_keys_content
+      ignore_errors: yes
+
+    # Check if the selected key is already present
+    - name: Check if selected key is present in remote authorized_keys
+      set_fact:
+        key_already_present: "{{ (remote_auth_keys_content.content | b64decode).split('\n') | select('equalto', (lookup('file', ssh_key) | trim)) | list | length > 0 }}"
+      when: remote_auth_keys_content is defined and remote_auth_keys_content.content is defined
+
+    # Add the key only if not present
+    - name: Add selected SSH public key to remote authorized_keys if missing
       authorized_key:
         user: "{{ docker_user }}"
         state: present
-        key: "{{ lookup('file', ssh_pubkey_path) }}"
+        key: "{{ lookup('file', ssh_key) }}"
+      when: not (key_already_present | default(false))
       tags: [docker_ssh]
+
+    # Terminal configuration
+    - name: Check if TERM is set in .bashrc
+      command: grep -q 'TERM=xterm' /home/{{ docker_user }}/.bashrc
+      register: term_set
+      changed_when: false
+      ignore_errors: yes
 
     - name: Ensure .bashrc TERM setting for docker user
       lineinfile:
@@ -74,45 +129,15 @@
         line: "TERM=xterm"
         create: yes
         state: present
+      when: term_set.rc != 0
       tags: [docker_bashrc]
 
-    - name: Clone CTFd
-      git:
-        repo: https://github.com/CTFd/CTFd.git
-        dest: "{{ ctfd_dir }}"
-        version: master
-        update: yes
-      become_user: "{{ docker_user }}"
-      tags: [ctfd_clone]
-
-    - name: Create plugins directory
-      file:
-        path: "{{ ctfd_dir }}/CTFd/plugins"
-        state: directory
-        owner: "{{ docker_user }}"
-        group: docker
-        mode: "0755"
-      tags: [ctfd_plugins_dir]
-
-    - name: Install webhook plugin
-      git:
-        repo: "{{ plugin_repo }}"
-        dest: "{{ plugin_dir }}"
-        version: master
-        update: yes
-      become_user: "{{ docker_user }}"
-      tags: [webhook_plugin]
-
-    - name: Configure webhook plugin
-      copy:
-        dest: "{{ plugin_dir }}/config.py"
-        content: |
-          import os
-          os.environ['WEBHOOK_URL'] = '{{ webhook_url }}'
-        owner: "{{ docker_user }}"
-        group: docker
-        mode: "0644"
-      tags: [webhook_config]
+    # Docker systemd configuration
+    - name: Check if Docker systemd override directory exists
+      stat:
+        path: /etc/systemd/system/docker.service.d
+      register: systemd_override_dir
+      tags: [docker_systemd_dir]
 
     - name: Ensure Docker systemd override directory exists
       file:
@@ -121,27 +146,115 @@
         owner: root
         group: root
         mode: "0755"
+      when: not systemd_override_dir.stat.exists
       tags: [docker_systemd_dir]
+
+    - name: Check Docker systemd override content
+      command: cat /etc/systemd/system/docker.service.d/override.conf
+      register: systemd_override_content
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Set expected Docker systemd override content
+      set_fact:
+        expected_docker_override: |
+          [Service]
+          ExecStart=
+          ExecStart=/usr/bin/dockerd -H fd:// -H tcp://{{ vpn_ip }}:2375
 
     - name: Place Docker systemd override for VPN exposure
       copy:
         dest: "/etc/systemd/system/docker.service.d/override.conf"
-        content: |
-          [Service]
-          ExecStart=
-          ExecStart=/usr/bin/dockerd -H fd:// -H tcp://{{ vpn_ip }}:2375
+        content: "{{ expected_docker_override }}"
         owner: root
         group: root
         mode: "0644"
+      notify:
+        - reload systemd
+        - restart docker
+      when: systemd_override_content is failed or systemd_override_content.stdout != expected_docker_override
       tags: [docker_systemd_override]
 
-    - name: Reload systemd daemon
-      systemd:
-        daemon_reload: yes
-      tags: [systemd_reload]
+    # CTFd installation tasks
+    - name: Check if CTFd directory is valid
+      stat:
+        path: "{{ ctfd_path }}/requirements.txt"
+      register: ctfd_valid
+      tags: [ctfd_check]
 
-    - name: Restart Docker daemon
-      systemd:
-        name: docker
-        state: restarted
-      tags: [docker_restart]
+    - name: Clone CTFd
+      git:
+        repo: https://github.com/CTFd/CTFd.git
+        dest: "{{ ctfd_path }}"
+        version: master
+      become_user: "{{ docker_user }}"
+      when: not ctfd_valid.stat.exists
+      tags: [ctfd_clone]
+
+    - name: Set plugin directory
+      set_fact:
+        plugin_dir: "{{ ctfd_path }}/CTFd/plugins/solve-webhook-plugin"
+      tags: [plugin_setup]
+
+    - name: Check if plugins directory exists
+      stat:
+        path: "{{ ctfd_path }}/CTFd/plugins"
+      register: plugins_dir_exists
+      tags: [ctfd_plugins_dir]
+
+    - name: Create plugins directory
+      file:
+        path: "{{ ctfd_path }}/CTFd/plugins"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: not plugins_dir_exists.stat.exists
+      tags: [ctfd_plugins_dir]
+
+    # Webhook plugin tasks
+    - name: Check if webhook plugin exists
+      stat:
+        path: "{{ plugin_dir }}"
+      register: webhook_plugin_stat
+      tags: [webhook_check]
+
+    - name: Install webhook plugin
+      block:
+        - name: Clone webhook plugin
+          git:
+            repo: "{{ plugin_repo }}"
+            dest: "{{ ctfd_path }}/CTFd/plugins/solve_webhook"
+            version: main
+          become_user: "{{ docker_user }}"
+          when: not webhook_plugin_stat.stat.exists
+          tags: [webhook_plugin]
+
+        - name: Move plugin to correct location
+          command: "mv {{ ctfd_path }}/CTFd/plugins/solve_webhook/solve-webhook-plugin {{ plugin_dir }}"
+          become_user: "{{ docker_user }}"
+
+        - name: Remove parent plugin directory
+          file:
+            path: "{{ ctfd_path }}/CTFd/plugins/solve_webhook"
+            state: absent
+      when: not webhook_plugin_stat.stat.exists
+
+    - name: Add webhook environment variables to .bashrc
+      blockinfile:
+        path: "/home/{{ docker_user }}/.bashrc"
+        block: |
+          SOLVE_WEBHOOK_URL={{ webhook_url }}
+          SOLVE_WEBHOOK_LIMIT=3
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - Webhook variables"
+        insertafter: EOF
+        create: yes
+      when: not webhook_plugin_stat.stat.exists
+      tags: [webhook_config]
+
+    - name: Start CTFd Docker containers
+      command: docker compose up -d --build
+      args:
+        chdir: "{{ ctfd_path }}"
+      become_user: "{{ docker_user }}"
+      tags: [ctfd_start]

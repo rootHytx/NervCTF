@@ -3,6 +3,7 @@ use bollard::container::{
 };
 use bollard::image::BuildImageOptions;
 use bollard::Docker;
+use clap::{Parser, Subcommand};
 use futures_util::stream::TryStreamExt;
 use hyper::{Body, Client, Method, Request};
 use serde::{Deserialize, Serialize};
@@ -13,35 +14,82 @@ use std::fs;
 use std::path::Path;
 use tar::Builder;
 
+mod challenge_manager;
+use challenge_manager::{ChallengeManager, ChallengeOperation};
+
+#[derive(Parser)]
+#[command(name = "local-configurator")]
+#[command(about = "NervCTF Local Configurator", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Manage CTF challenges
+    Challenges {
+        #[command(subcommand)]
+        operation: ChallengeOperation,
+        /// Path to the root directory containing challenges
+        #[arg(short, long, default_value = "./challenges")]
+        path: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load environment variables
-    dotenv::dotenv().ok();
-    let docker_host = env::var("DOCKER_HOST").expect("DOCKER_HOST environment variable not set");
-    let docker_url = format!("http://{}:2375", docker_host);
+    let cli = Cli::parse();
 
-    // Connect to remote Docker daemon
-    let docker = Docker::connect_with_http(&docker_url, 4, bollard::API_DEFAULT_VERSION)?;
-
-    // Check container status
-    let container_name = "remote-monitor";
-    match get_container_status(&docker, container_name).await? {
-        ContainerStatus::Running => println!("Container is already running"),
-        ContainerStatus::Stopped => {
-            println!("Starting existing container");
-            docker
-                .start_container(container_name, None::<StartContainerOptions<String>>)
-                .await?;
+    match cli.command {
+        Some(Commands::Challenges { operation, path }) => {
+            let manager = ChallengeManager::new(&path);
+            match manager.execute_operation(operation) {
+                Ok(_) => (),
+                Err(e) => eprintln!("Error processing challenges: {}", e),
+            }
         }
-        ContainerStatus::NotFound => {
-            println!("Container not found, deploying new instance");
-            deploy_remote_monitor(&docker).await?;
+        None => {
+            // Load environment variables
+            dotenv::dotenv().ok();
+            let docker_host =
+                env::var("DOCKER_HOST").expect("DOCKER_HOST environment variable not set");
+            let docker_url = format!("http://{}:2375", docker_host);
+
+            // Connect to remote Docker daemon
+            let docker =
+                match Docker::connect_with_http(&docker_url, 4, bollard::API_DEFAULT_VERSION) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!(
+                            "Failed to connect to Docker daemon at {}: {}",
+                            docker_url, e
+                        );
+                        return Ok(());
+                    }
+                };
+
+            // Check container status
+            let container_name = "remote-monitor";
+            match get_container_status(&docker, container_name).await? {
+                ContainerStatus::Running => println!("Container is already running"),
+                ContainerStatus::Stopped => {
+                    println!("Starting existing container");
+                    docker
+                        .start_container(container_name, None::<StartContainerOptions<String>>)
+                        .await?;
+                }
+                ContainerStatus::NotFound => {
+                    println!("Container not found, deploying new instance");
+                    deploy_remote_monitor(&docker).await?;
+                }
+            }
+
+            // Now that container is running, load and send challenge configuration
+            let config = load_config().await?;
+            send_configuration(&config).await?;
         }
     }
-
-    // Now that container is running, load and send challenge configuration
-    let config = load_config().await?;
-    send_configuration(&config).await?;
 
     Ok(())
 }

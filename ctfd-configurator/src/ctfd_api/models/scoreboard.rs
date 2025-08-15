@@ -2,11 +2,11 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct ScoreboardEntry {
-    pub pos: u32,
-    pub account_id: u32,
-    pub account_url: String,
-    pub account_name: String,
-    pub score: u32,
+    pub pos: Option<u32>,
+    pub account_id: Option<u32>,
+    pub account_url: Option<String>,
+    pub account_name: Option<String>,
+    pub score: Option<u32>,
     pub solves: Option<u32>,
     pub member_count: Option<u32>,
     pub team_id: Option<u32>,
@@ -15,14 +15,14 @@ pub struct ScoreboardEntry {
 
 #[derive(Debug, Deserialize)]
 pub struct ScoreboardGraph {
-    pub labels: Vec<String>,
-    pub datasets: Vec<ScoreboardDataset>,
+    pub labels: Option<Vec<String>>,
+    pub datasets: Option<Vec<ScoreboardDataset>>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ScoreboardDataset {
-    pub label: String,
-    pub data: Vec<u32>,
+    pub label: Option<String>,
+    pub data: Option<Vec<u32>>,
     pub border_color: Option<String>,
     pub background_color: Option<String>,
     pub fill: Option<bool>,

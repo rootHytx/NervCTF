@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct Tag {
-    pub id: u32,
+    pub id: Option<u32>,
     pub challenge_id: Option<u32>,
-    pub value: String,
+    pub value: Option<String>,
     pub created: Option<String>,
     pub modified: Option<String>,
 }
@@ -12,7 +12,7 @@ pub struct Tag {
 #[derive(Debug, Serialize)]
 pub struct TagCreate {
     pub challenge_id: Option<u32>,
-    pub value: String,
+    pub value: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

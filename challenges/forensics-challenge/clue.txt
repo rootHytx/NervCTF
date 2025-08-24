@@ -1,1 +1,0 @@
-Examine the disk image carefully. The flag might be in a hidden or deleted file.

@@ -108,7 +108,7 @@ impl CtfdClient {
         body: Option<&B>,
     ) -> Result<Option<T>> {
         let response = self.request(method.clone(), endpoint, body).await?;
-        if method == Method::GET {
+        if method != Method::DELETE {
             let parsed = Self::parse_response(response).await?;
             Ok(Some(parsed))
         } else {

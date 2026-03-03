@@ -2,7 +2,7 @@
 //! Provides comprehensive challenge management functionality including CRUD operations,
 //! synchronization, and local file system management for CTFd challenges.
 
-use crate::ctfd_api::models::{Challenge, FlagContent, Tag};
+use crate::ctfd_api::models::{Challenge, FlagContent, HintContent, Tag};
 use crate::ctfd_api::{CtfdClient, RequirementsQueue};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
@@ -56,8 +56,9 @@ impl ChallengeManager {
 
     pub fn generate_requirements_list(&mut self, challenges: Vec<Challenge>) {
         for chall in challenges {
-            if let Some(reqs) = chall.requirements {
-                self.requirements_queue.add(chall.name.clone(), reqs);
+            if let Some(reqs) = &chall.requirements {
+                self.requirements_queue
+                    .add(chall.name.clone(), reqs.prerequisite_names());
             }
         }
     }
@@ -78,7 +79,7 @@ impl ChallengeManager {
 
     /// Update an existing challenge
     pub async fn update_challenge(&self, id: u32, config: &Challenge) -> Result<Option<Challenge>> {
-        // Update: challenge
+        // Update: challenge core
         let challenge_data = json!({
             "name": config.name,
             "category": config.category,
@@ -95,21 +96,18 @@ impl ChallengeManager {
             .find(|c| c.name == config.name)
             .and_then(|c| c.id)
             .unwrap();
-        // Update: challenge
-        //
+
         // Update: flags
         let installed_flags = self
             .client
             .get_challenge_flags_endpoint(challenge_id)
             .await?
             .unwrap();
-        // Delete existing flags
         for flag in installed_flags.as_array().unwrap() {
             if let Some(flag_id) = flag.get("id").and_then(Value::as_u64) {
                 self.client.delete_flag(flag_id as u32).await?;
             }
         }
-        // Update: flags
         if let Some(flags) = &config.flags {
             for flag in flags {
                 match flag {
@@ -117,6 +115,7 @@ impl ChallengeManager {
                         let flag_data = json!({
                             "content": content,
                             "type": "static",
+                            "data": "",
                             "challenge_id": challenge_id,
                         });
                         self.client.create_flag(&flag_data).await?;
@@ -131,7 +130,7 @@ impl ChallengeManager {
                         let flag_data = json!({
                             "content": content,
                             "type": format!("{:?}", type_).to_lowercase(),
-                            "data": format!("{:?}", data).to_lowercase(),
+                            "data": data.as_ref().map(|d| format!("{:?}", d).to_lowercase()).unwrap_or_default(),
                             "challenge_id": challenge_id,
                         });
                         self.client.create_flag(&flag_data).await?;
@@ -139,22 +138,18 @@ impl ChallengeManager {
                 }
             }
         };
-        // Update: flags
-        //
+
         // Update: tags
-        // Get existing tags
         let installed_tags = self
             .client
             .get_challenge_tags_endpoint(challenge_id)
             .await?
             .unwrap();
-        // Delete existing tags
         for tag in installed_tags.as_array().unwrap() {
             if let Some(tag_id) = tag.get("id").and_then(Value::as_u64) {
                 self.client.delete_tag(tag_id as u32).await?;
             }
         }
-        // Update: tags
         if let Some(tags) = &config.tags {
             for tag in tags {
                 match tag {
@@ -179,28 +174,21 @@ impl ChallengeManager {
                 }
             }
         };
-        // Update: tags
-        //
+
         // Update: files
-        // Get existing files
         let installed_files = self
             .client
             .get_challenge_files_endpoint(challenge_id)
             .await?
             .unwrap();
-        // Delete existing files
         for file in installed_files.as_array().unwrap() {
             if let Some(file_id) = file.get("id").and_then(Value::as_u64) {
                 self.client.delete_file(file_id as u32).await?;
             }
         }
-        // Update: files
         if let Some(files) = &config.files {
             for file in files {
                 let file_path = Path::new(config.source_path.as_str()).join(&file.clone());
-                /*if !file_path.exists() {
-                    return Err(anyhow!("File not found: {}", file_path.display()));
-                };*/
                 let form = reqwest::blocking::multipart::Form::new()
                     .text("challenge_id", challenge_id.to_string())
                     .text("type", "challenge")
@@ -208,36 +196,38 @@ impl ChallengeManager {
                 self.client.create_file(form).await?;
             }
         };
-        // Update: files
-        //
-        // Update: hints
-        // Get existing hints
+
+        // Update: hints — Bug 4 fix: "value" → "cost" + handle HintContent variants
         let installed_hints = self
             .client
             .get_challenge_hints_endpoint(challenge_id)
             .await?
             .unwrap();
-        // Delete existing hints
         for hint in installed_hints.as_array().unwrap() {
             if let Some(hint_id) = hint.get("id").and_then(Value::as_u64) {
                 self.client.delete_hint(hint_id as u32).await?;
             }
         }
-        // Update: hints
         if let Some(hints) = &config.hints {
             for hint in hints {
+                let (content, cost) = match hint {
+                    HintContent::Simple(s) => (s.as_str(), 0u32),
+                    HintContent::Detailed { content, cost, .. } => {
+                        (content.as_str(), cost.unwrap_or(0))
+                    }
+                };
                 let hint_data = json!({
                     "challenge_id": challenge_id,
-                    "content": hint.content,
-                    "value": hint.cost,
+                    "content": content,
+                    "cost": cost,
                 });
                 self.client.create_hint(&hint_data).await?;
             }
         };
-        // Update: hints
-        //
+
         // Patch: requirements
         if let Some(requirements) = &config.requirements {
+            let prereq_names = requirements.prerequisite_names();
             let mut required_challenges: Vec<u32> = Vec::new();
             let installed_challenges = self.get_all_challenges().await?.unwrap();
             let mut names = vec![];
@@ -246,20 +236,25 @@ impl ChallengeManager {
             }
             names.sort();
             println!("names: {:#?}", names);
-            for req in requirements {
+            for req in &prereq_names {
                 if req.trim().is_empty() {
                     continue;
                 }
-                let req_challenge = installed_challenges
-                    .iter()
-                    .find(|c| c.name == *req)
-                    .ok_or_else(|| anyhow!("Required challenge '{}' not found", req))?;
-                required_challenges.push(
-                    self.client
-                        .get_challenge_id(&req_challenge.name)
-                        .await?
-                        .unwrap(),
-                );
+                // Try as integer ID first
+                if let Ok(id) = req.parse::<u32>() {
+                    required_challenges.push(id);
+                } else {
+                    let req_challenge = installed_challenges
+                        .iter()
+                        .find(|c| c.name == *req)
+                        .ok_or_else(|| anyhow!("Required challenge '{}' not found", req))?;
+                    required_challenges.push(
+                        self.client
+                            .get_challenge_id(&req_challenge.name)
+                            .await?
+                            .unwrap(),
+                    );
+                }
             }
             let req_data = json!({
                 "requirements": json!({
@@ -270,8 +265,7 @@ impl ChallengeManager {
                 .update_challenge(challenge_id, &req_data)
                 .await?;
         };
-        // Patch: requirements
-        //
+
         // Patch: state
         if let Some(state) = &config.state {
             let state_data = json!({
@@ -281,7 +275,7 @@ impl ChallengeManager {
                 .update_challenge(challenge_id, &state_data)
                 .await?;
         };
-        // Patch: state
+
         Ok(Option::from(challenge))
     }
 
@@ -304,6 +298,7 @@ impl ChallengeManager {
                         "challenge_id": challenge_id,
                         "content": content,
                         "type": "static",
+                        "data": "",
                     }),
                     FlagContent::Detailed {
                         id: _,
@@ -315,7 +310,7 @@ impl ChallengeManager {
                         "challenge_id": challenge_id,
                         "content": content,
                         "type": format!("{:?}", type_).to_lowercase(),
-                        "data": format!("{:?}", data).to_lowercase()
+                        "data": data.as_ref().map(|d| format!("{:?}", d).to_lowercase()).unwrap_or_default(),
                     }),
                 }
             })
@@ -357,7 +352,6 @@ impl ChallengeManager {
                                 }
                                 Err(e) => {
                                     eprintln!("❌ Failed to parse {}: {}", yml_path.display(), e);
-                                    // Continue with other challenges instead of failing completely
                                 }
                             }
                         }
@@ -410,7 +404,6 @@ impl ChallengeManager {
         let challenges = self.get_all_challenges().await?.unwrap();
 
         for challenge in challenges {
-            // let spec = challenge.to_spec();
             let (name, category) = (challenge.name.clone(), challenge.category.clone());
             let category_dir = export_path.join(&category);
             let challenge_dir = category_dir.join(&name);

@@ -1,0 +1,298 @@
+<svg width="1200" height="1600" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <defs>
+    <linearGradient id="headerGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2563eb;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1e40af;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="componentGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f8fafc;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#e2e8f0;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="apiGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#dcfce7;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#bbf7d0;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="fileGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ffedd5;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#fed7aa;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="externalGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ddd6fe;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#c4b5fd;stop-opacity:1" />
+    </linearGradient>
+
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#333" />
+    </marker>
+
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3" />
+      <feOffset dx="2" dy="2" result="offsetblur" />
+      <feFlood flood-color="#000000" flood-opacity="0.3" />
+      <feComposite in2="offsetblur" operator="in" />
+      <feMerge>
+        <feMergeNode />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Title and Header -->
+  <rect x="0" y="0" width="1200" height="80" fill="url(#headerGradient)" />
+  <text x="600" y="40" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="24" font-weight="bold">
+    NervCTF System Architecture
+  </text>
+  <text x="600" y="65" text-anchor="middle" fill="#e0e7ff" font-family="Arial, sans-serif" font-size="14">
+    Comprehensive CTFd Challenge Management System
+  </text>
+
+  <!-- Legend -->
+  <rect x="50" y="100" width="1100" height="60" fill="#f8fafc" stroke="#cbd5e1" rx="8" />
+  <text x="70" y="125" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#1e293b">Legend:</text>
+
+  <rect x="150" y="115" width="20" height="20" fill="url(#componentGradient)" stroke="#94a3b8" rx="4" />
+  <text x="180" y="130" font-family="Arial, sans-serif" font-size="14" fill="#475569">Core Component</text>
+
+  <rect x="300" y="115" width="20" height="20" fill="url(#apiGradient)" stroke="#86efac" rx="4" />
+  <text x="330" y="130" font-family="Arial, sans-serif" font-size="14" fill="#475569">API/Service</text>
+
+  <rect x="450" y="115" width="20" height="20" fill="url(#fileGradient)" stroke="#fdba74" rx="4" />
+  <text x="480" y="130" font-family="Arial, sans-serif" font-size="14" fill="#475569">File/Data</text>
+
+  <rect x="600" y="115" width="20" height="20" fill="url(#externalGradient)" stroke="#a78bfa" rx="4" />
+  <text x="630" y="130" font-family="Arial, sans-serif" font-size="14" fill="#475569">External System</text>
+
+  <line x1="780" y1="125" x2="820" y2="125" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+  <text x="840" y="130" font-family="Arial, sans-serif" font-size="14" fill="#475569">Data Flow</text>
+
+  <!-- Main Architecture Sections -->
+
+  <!-- User Interface Layer -->
+  <rect x="50" y="180" width="1100" height="100" fill="#f1f5f9" stroke="#cbd5e1" rx="8" />
+  <text x="600" y="200" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#1e293b">
+    User Interface Layer
+  </text>
+
+  <!-- CLI Tool -->
+  <rect x="150" y="220" width="200" height="40" fill="url(#componentGradient)" stroke="#94a3b8" rx="6" filter="url(#shadow)" />
+  <text x="250" y="245" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    CLI Tool (nervctf)
+  </text>
+
+  <!-- Commands -->
+  <rect x="450" y="220" width="600" height="40" fill="#e2e8f0" stroke="#cbd5e1" rx="6" />
+  <text x="750" y="245" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Commands: deploy | list | scan | auto (--dry-run, --watch)
+  </text>
+
+  <!-- Core Application Layer -->
+  <rect x="50" y="300" width="1100" height="400" fill="#f1f5f9" stroke="#cbd5e1" rx="8" />
+  <text x="600" y="320" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#1e293b">
+    Core Application Layer
+  </text>
+
+  <!-- Main Components -->
+  <rect x="100" y="350" width="250" height="60" fill="url(#componentGradient)" stroke="#94a3b8" rx="6" filter="url(#shadow)" />
+  <text x="225" y="380" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    Challenge Manager
+  </text>
+  <text x="225" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    CRUD operations, validation, sync
+  </text>
+
+  <rect x="400" y="350" width="250" height="60" fill="url(#componentGradient)" stroke="#94a3b8" rx="6" filter="url(#shadow)" />
+  <text x="525" y="380" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    Directory Scanner
+  </text>
+  <text x="525" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    Recursive file search, validation
+  </text>
+
+  <rect x="700" y="350" width="250" height="60" fill="url(#componentGradient)" stroke="#94a3b8" rx="6" filter="url(#shadow)" />
+  <text x="825" y="380" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    Synchronizer
+  </text>
+  <text x="825" y="400" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    Diff, dependency resolution, atomic updates
+  </text>
+
+  <!-- Sub-components -->
+  <rect x="150" y="430" width="150" height="40" fill="#e2e8f0" stroke="#cbd5e1" rx="4" />
+  <text x="225" y="455" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Requirements Queue
+  </text>
+
+  <rect x="500" y="430" width="150" height="40" fill="#e2e8f0" stroke="#cbd5e1" rx="4" />
+  <text x="575" y="455" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    File Validator
+  </text>
+
+  <rect x="800" y="430" width="150" height="40" fill="#e2e8f0" stroke="#cbd5e1" rx="4" />
+  <text x="875" y="455" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Dependency Resolver
+  </text>
+
+  <!-- API Layer -->
+  <rect x="50" y="720" width="1100" height="200" fill="#f1f5f9" stroke="#cbd5e1" rx="8" />
+  <text x="600" y="740" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#1e293b">
+    CTFd API Layer
+  </text>
+
+  <!-- CTFd Client -->
+  <rect x="475" y="780" width="250" height="60" fill="url(#apiGradient)" stroke="#86efac" rx="6" filter="url(#shadow)" />
+  <text x="600" y="810" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    CTFd API Client
+  </text>
+  <text x="600" y="830" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    Authentication, request/response handling
+  </text>
+
+  <!-- API Endpoints -->
+  <rect x="200" y="860" width="150" height="40" fill="#dcfce7" stroke="#86efac" rx="4" />
+  <text x="275" y="885" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Challenges API
+  </text>
+
+  <rect x="400" y="860" width="150" height="40" fill="#dcfce7" stroke="#86efac" rx="4" />
+  <text x="475" y="885" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Flags API
+  </text>
+
+  <rect x="600" y="860" width="150" height="40" fill="#dcfce7" stroke="#86efac" rx="4" />
+  <text x="675" y="885" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Files API
+  </text>
+
+  <rect x="800" y="860" width="150" height="40" fill="#dcfce7" stroke="#86efac" rx="4" />
+  <text x="875" y="885" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    Hints/Tags API
+  </text>
+
+  <!-- Data Layer -->
+  <rect x="50" y="940" width="1100" height="200" fill="#f1f5f9" stroke="#cbd5e1" rx="8" />
+  <text x="600" y="960" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#1e293b">
+    Data Layer
+  </text>
+
+  <!-- Local Files -->
+  <rect x="200" y="1000" width="250" height="60" fill="url(#fileGradient)" stroke="#fdba74" rx="6" filter="url(#shadow)" />
+  <text x="325" y="1030" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    Local Challenge Files
+  </text>
+  <text x="325" y="1050" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    YAML/JSON challenge definitions
+  </text>
+
+  <!-- File Structure -->
+  <rect x="200" y="1080" width="250" height="50" fill="#ffedd5" stroke="#fdba74" rx="4" />
+  <text x="325" y="1105" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#475569">
+    challenges/category/challenge/challenge.yml
+  </text>
+
+  <!-- CTFd Database -->
+  <rect x="650" y="1000" width="250" height="60" fill="url(#externalGradient)" stroke="#a78bfa" rx="6" filter="url(#shadow)" />
+  <text x="775" y="1030" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    CTFd Database
+  </text>
+  <text x="775" y="1050" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    Remote challenge storage
+  </text>
+
+  <!-- External Systems Layer -->
+  <rect x="50" y="1160" width="1100" height="200" fill="#f1f5f9" stroke="#cbd5e1" rx="8" />
+  <text x="600" y="1180" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="bold" fill="#1e293b">
+    External Systems
+  </text>
+
+  <!-- CTFd Instance -->
+  <rect x="300" y="1220" width="250" height="60" fill="url(#externalGradient)" stroke="#a78bfa" rx="6" filter="url(#shadow)" />
+  <text x="425" y="1250" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    CTFd Instance
+  </text>
+  <text x="425" y="1270" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    Target deployment platform
+  </text>
+
+  <!-- Docker -->
+  <rect x="650" y="1220" width="250" height="60" fill="url(#externalGradient)" stroke="#a78bfa" rx="6" filter="url(#shadow)" />
+  <text x="775" y="1250" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#1e293b">
+    Docker Container
+  </text>
+  <text x="775" y="1270" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#64748b">
+    Containerized deployment
+  </text>
+
+  <!-- Data Flow Arrows -->
+
+  <!-- CLI to Core -->
+  <line x1="250" y1="260" x2="250" y2="350" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+
+  <!-- Core Components Connections -->
+  <line x1="225" y1="410" x2="225" y2="430" stroke="#3b82f6" stroke-width="1" />
+  <line x1="525" y1="410" x2="525" y2="430" stroke="#3b82f6" stroke-width="1" />
+  <line x1="825" y1="410" x2="825" y2="430" stroke="#3b82f6" stroke-width="1" />
+
+  <!-- Directory Scanner to Local Files -->
+  <line x1="525" y1="470" x2="325" y2="1000" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+  <text x="425" y="750" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#3b82f6">
+    Reads challenge files
+  </text>
+
+  <!-- Challenge Manager to API -->
+  <line x1="225" y1="470" x2="600" y2="780" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+  <text x="400" y="650" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#3b82f6">
+    Sends API requests
+  </text>
+
+  <!-- API to CTFd Database -->
+  <line x1="600" y1="840" x2="775" y2="1000" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+  <text x="700" y="920" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#3b82f6">
+    Stores/retrieves data
+  </text>
+
+  <!-- CTFd Database to CTFd Instance -->
+  <line x1="775" y1="1060" x2="425" y2="1220" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+  <text x="600" y="1150" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#3b82f6">
+    Serves challenges
+  </text>
+
+  <!-- Synchronizer bidirectional flow -->
+  <path d="M 825 470 C 825 600, 950 600, 950 720" stroke="#3b82f6" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+  <path d="M 950 720 C 950 600, 825 600, 825 470" stroke="#3b82f6" stroke-width="2" fill="none" marker-end="url(#arrow)" />
+  <text x="900" y="600" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#3b82f6">
+    Syncs local ↔ remote
+  </text>
+
+  <!-- Docker deployment -->
+  <line x1="775" y1="1280" x2="600" y2="1280" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow)" />
+  <text x="700" y="1295" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#3b82f6">
+    Containerized deployment
+  </text>
+
+  <!-- Environment Variables -->
+  <rect x="50" y="1380" width="1100" height="80" fill="#f8fafc" stroke="#cbd5e1" rx="8" />
+  <text x="600" y="1400" text-anchor="middle" font-family="Arial, sans-serif" font-size="16" font-weight="bold" fill="#1e293b">
+    Environment Configuration
+  </text>
+  <text x="600" y="1425" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#475569">
+    CTFD_URL, CTFD_API_KEY, DOCKER_HOST, SSH keys
+  </text>
+
+  <!-- Footer -->
+  <rect x="0" y="1480" width="1200" height="120" fill="#f1f5f9" />
+  <text x="600" y="1500" text-anchor="middle" font-family="Arial, sans-serif" font-size="14" font-weight="bold" fill="#475569">
+    NervCTF Architecture Overview
+  </text>
+  <text x="600" y="1520" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#64748b">
+    CTFd Challenge Management System - Rust-based CLI tool for automated challenge deployment
+  </text>
+  <text x="600" y="1540" text-anchor="middle" font-family="Arial, sans-serif" font-size="11" fill="#94a3b8">
+    Features: Automatic scanning, validation, dependency resolution, atomic deployment, synchronization
+  </text>
+  <text x="600" y="1560" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#94a3b8">
+    Supports: YAML/JSON challenge files, Docker deployment, CTFd API integration
+  </text>
+  <text x="600" y="1580" text-anchor="middle" font-family="Arial, sans-serif" font-size="10" fill="#94a3b8">
+    Created based on NervCTF project analysis
+  </text>
+</svg>

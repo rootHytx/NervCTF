@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand};
 use nervctf::{
     challenge_manager::ChallengeManager,
     ctfd_api::{
-        models::{Challenge, FlagContent},
+        models::{Challenge, FlagContent, HintContent, Tag},
         CtfdClient,
     },
     directory_scanner::DirectoryScanner,
+    load_config,
 };
 use serde_json;
 use std::env;
@@ -28,6 +29,18 @@ struct Cli {
     /// Verbose output
     #[arg(short, long)]
     verbose: bool,
+
+    /// Run remote monitor via Docker Compose
+    #[arg(short, long)]
+    remote: bool,
+
+    /// Remote monitor URL (overrides MONITOR_URL env var and .nervctf.yml)
+    #[arg(long)]
+    monitor_url: Option<String>,
+
+    /// Remote monitor token (overrides MONITOR_TOKEN env var and .nervctf.yml)
+    #[arg(long)]
+    monitor_token: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -49,8 +62,8 @@ enum Commands {
         detailed: bool,
     },
 
-    /// Auto-manager: automatically verify and synchronize challenges
-    AutoManager {
+    /// Auto: automatically verify and synchronize challenges
+    Auto {
         /// Show diff without applying changes
         #[arg(short, long)]
         dry_run: bool,
@@ -65,21 +78,56 @@ enum Commands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Get environment variables
-    let ctfd_url =
-        env::var("CTFD_URL").map_err(|_| anyhow!("CTFD_URL environment variable is required"))?;
+    // Load config from .nervctf.yml (walk up from base_dir)
+    let file_config = load_config(&cli.base_dir);
+
+    // Resolve CTFD_URL: env var > config file
+    let ctfd_url = env::var("CTFD_URL")
+        .ok()
+        .or_else(|| file_config.ctfd_url.clone())
+        .ok_or_else(|| anyhow!("CTFD_URL is required (set via env var or .nervctf.yml)"))?;
+
+    // Resolve CTFD_API_KEY: env var > config file
     let api_key = env::var("CTFD_API_KEY")
-        .map_err(|_| anyhow!("CTFD_API_KEY environment variable is required"))?;
+        .ok()
+        .or_else(|| file_config.ctfd_api_key.clone())
+        .ok_or_else(|| anyhow!("CTFD_API_KEY is required (set via env var or .nervctf.yml)"))?;
+
+    // Resolve monitor config: CLI flag > env var > config file
+    let monitor_url = cli
+        .monitor_url
+        .or_else(|| env::var("MONITOR_URL").ok())
+        .or_else(|| file_config.monitor_url.clone());
+
+    let monitor_token = cli
+        .monitor_token
+        .or_else(|| env::var("MONITOR_TOKEN").ok())
+        .or_else(|| file_config.monitor_token.clone());
 
     if cli.verbose {
-        println!("✅ Connected to CTFd instance at {}", ctfd_url);
+        if let (Some(ref url), _) = (&monitor_url, &monitor_token) {
+            println!("✅ Using remote monitor at {}", url);
+        } else {
+            println!("✅ Connected to CTFd instance at {}", ctfd_url);
+        }
         println!("📁 Base directory: {}", cli.base_dir.display());
     }
 
-    // Initialize CTFd client
-    let client = CtfdClient::new(&ctfd_url, &api_key)?;
+    if cli.remote {
+        let status = std::process::Command::new("docker")
+            .args(["compose", "-f", "./remote-monitor/docker-compose.yml", "up"])
+            .status()
+            .expect("Failed to run docker compose");
+        std::process::exit(status.code().unwrap_or(1));
+    }
 
-    // Create directory scanner
+    // When monitor_url+token are set, use the monitor as the endpoint
+    let client = if let (Some(ref url), Some(ref token)) = (&monitor_url, &monitor_token) {
+        CtfdClient::new(url, token)?
+    } else {
+        CtfdClient::new(&ctfd_url, &api_key)?
+    };
+
     let scanner = DirectoryScanner::new();
 
     match cli.command {
@@ -98,8 +146,8 @@ async fn main() -> Result<()> {
             scan_challenges(&scanner, &cli.base_dir, detailed).await?;
         }
 
-        Commands::AutoManager { dry_run, watch } => {
-            println!("🤖 Auto-manager started for {}", cli.base_dir.display());
+        Commands::Auto { dry_run, watch } => {
+            println!("🤖 Auto started for {}", cli.base_dir.display());
             auto_manager(&client, &cli.base_dir, dry_run, watch).await?;
         }
     }
@@ -158,28 +206,28 @@ async fn deploy_challenges(
     Ok(())
 }
 
-/// Deploy a single challenge to CTFd with all associated components
+/// Gap 4 fix: Deploy a single challenge with all spec fields handled in order
 async fn deploy_single_challenge(client: &CtfdClient, challenge: &Challenge) -> Result<u32> {
     use reqwest::Method;
     use serde_json::json;
 
-    // Prepare challenge data
+    // Step 1: POST challenge core
     let challenge_data = json!({
         "name": challenge.name,
         "category": challenge.category,
-        "description": challenge.description,
+        "description": challenge.description.as_deref().unwrap_or(""),
         "value": challenge.value,
         "type": challenge.challenge_type,
         "state": challenge.state,
         "connection_info": challenge.connection_info,
-        "requirements": challenge.requirements,
+        "attempts": challenge.attempts,
+        "extra": challenge.extra,
     });
 
-    // Create the challenge
     let created_challenge: Challenge = client
         .execute::<Challenge, _>(Method::POST, "/challenges", Some(&challenge_data))
         .await?
-        .unwrap();
+        .ok_or_else(|| anyhow!("No response from challenge creation"))?;
 
     let challenge_id = created_challenge
         .id
@@ -187,84 +235,171 @@ async fn deploy_single_challenge(client: &CtfdClient, challenge: &Challenge) -> 
 
     println!("   📝 Created challenge with ID: {}", challenge_id);
 
-    // Deploy flags
+    // Step 2: POST flags
     if let Some(flags) = &challenge.flags {
         println!("   🚩 Deploying {} flags", flags.len());
         for flag in flags {
-            match flag {
-                FlagContent::Simple(content) => {
-                    let flag_data = json!({
-                        "challenge_id": challenge_id,
-                        "content": content,
-                        "type": "static",
-                    });
-
-                    client
-                        .execute::<serde_json::Value, _>(Method::POST, "/flags", Some(&flag_data))
-                        .await?;
-                }
+            let flag_data = match flag {
+                FlagContent::Simple(content) => json!({
+                    "challenge_id": challenge_id,
+                    "content": content,
+                    "type": "static",
+                    "data": "",
+                }),
                 FlagContent::Detailed {
-                    id: _,
-                    challenge_id: _,
                     type_,
                     content,
                     data,
+                    ..
                 } => {
-                    let flag_data = json!({
+                    let data_val = data
+                        .as_ref()
+                        .map(|d| serde_json::to_value(d).unwrap_or_default())
+                        .unwrap_or(serde_json::Value::String(String::new()));
+                    json!({
                         "challenge_id": challenge_id,
                         "content": content,
-                        "type": serde_yaml::to_string(type_).unwrap_or_else(|_| "static".to_string()),
-                        "data": serde_yaml::to_string(data).unwrap_or_else(|_| "case sensitive".to_string()),
-                    });
-
-                    client
-                        .execute::<serde_json::Value, _>(Method::POST, "/flags", Some(&flag_data))
-                        .await?;
+                        "type": serde_json::to_value(type_).unwrap_or_default(),
+                        "data": data_val,
+                    })
                 }
             };
+            client
+                .execute::<serde_json::Value, _>(Method::POST, "/flags", Some(&flag_data))
+                .await?;
         }
     }
 
-    // Deploy tags
+    // Step 3: POST tags
     if let Some(tags) = &challenge.tags {
         println!("   🏷️  Deploying {} tags", tags.len());
         for tag in tags {
+            let value = match tag {
+                Tag::Simple(s) => s.as_str(),
+                Tag::Detailed { value, .. } => value.as_str(),
+            };
             let tag_data = json!({
                 "challenge_id": challenge_id,
-                "value": tag,
+                "value": value,
             });
-
             client
                 .execute::<serde_json::Value, _>(Method::POST, "/tags", Some(&tag_data))
                 .await?;
         }
     }
 
-    // Deploy hints
+    // Step 4: POST topics
+    if let Some(topics) = &challenge.topics {
+        println!("   🔖 Deploying {} topics", topics.len());
+        for topic in topics {
+            let topic_data = json!({
+                "challenge_id": challenge_id,
+                "value": topic,
+                "type": "challenge",
+            });
+            client
+                .execute::<serde_json::Value, _>(Method::POST, "/topics", Some(&topic_data))
+                .await?;
+        }
+    }
+
+    // Step 5: POST hints (handling both Simple and Detailed variants)
     if let Some(hints) = &challenge.hints {
         println!("   💡 Deploying {} hints", hints.len());
         for hint in hints {
+            let (content, cost) = match hint {
+                HintContent::Simple(s) => (s.as_str(), 0u32),
+                HintContent::Detailed { content, cost, .. } => {
+                    (content.as_str(), cost.unwrap_or(0))
+                }
+            };
             let hint_data = json!({
                 "challenge_id": challenge_id,
-                "content": hint.content,
-                "cost": hint.cost.unwrap_or(0),
+                "content": content,
+                "cost": cost,
             });
-
             client
                 .execute::<serde_json::Value, _>(Method::POST, "/hints", Some(&hint_data))
                 .await?;
         }
     }
 
-    // Note: File deployment requires actual file uploads which is more complex
-    // For now, we'll just log the file information
+    // Step 6: POST files via multipart
     if let Some(files) = &challenge.files {
-        println!(
-            "   📁 Found {} files (file upload not implemented yet)",
-            files.len()
-        );
+        println!("   📁 Uploading {} files", files.len());
         for file in files {
-            println!("     - {}", file);
+            let file_path = std::path::Path::new(&challenge.source_path).join(file);
+            if file_path.exists() {
+                let form = reqwest::blocking::multipart::Form::new()
+                    .text("challenge_id", challenge_id.to_string())
+                    .text("type", "challenge")
+                    .file("file", &file_path)?;
+                client
+                    .post_file::<serde_json::Value>("/files", Some(form))
+                    .await?;
+                println!("     ✅ Uploaded: {}", file);
+            } else {
+                println!("     ⚠️  File not found: {}", file_path.display());
+            }
+        }
+    }
+
+    // Step 7: PATCH requirements — resolve names→IDs
+    if let Some(requirements) = &challenge.requirements {
+        let prereq_names = requirements.prerequisite_names();
+        if !prereq_names.is_empty() {
+            println!("   🔗 Setting {} requirements", prereq_names.len());
+            let all_challenges: Vec<Challenge> = client
+                .execute::<Vec<Challenge>, _>(Method::GET, "/challenges", None::<&()>)
+                .await?
+                .unwrap_or_default();
+
+            let mut prereq_ids: Vec<u32> = Vec::new();
+            for req in &prereq_names {
+                if let Ok(id) = req.parse::<u32>() {
+                    prereq_ids.push(id);
+                } else if let Some(found) = all_challenges.iter().find(|c| c.name == *req) {
+                    if let Some(id) = found.id {
+                        prereq_ids.push(id);
+                    }
+                }
+            }
+
+            if !prereq_ids.is_empty() {
+                let req_data = json!({
+                    "requirements": {
+                        "prerequisites": prereq_ids,
+                    }
+                });
+                client
+                    .execute::<serde_json::Value, _>(
+                        Method::PATCH,
+                        &format!("/challenges/{}", challenge_id),
+                        Some(&req_data),
+                    )
+                    .await?;
+            }
+        }
+    }
+
+    // Step 8: PATCH next if set
+    if let Some(next_name) = &challenge.next {
+        let all_challenges: Vec<Challenge> = client
+            .execute::<Vec<Challenge>, _>(Method::GET, "/challenges", None::<&()>)
+            .await?
+            .unwrap_or_default();
+
+        if let Some(next_challenge) = all_challenges.iter().find(|c| c.name == *next_name) {
+            if let Some(next_id) = next_challenge.id {
+                let next_data = json!({ "next_id": next_id });
+                client
+                    .execute::<serde_json::Value, _>(
+                        Method::PATCH,
+                        &format!("/challenges/{}", challenge_id),
+                        Some(&next_data),
+                    )
+                    .await?;
+            }
         }
     }
 
@@ -302,21 +437,19 @@ async fn list_challenges(
     Ok(())
 }
 
-/// Auto-manager: automatically verifies and synchronizes challenges
+/// Auto: automatically verifies and synchronizes challenges
 async fn auto_manager(
     client: &CtfdClient,
     base_dir: &PathBuf,
     dry_run: bool,
     watch: bool,
 ) -> Result<()> {
-    println!("🎯 Auto-manager mode activated");
+    println!("🎯 Auto mode activated");
     println!("   Dry run: {}", dry_run);
     println!("   Watch: {}", watch);
 
-    // Create challenge manager
     let challenge_manager = ChallengeManager::new(client.clone(), base_dir);
 
-    // Verify local challenges first
     println!("\n🔍 Verifying local challenges...");
     match verify_local_challenges(&challenge_manager) {
         Ok(()) => println!("✅ Local challenges verification passed"),
@@ -325,7 +458,6 @@ async fn auto_manager(
         }
     }
 
-    // Synchronize challenges
     println!("\n🔄 Synchronizing challenges...");
     let mut synchronizer = challenge_manager.synchronizer();
 
@@ -342,22 +474,20 @@ async fn auto_manager(
     if watch {
         println!("\n👀 Watch mode enabled - monitoring for changes...");
         println!("   Press Ctrl+C to stop watching");
-        // Simple watch implementation - in production you'd use a proper file watcher
         tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         println!("⏰ Watch period completed (30 seconds)");
     }
 
-    println!("\n🎉 Auto-manager completed successfully!");
+    println!("\n🎉 Auto completed successfully!");
     Ok(())
 }
 
-/// Verify all local challenges for correctness
+/// Bug 3 fix: verify_local_challenges no longer panics on missing description
 fn verify_local_challenges(challenge_manager: &ChallengeManager) -> Result<()> {
     let challenges = match challenge_manager.scan_local_challenges() {
         Ok(challenges) => challenges,
         Err(e) => {
             eprintln!("⚠️  Warning: Some challenges failed to scan: {}", e);
-            // Return empty vector to continue with verification of valid challenges
             Vec::new()
         }
     };
@@ -372,7 +502,6 @@ fn verify_local_challenges(challenge_manager: &ChallengeManager) -> Result<()> {
     let mut warning_count = 0;
 
     for challenge in &challenges {
-        // Basic validation
         if challenge.name.trim().is_empty() {
             eprintln!("     ❌ ERROR: Challenge name cannot be empty");
             error_count += 1;
@@ -383,10 +512,11 @@ fn verify_local_challenges(challenge_manager: &ChallengeManager) -> Result<()> {
             error_count += 1;
         }
 
+        // Bug 3 fix: use as_deref().unwrap_or("") instead of .expect()
         if challenge
             .description
-            .clone()
-            .expect("REASON")
+            .as_deref()
+            .unwrap_or("")
             .trim()
             .is_empty()
         {
@@ -414,13 +544,7 @@ fn verify_local_challenges(challenge_manager: &ChallengeManager) -> Result<()> {
                             error_count += 1;
                         }
                     }
-                    FlagContent::Detailed {
-                        id: _,
-                        challenge_id: _,
-                        type_,
-                        content,
-                        data,
-                    } => {
+                    FlagContent::Detailed { content, .. } => {
                         if content.is_empty() {
                             eprintln!("     ❌ ERROR: Flag {} content cannot be empty", i + 1);
                             error_count += 1;
@@ -489,8 +613,8 @@ async fn scan_challenges(
                 "  - {} ({}) - {} points",
                 challenge.name, challenge.category, challenge.value
             );
-            if !challenge.flags.is_none() {
-                println!("    Flags: {}", challenge.flags.clone().unwrap().len());
+            if challenge.flags.is_some() {
+                println!("    Flags: {}", challenge.flags.as_ref().unwrap().len());
             }
             if let Some(hints) = &challenge.hints {
                 println!("    Hints: {}", hints.len());

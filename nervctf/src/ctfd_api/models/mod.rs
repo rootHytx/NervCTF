@@ -1,7 +1,8 @@
 use crate::challenge_manager::sync::SyncAction;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-#[derive(Debug, Deserialize, Clone, Serialize)]
+
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChallengeType {
     Standard,
@@ -9,39 +10,63 @@ pub enum ChallengeType {
     // Add other types as needed
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum FlagType {
     Static,
     Regex,
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
-#[serde(rename_all = "lowercase")]
+/// Bug 2 fix: use snake_case so CaseInsensitive → "case_insensitive"
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum FlagData {
     CaseSensitive,
     CaseInsensitive,
 }
 
+/// Gap 2 fix: `data` is now optional in Detailed variant
 #[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(untagged)]
 pub enum FlagContent {
     Simple(String),
     Detailed {
-        id: Option<u32>,           // ID can be None for new flags
-        challenge_id: Option<u32>, // ID can be None for new challenges
+        id: Option<u32>,
+        challenge_id: Option<u32>,
         #[serde(rename = "type")]
         type_: FlagType,
         content: String,
-        data: FlagData,
+        data: Option<FlagData>,
     },
 }
 
+/// Kept for CTFd API responses (always returns detailed format)
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct Hint {
     pub content: String,
     pub cost: Option<u32>,
     pub title: Option<String>,
+}
+
+/// Gap 1 fix: HintContent supports both simple string and detailed object
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(untagged)]
+pub enum HintContent {
+    Simple(String),
+    Detailed {
+        content: String,
+        cost: Option<u32>,
+        title: Option<String>,
+    },
+}
+
+impl HintContent {
+    pub fn content_str(&self) -> &str {
+        match self {
+            HintContent::Simple(s) => s.as_str(),
+            HintContent::Detailed { content, .. } => content.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -51,7 +76,7 @@ pub struct Extra {
     pub minimum: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
     Hidden,
@@ -62,7 +87,7 @@ pub enum State {
 pub struct File {
     pub location: String,
     pub sha1sum: String,
-    pub id: Option<u32>, // ID can be None for new files
+    pub id: Option<u32>,
     #[serde(rename = "type")]
     pub file_type: String,
 }
@@ -73,9 +98,51 @@ pub enum Tag {
     Simple(String),
     Detailed {
         challenge_id: Option<u32>,
-        id: Option<u32>, // ID can be None for new files
+        id: Option<u32>,
         value: String,
     },
+}
+
+impl Tag {
+    pub fn value_str(&self) -> &str {
+        match self {
+            Tag::Simple(s) => s.as_str(),
+            Tag::Detailed { value, .. } => value.as_str(),
+        }
+    }
+}
+
+/// Gap 3 fix: Requirements supports simple list, advanced object, and integer IDs
+#[derive(Debug, Deserialize, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Requirements {
+    Simple(Vec<serde_json::Value>),
+    Advanced {
+        prerequisites: Vec<serde_json::Value>,
+        #[serde(default)]
+        anonymize: bool,
+    },
+}
+
+impl Requirements {
+    /// Extract prerequisite names/IDs as strings for topological sorting
+    pub fn prerequisite_names(&self) -> Vec<String> {
+        let vals = match self {
+            Requirements::Simple(v) => v,
+            Requirements::Advanced { prerequisites, .. } => prerequisites,
+        };
+        vals.iter()
+            .filter_map(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else if let Some(n) = v.as_u64() {
+                    Some(n.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]
@@ -88,8 +155,8 @@ pub struct Challenge {
 
     // Optional fields
     pub description: Option<String>,
-    pub id: Option<u32>,           // ID can be None for new challenges
-    pub challenge_id: Option<u32>, // ID can be None for new challenges
+    pub id: Option<u32>,
+    pub challenge_id: Option<u32>,
     pub author: Option<String>,
     pub extra: Option<Extra>,
     pub image: Option<String>,
@@ -102,9 +169,11 @@ pub struct Challenge {
     pub topics: Option<Vec<String>>,
     pub tags: Option<Vec<Tag>>,
     pub files: Option<Vec<String>>,
-    pub hints: Option<Vec<Hint>>,
-    pub requirements: Option<Vec<String>>,
-    pub next: Option<String>, // Could be enhanced with enum for ID/name
+    /// Gap 1 fix: hints support both simple strings and detailed objects
+    pub hints: Option<Vec<HintContent>>,
+    /// Gap 3 fix: requirements support simple list and advanced object
+    pub requirements: Option<Requirements>,
+    pub next: Option<String>,
     pub state: Option<State>,
     #[serde(skip)]
     pub script: Option<String>,
@@ -196,6 +265,7 @@ impl RequirementsQueue {
         });
         self.queue.retain(|cw| !cw.satisfied());
     }
+
     pub fn print(&self) {
         if self.queue.is_empty() {
             println!("✅ All challenges are ready to be processed.");
@@ -210,6 +280,7 @@ impl RequirementsQueue {
             }
         }
     }
+
     pub fn resolve_dependencies<'a>(&self, actions: Vec<SyncAction<'a>>) -> Vec<SyncAction<'a>> {
         // Separate actions
         let mut to_sort = Vec::new();
@@ -224,18 +295,18 @@ impl RequirementsQueue {
             }
         }
 
-        // Build dependency map and action lookup
-        let mut deps: HashMap<&str, HashSet<&str>> = HashMap::new();
+        // Build dependency map with owned Strings (Requirements enum returns Vec<String>)
+        let mut deps: HashMap<String, HashSet<String>> = HashMap::new();
         let mut name_to_action: HashMap<&str, &SyncAction> = HashMap::new();
 
         for action in &to_sort {
-            let (name, requirements) = match action {
+            let (name, requirements): (&str, HashSet<String>) = match action {
                 SyncAction::Create { name, challenge } => (
                     name.as_str(),
                     challenge
                         .requirements
                         .as_ref()
-                        .map(|v| v.iter().map(|s| s.as_str()).collect())
+                        .map(|r| r.prerequisite_names().into_iter().collect())
                         .unwrap_or_default(),
                 ),
                 SyncAction::Update { name, local, .. } => (
@@ -243,45 +314,46 @@ impl RequirementsQueue {
                     local
                         .requirements
                         .as_ref()
-                        .map(|v| v.iter().map(|s| s.as_str()).collect())
+                        .map(|r| r.prerequisite_names().into_iter().collect())
                         .unwrap_or_default(),
                 ),
                 _ => continue,
             };
-            deps.insert(name, requirements);
+            deps.insert(name.to_string(), requirements);
             name_to_action.insert(name, action);
         }
 
         // Kahn's algorithm for topological sort
         let mut sorted = Vec::new();
-        let mut no_deps: VecDeque<&str> = deps
+        let mut no_deps: VecDeque<String> = deps
             .iter()
             .filter(|(_, reqs)| reqs.is_empty())
-            .map(|(name, _)| *name)
+            .map(|(name, _)| name.clone())
             .collect();
 
-        let mut processed: HashSet<&str> = HashSet::new();
+        let mut processed: HashSet<String> = HashSet::new();
 
         while let Some(name) = no_deps.pop_front() {
-            if processed.contains(name) {
+            if processed.contains(&name) {
                 continue;
             }
-            processed.insert(name);
+            processed.insert(name.clone());
 
-            if let Some(action) = name_to_action.get(name) {
+            if let Some(action) = name_to_action.get(name.as_str()) {
                 sorted.push((*action).clone());
             }
             // Remove this name from other requirements
             for reqs in deps.values_mut() {
-                reqs.remove(name);
+                reqs.remove(&name);
             }
             // Find new nodes with no dependencies and not yet processed
             for (n, reqs) in deps.iter() {
                 if reqs.is_empty() && !processed.contains(n) {
-                    no_deps.push_back(n);
+                    no_deps.push_back(n.clone());
                 }
             }
         }
+
         // Append the unsorted actions at the end
         sorted.extend(to_append);
         sorted

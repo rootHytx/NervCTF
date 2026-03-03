@@ -2,9 +2,45 @@
 //! Provides helper functions for working with challenge files and directories
 
 use anyhow::{anyhow, Result};
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// Configuration loaded from `.nervctf.yml` (merged with env vars and CLI flags)
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct Config {
+    pub ctfd_url: Option<String>,
+    pub ctfd_api_key: Option<String>,
+    pub monitor_url: Option<String>,
+    pub monitor_token: Option<String>,
+    pub base_dir: Option<String>,
+}
+
+/// Load config from `.nervctf.yml`, walking up from `start_dir` to find it.
+/// Returns `Config::default()` if no file is found or parsing fails.
+pub fn load_config(start_dir: &Path) -> Config {
+    let mut dir = start_dir.to_path_buf();
+    // Canonicalize so we can walk up reliably
+    if let Ok(abs) = dir.canonicalize() {
+        dir = abs;
+    }
+    loop {
+        let config_path = dir.join(".nervctf.yml");
+        if config_path.exists() {
+            if let Ok(content) = fs::read_to_string(&config_path) {
+                if let Ok(config) = serde_yaml::from_str::<Config>(&content) {
+                    return config;
+                }
+            }
+            break;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    Config::default()
+}
 
 /// Creates a directory if it doesn't exist
 pub fn ensure_dir_exists(path: &Path) -> Result<()> {

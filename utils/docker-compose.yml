@@ -1,23 +1,11 @@
-version: "2"
-
 services:
   ctfd:
-    image: ctfd/ctfd
+    build: .
     user: root
     restart: always
-    env_file: .env
-    networks:
-      default:
-      internal:
     ports:
-      - "8001:8000"
-    volumes:
-      - .data/CTFd/logs:/var/log/CTFd
-      - .data/CTFd/uploads:/var/uploads
-      - ./CTFd:/opt/CTFd
-      - ./solve-webhook-plugin:/opt/CTFd/CTFd/plugins/solve-webhook-plugin
+      - "8000:8000"
     environment:
-      - SECRET_KEY=test_infra_dont_bother
       - UPLOAD_FOLDER=/var/uploads
       - DATABASE_URL=mysql+pymysql://ctfd:ctfd@db/ctfd
       - REDIS_URL=redis://cache:6379
@@ -28,23 +16,46 @@ services:
       - REVERSE_PROXY=true
       - SOLVE_WEBHOOK_URL=
       - SOLVE_WEBHOOK_LIMIT=3
+    volumes:
+      - .data/CTFd/logs:/var/log/CTFd
+      - .data/CTFd/uploads:/var/uploads
+      - .:/opt/CTFd:ro
+      - ./CTFd/plugins/solve-webhook-plugin:/opt/CTFd/CTFd/plugins/solve-webhook-plugin
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - db
+    networks:
+      default:
+      internal:
+    profiles:
+      - ctfd
+
+  nginx:
+    image: nginx:stable
+    restart: always
+    volumes:
+      - ./conf/nginx/http.conf:/etc/nginx/nginx.conf
+    ports:
+      - 80:80
+    depends_on:
+      - ctfd
     profiles:
       - ctfd
 
   db:
-    image: mariadb:10.4.12
+    image: mariadb:10.11
     restart: always
-    networks:
-      internal:
+    environment:
+      - MARIADB_ROOT_PASSWORD=ctfd
+      - MARIADB_USER=ctfd
+      - MARIADB_PASSWORD=ctfd
+      - MARIADB_DATABASE=ctfd
+      - MARIADB_AUTO_UPGRADE=1
     volumes:
       - .data/mysql:/var/lib/mysql
-    environment:
-      - MYSQL_ROOT_PASSWORD=ctfd
-      - MYSQL_USER=ctfd
-      - MYSQL_PASSWORD=ctfd
-      - MYSQL_DATABASE=ctfd
+    networks:
+      internal:
+    # This command is required to set important mariadb defaults
     command:
       [
         mysqld,
@@ -59,10 +70,10 @@ services:
   cache:
     image: redis:4
     restart: always
-    networks:
-      internal:
     volumes:
       - .data/redis:/data
+    networks:
+      internal:
     profiles:
       - ctfd
 

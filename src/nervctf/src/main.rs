@@ -80,7 +80,11 @@ enum Commands {
     },
 
     /// Validate challenge YAML files and report errors/warnings
-    Validate,
+    Validate {
+        /// Show full field-by-field dictionary for every challenge
+        #[arg(long)]
+        debug: bool,
+    },
 }
 
 // ── Queue types for deferred phases ──────────────────────────────────────────
@@ -114,8 +118,8 @@ async fn main() -> Result<()> {
     if let Commands::Fix { dry_run } = cli.command {
         return run_fix(&cli.base_dir, dry_run);
     }
-    if let Commands::Validate = cli.command {
-        return validate_command(&cli.base_dir);
+    if let Commands::Validate { debug } = cli.command {
+        return validate_command(&cli.base_dir, debug);
     }
 
     // Load config from .nervctf.yml (walk up from base_dir)
@@ -180,7 +184,7 @@ async fn main() -> Result<()> {
         Commands::Scan { detailed } => {
             scan_challenges(&scanner, &cli.base_dir, detailed).await?;
         }
-        Commands::Setup | Commands::Fix { .. } | Commands::Validate => {
+        Commands::Setup | Commands::Fix { .. } | Commands::Validate { .. } => {
             unreachable!("handled before credential resolution")
         }
     }
@@ -190,20 +194,33 @@ async fn main() -> Result<()> {
 
 // ── validate ──────────────────────────────────────────────────────────────────
 
-fn validate_command(base_dir: &PathBuf) -> Result<()> {
-    let scanner = DirectoryScanner::new();
-    let challenges = scanner.scan_directory(base_dir)?;
+fn validate_command(base_dir: &PathBuf, debug: bool) -> Result<()> {
+    use nervctf::ScanFailure;
 
-    if challenges.is_empty() {
+    let scanner = DirectoryScanner::new();
+    let (challenges, failures): (_, Vec<ScanFailure>) =
+        scanner.scan_directory_full(base_dir, debug)?;
+
+    if challenges.is_empty() && failures.is_empty() {
         println!("ℹ️  No challenge files found in {}", base_dir.display());
         return Ok(());
     }
 
-    println!("🔍 Validating {} challenge(s)...\n", challenges.len());
-    let report = validate_challenges(&challenges);
-    report.print();
+    let total = challenges.len() + failures.len();
+    if failures.is_empty() {
+        println!("🔍 Validating {} challenge(s)...\n", total);
+    } else {
+        println!(
+            "🔍 Validating {} challenge(s) ({} failed to parse)...\n",
+            total,
+            failures.len()
+        );
+    }
 
-    if report.has_errors() {
+    let report = validate_challenges(&challenges);
+    report.print(&challenges, &failures, debug);
+
+    if report.has_errors() || !failures.is_empty() {
         std::process::exit(1);
     }
     Ok(())
@@ -230,7 +247,7 @@ async fn deploy_challenges(
     // ── Pre-deploy validation ─────────────────────────────────────────────────
     println!("\n🔍 Validating challenges...");
     let report = validate_challenges(&local_challenges);
-    report.print();
+    report.print(&local_challenges, &[], false);
     if report.has_errors() {
         println!("\n❌ Fix the errors above before deploying. Run `nervctf validate` for details.");
         return Ok(());

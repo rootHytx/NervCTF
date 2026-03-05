@@ -421,6 +421,7 @@ mod tests {
             template: None,
             version: "0.1".to_string(),
             source_path: String::new(),
+            unknown_yaml_keys: Vec::new(),
         }
     }
 

@@ -2,195 +2,266 @@
 
 ## Overview
 
-The `challenge_manager` module is the core of the `nervctf` system, responsible for all high-level operations on CTFd challenges. It provides a robust API for CRUD (Create, Read, Update, Delete) operations, local file system management, requirements/dependency handling, and synchronization between local and remote (CTFd) challenge states.
+The `challenge_manager` module provides the mid-level orchestration layer for
+CTFd challenge operations. It wraps `CtfdClient` and the directory scanner to
+offer a unified API for scanning local files, fetching remote state, and
+performing CRUD operations.
+
+The primary **deploy and sync workflow** lives in `src/main.rs`
+(`deploy_challenges()`), which uses `CtfdClient` directly for maximum control
+over the 4-phase deployment order. `ChallengeManager` remains available for
+programmatic use and is exercised by the legacy `ChallengeSynchronizer`.
 
 ---
 
 ## Module Structure
 
-- **`ChallengeManager`**: Main struct for managing challenges.
-- **`sync` submodule**: Handles synchronization logic and dependency resolution.
-- **`utils` submodule**: Provides validation and helper functions.
+```
+src/challenge_manager/
+├── mod.rs     — ChallengeManager struct and CRUD helpers
+├── sync.rs    — ChallengeSynchronizer, SyncAction, needs_update()
+└── utils.rs   — (legacy) basic field validation helper
+```
 
 ---
 
-## Main Struct: `ChallengeManager`
+## `ChallengeManager`
 
 ### Fields
 
-- `client: CtfdClient`
-  - The API client for interacting with the remote CTFd instance.
-- `base_path: PathBuf`
-  - The root directory for local challenge files.
-- `requirements_queue: RequirementsQueue`
-  - Tracks challenge dependencies for correct sync order.
+| Field | Type | Description |
+|-------|------|-------------|
+| `client` | `CtfdClient` | Async API client for CTFd |
+| `base_path` | `PathBuf` | Root directory for local challenge files |
+| `requirements_queue` | `RequirementsQueue` | Dependency tracking for sync order |
 
 ### Key Methods
 
 #### `new(client: CtfdClient, base_path: &Path) -> Self`
-Creates a new manager instance.
-**Usage:**
-- Instantiate once per session, passing the API client and the local base directory.
-
-#### `get_all_challenges(&self) -> Result<Option<Vec<Challenge>>>`
-Fetches all challenges from the remote CTFd instance.
-
-#### `get_challenge(&self, id: u32) -> Result<Option<Challenge>>`
-Fetches a specific challenge by its ID.
-
-#### `get_challenge_by_name(&self, name: &str) -> Result<Option<Challenge>>`
-Fetches a challenge by its name (case-sensitive).
-
-#### `get_base_path(&self) -> &Path`
-Returns the base path for local challenge files.
-
-#### `generate_requirements_list(&mut self, challenges: Vec<Challenge>)`
-Populates the requirements queue with challenge dependencies.
-**Tricky aspect:**
-- This is essential for correct sync order; missing or circular dependencies can cause sync failures.
-
-#### `create_challenge(&self, config: &Challenge) -> Result<Option<Challenge>>`
-Creates a new challenge on CTFd using the provided configuration.
-- Only basic fields are set; flags, tags, files, and hints must be added separately.
-
-#### `update_challenge(&self, id: u32, config: &Challenge) -> Result<Option<Challenge>>`
-Updates an existing challenge and all its related entities (flags, tags, files, hints, requirements, state).
-- **Atomic update:** Deletes all existing related entities before recreating them.
-- **Tricky aspect:**
-  - If any step fails, the challenge may be left in a partially updated state.
-  - File uploads are performed using blocking multipart requests.
-
-#### `delete_challenge(&self, id: u32) -> Result<()>`
-Deletes a challenge by its ID.
-
-#### `create_flag(&self, challenge_id: u32, flags: Vec<FlagContent>) -> Result<Option<Value>>`
-Creates one or more flags for a challenge.
+Creates a new manager. Instantiate once per session.
 
 #### `scan_local_challenges(&self) -> Result<Vec<Challenge>>`
-Scans the local file system for challenge definitions (`challenge.yml`), parses them, and returns a vector of `Challenge` structs.
-- **Tricky aspect:**
-  - If a challenge fails to parse, it is skipped with an error message.
+Recursively walks `base_path` for `challenge.yml` files, parses each one, and
+sets `source_path` to the containing directory. Parse failures are logged and
+skipped (non-fatal).
 
-#### `get_local_challenge(&self, name: &str) -> Result<Option<Challenge>>`
-Returns a local challenge by name.
+#### `get_all_challenges(&self) -> Result<Option<Vec<Challenge>>>`
+Fetches all challenges from the remote CTFd instance via `GET /api/v1/challenges`.
 
-#### `create_challenge_from_file(&self, yaml_path: &Path) -> Result<Option<Challenge>>`
-Creates a challenge on CTFd from a local YAML file.
+#### `create_challenge(&self, data: &Value) -> Result<Option<Challenge>>`
+POSTs a challenge payload to CTFd. Returns the created challenge with its assigned
+`id`. Only the core fields are included; flags, hints, tags, and files must be
+added as separate requests.
 
-#### `update_challenge_from_file(&self, challenge_id: u32, yaml_path: &Path) -> Result<Option<Challenge>>`
-Updates a challenge on CTFd from a local YAML file.
+#### `update_challenge(&self, id: u32, data: &Value) -> Result<Option<Challenge>>`
+PATCHes an existing challenge. For full updates (replacing all sub-resources),
+the higher-level `update_challenge_phase1()` in `main.rs` deletes existing
+flags/tags/hints/files before recreating them.
 
-#### `export_challenges(&self, export_path: &Path) -> Result<()>`
-Exports all remote challenges to a local directory structure as YAML files.
+#### `delete_challenge(&self, id: u32) -> Result<()>`
+Deletes a challenge and (on CTFd's side) all its associated flags, hints, tags,
+and files.
+
+#### `generate_requirements_list(&mut self, challenges: Vec<Challenge>)`
+Populates `requirements_queue` with dependency information extracted from each
+challenge's `requirements` field. Used by `ChallengeSynchronizer` to determine
+the creation order.
 
 #### `synchronizer(&self) -> sync::ChallengeSynchronizer`
-Returns a new synchronizer instance for this manager.
+Returns a new `ChallengeSynchronizer` bound to this manager.
 
 ---
 
-## Submodule: `sync`
+## `sync` Submodule
 
-### Main Struct: `ChallengeSynchronizer`
+### `needs_update(remote: &Challenge, local: &Challenge) -> bool`
 
-- **Purpose:** Orchestrates the synchronization of local and remote challenges.
-- **Key Method:**
-  - `sync(&mut self, show_diff: bool) -> Result<()>`
-    - Compares local and remote challenges, determines required actions, resolves dependencies, and applies changes.
-    - Supports dry-run (diff only) and interactive execution.
+Standalone public function (also callable from `main.rs`) that returns `true` if
+any significant field differs between the remote CTFd state and the local YAML.
 
-### Enum: `SyncAction<'a>`
+**Fields compared:**
 
-- **Variants:**
-  - `Create { name, challenge }`
-  - `Update { name, local, remote }`
-  - `UpToDate { name, challenge }`
-  - `RemoteOnly { name, challenge }`
+| Field | Notes |
+|-------|-------|
+| `category` | exact match |
+| `value` | exact match |
+| `description` | exact match |
+| `state` | exact match |
+| `connection_info` | exact match |
+| `attempts` | exact match |
+| `extra` | JSON-serialized comparison |
+| `flags` | sorted list of `content` strings |
+| `tags` | sorted list of tag values |
+| `hints` | sorted list of `content` strings |
 
-- **Usage:**
-  - Actions are generated during sync and executed in dependency order.
+This function is the gatekeeper for the diff computation in `deploy_challenges()`:
+only challenges where `needs_update()` returns `true` enter the UPDATE path.
 
-### Tricky/Advanced Aspects
+### `ChallengeSynchronizer`
 
-- **Dependency Resolution:**
-  - Uses a topological sort (Kahn's algorithm) to ensure challenges are created/updated in the correct order.
-  - If dependencies are missing or circular, sync may fail or hang.
+```rust
+pub struct ChallengeSynchronizer {
+    challenge_manager: ChallengeManager,
+}
+```
 
-- **Partial Failures:**
-  - If an action fails, the synchronizer continues with other actions, logging errors.
+The synchronizer provides a `sync(&mut self, show_diff: bool)` method that
+orchestrates the full compare-and-apply cycle using `SyncAction`:
+
+```rust
+pub enum SyncAction<'a> {
+    Create   { name: String, challenge: &'a Challenge },
+    Update   { name: String, local: &'a Challenge, remote: &'a Challenge },
+    UpToDate { name: String, challenge: &'a Challenge },
+    RemoteOnly { name: String, challenge: &'a Challenge },
+}
+```
+
+Actions are topologically sorted by `RequirementsQueue::resolve_dependencies()`
+(Kahn's algorithm) to ensure challenges without dependencies are created first.
+
+**Note:** The 4-phase deploy in `main.rs` supersedes the synchronizer for the
+primary workflow. The synchronizer remains useful when you need the full
+`SyncAction` enum (e.g., to handle `RemoteOnly` challenges or build tooling on
+top of the diff).
+
+### Dependency Resolution (`RequirementsQueue`)
+
+`RequirementsQueue` implements Kahn's topological sort over `SyncAction` entries:
+
+1. Build a `HashMap<name, HashSet<prereq_names>>` from all `Create`/`Update`
+   actions.
+2. Seed a ready-queue with nodes that have no unresolved dependencies.
+3. Process the ready-queue: for each resolved node, remove it from every other
+   node's dependency set, then enqueue newly unblocked nodes.
+4. Append `UpToDate` and `RemoteOnly` actions at the end (order-insensitive).
+
+Circular dependencies cause the sort to silently drop the involved challenges.
+Use `nervctf validate` to catch self-referencing requirements before they reach
+this stage.
 
 ---
 
-## Submodule: `utils`
+## `utils` Submodule
 
-### Function: `validate_challenge_config(config: &Challenge) -> Result<()>`
+### `validate_challenge_config(config: &Challenge) -> Result<()>`
 
-- **Purpose:**
-  - Ensures that a challenge configuration is valid before deployment or sync.
-- **Checks:**
-  - Name and category are non-empty.
-  - Value is non-zero.
-  - At least one flag is present.
+A lightweight legacy check confirming that `name`, `category`, and `value` are
+non-empty/non-zero and that at least one flag is present. This predates the full
+`validator` module; for comprehensive validation use `validator::validate_challenges()`.
 
 ---
 
 ## Error Handling
 
-- Uses the `anyhow` crate for rich error context.
-- Most methods return `Result<Option<T>>` to distinguish between "not found" and actual errors.
-- When scanning or syncing, errors in individual challenges are logged but do not halt the entire process.
+- All methods use `anyhow` for rich error context.
+- `Result<Option<T>>` distinguishes "not found" (`Ok(None)`) from actual API/IO
+  errors (`Err`).
+- Scan failures in individual challenge files are printed to stderr and skipped,
+  so a single broken YAML does not abort the full scan.
 
 ---
 
-## Debugging and Development Notes
+## Deploy Workflow (current)
 
-- **File Uploads:**
-  - File uploads are performed using blocking requests due to limitations in async multipart support. This can cause deadlocks if not handled carefully.
-- **Atomic Updates:**
-  - When updating a challenge, all related entities are deleted and recreated. If an error occurs mid-update, the challenge may be left in an inconsistent state.
-- **Dependency Loops:**
-  - Circular dependencies in requirements will cause the synchronizer to hang or fail. Always validate requirements before deployment.
-- **Schema Changes:**
-  - If the CTFd API or challenge schema changes, update both the Rust structs and the serialization logic.
+The primary deployment path is in `src/main.rs`. Here is the end-to-end flow:
+
+```
+1. scan_directory()           — find all challenge.yml files
+2. validate_challenges()      — pre-flight checks (errors block deploy)
+3. get_challenges()           — fetch remote state
+4. needs_update()             — compute diff (CREATE / UPDATE / UP-TO-DATE)
+5. show diff, confirm
+─── Phase 1 ──────────────────────────────────────────────────────────────
+6. POST /challenges           — create/update core fields
+7. POST /flags                — create flags
+8. POST /tags                 — create tags
+9. POST /topics               — create topics
+10. POST /hints               — create hints
+─── Phase 2 ──────────────────────────────────────────────────────────────
+11. POST /files               — upload all files per challenge in one
+                                batched multipart request
+─── Phase 3 ──────────────────────────────────────────────────────────────
+12. PATCH /challenges/{id}    — set requirements (names → IDs resolved)
+─── Phase 4 ──────────────────────────────────────────────────────────────
+13. PATCH /challenges/{id}    — set next_id (names → IDs resolved)
+```
+
+Phases 3 and 4 run after all challenges exist so forward-references never fail.
 
 ---
 
-## Example Workflow
+## File Uploads
 
-1. **Scan Local Challenges:**
-   `scan_local_challenges()` reads all `challenge.yml` files and parses them into `Challenge` structs.
+Files are uploaded via `CtfdClient::upload_file()`, which uses the **async**
+`reqwest::Client` with a 120-second timeout. All files belonging to a challenge
+are batched into a **single** multipart `POST /api/v1/files` request:
 
-2. **Validate Challenges:**
-   Use `utils::validate_challenge_config()` to ensure each challenge is well-formed.
+```
+POST /api/v1/files
+Content-Type: multipart/form-data; boundary=...
 
-3. **Synchronize:**
-   Use `synchronizer().sync(show_diff)` to compare local and remote states, resolve dependencies, and apply changes.
+--boundary
+Content-Disposition: form-data; name="challenge_id"
 
-4. **Deploy/Update:**
-   Use `create_challenge()` or `update_challenge()` to push changes to CTFd.
+339
+--boundary
+Content-Disposition: form-data; name="type"
+
+challenge
+--boundary
+Content-Disposition: form-data; name="file"; filename="exploit.py"
+
+<binary>
+--boundary
+Content-Disposition: form-data; name="file"; filename="Dockerfile"
+
+<binary>
+--boundary--
+```
+
+This matches ctfcli's `_create_all_files()` pattern. Sending one file per
+request produces a 500 from CTFd.
+
+**CTFd upload pre-requisite:** the uploads directory must be writable by CTFd's
+process user (UID 1001 in the default Docker image):
+
+```sh
+sudo chown -R 1001:1001 /path/to/CTFd/.data/CTFd/uploads
+```
+
+---
+
+## Debugging Notes
+
+- **Partial updates**: if a Phase 1 operation fails, the challenge may exist
+  on CTFd with no flags/hints/files. Rerunning deploy is safe — `needs_update()`
+  will detect the discrepancy and reapply.
+- **Circular requirements**: `RequirementsQueue::resolve_dependencies()` silently
+  drops challenges caught in a cycle. Run `nervctf validate` first.
+- **Schema changes**: if the CTFd API changes, update both the model structs in
+  `models/mod.rs` and any payload construction in `main.rs`.
 
 ---
 
 ## Extending the Module
 
-- **Adding New Challenge Fields:**
-  - Update the `Challenge` struct and ensure serialization/deserialization is correct.
-  - Update `create_challenge` and `update_challenge` to include new fields in API payloads.
+**New challenge fields:**
+1. Add the field to `Challenge` in `models/mod.rs`.
+2. Include it in the payload JSON in `create_challenge_phase1()` / `update_challenge_phase1()` in `main.rs`.
+3. Add a comparison in `needs_update()` in `sync.rs`.
+4. Optionally add a validation check in `validator.rs`.
 
-- **Supporting New Challenge Types:**
-  - Extend the `ChallengeType` enum and update logic where challenge types are handled.
-
-- **Custom Validation:**
-  - Add new checks to `validate_challenge_config` as needed.
+**New challenge types:**
+1. Extend `ChallengeType` enum in `models/mod.rs`.
+2. Handle any type-specific payload differences in `create_challenge_phase1()`.
 
 ---
 
 ## References
 
-- [CTFd API Documentation](https://ctfd.io/api/v1)
-- [serde](https://serde.rs/)
-- [anyhow](https://docs.rs/anyhow/)
-- [walkdir](https://docs.rs/walkdir/)
-
----
-
-*This documentation is intended for developers and maintainers of the `nervctf` project. For further questions or contributions, please refer to the project repository or contact the maintainers.*
+- `src/nervctf/src/challenge_manager/mod.rs`
+- `src/nervctf/src/challenge_manager/sync.rs`
+- `src/nervctf/src/main.rs` — primary deploy orchestration
+- [CTFd API Documentation](https://docs.ctfd.io/docs/api/redoc/)
+- [Kahn's algorithm](https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm)

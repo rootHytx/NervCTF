@@ -5,3 +5,5 @@
 
 target
 /challenges/
+.nervctf.yml
+# Cargo.lock is intentionally tracked — binary applications should pin their deps

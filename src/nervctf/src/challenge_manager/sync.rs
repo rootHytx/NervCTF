@@ -491,13 +491,13 @@ mod tests {
     fn different_extra_triggers_update() {
         let remote = base();
         let mut local = base();
-        local.extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: Some(100) });
+        local.extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: Some(100), ..Default::default() });
         assert!(needs_update(&remote, &local));
     }
 
     #[test]
     fn same_extra_no_update() {
-        let extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: Some(100) });
+        let extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: Some(100), ..Default::default() });
         let mut remote = base();
         remote.extra = extra.clone();
         let mut local = base();

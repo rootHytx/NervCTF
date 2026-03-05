@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub enum ChallengeType {
     Standard,
     Dynamic,
-    // Add other types as needed
+    Container,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -69,11 +69,45 @@ impl HintContent {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Serialize)]
+/// Flag generation mode for container challenges.
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FlagMode {
+    Static,
+    Random,
+}
+
+/// `extra` block — shared by Dynamic and Container challenge types.
+/// Dynamic uses only the scoring fields; Container uses all of them.
+/// All fields are optional so serde silently ignores unknown sub-keys.
+#[derive(Debug, Deserialize, Clone, Serialize, Default)]
 pub struct Extra {
+    // ── Scoring (dynamic + container) ────────────────────────────────────────
     pub initial: Option<u32>,
     pub decay: Option<u32>,
     pub minimum: Option<u32>,
+
+    // ── Container-specific ────────────────────────────────────────────────────
+    /// Docker image name or local build path (`.` = build from Dockerfile).
+    pub image: Option<String>,
+    /// TCP port the container service listens on (integer form).
+    pub internal_port: Option<u32>,
+    /// TCP port as a string (some plugins prefer this form).
+    pub internal_ports: Option<String>,
+    /// How the flag is generated: `static` (from `flags:`) or `random`.
+    pub flag_mode: Option<FlagMode>,
+    /// Prefix prepended to random flags (e.g. `"upCTF{"`).
+    pub flag_prefix: Option<String>,
+    /// Suffix appended to random flags (e.g. `"}"`).
+    pub flag_suffix: Option<String>,
+    /// Length of the random part of an auto-generated flag.
+    pub random_flag_length: Option<u32>,
+    /// Scoring decay function: `"linear"` or `"logarithmic"`.
+    pub decay_function: Option<String>,
+    /// How many minutes before an idle container is destroyed.
+    pub timeout_minutes: Option<u32>,
+    /// Override entrypoint / command run inside the container.
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]

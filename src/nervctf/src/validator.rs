@@ -1,7 +1,8 @@
 //! Challenge YAML validator
 //! Checks challenge structs for correctness before deploying to CTFd.
 
-use crate::ctfd_api::models::{Challenge, ChallengeType, FlagContent};
+use crate::ctfd_api::models::{Challenge, ChallengeType, FlagContent, FlagType, State, Tag};
+use crate::directory_scanner::ScanFailure;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -98,38 +99,95 @@ impl ValidationReport {
             .count()
     }
 
-    pub fn print(&self) {
-        if self.is_clean() {
-            println!("✅ All challenges valid — no issues found.");
-            return;
-        }
+    /// Print validation results.
+    ///
+    /// Normal mode (verbose=false): only shows parse failures and challenges
+    /// with issues (compact one-liner per issue).  Clean challenges are silent.
+    ///
+    /// Debug mode (verbose=true): full per-field dictionary for every challenge.
+    pub fn print(&self, challenges: &[Challenge], failures: &[ScanFailure], verbose: bool) {
+        // ── Group issues by challenge name ────────────────────────────────────
+        let mut by_challenge: HashMap<&str, Vec<&Issue>> = HashMap::new();
+        let mut global: Vec<&Issue> = Vec::new();
 
         for issue in &self.issues {
-            let prefix = match issue.severity {
-                Severity::Error => "❌ ERROR  ",
-                Severity::Warning => "⚠️  WARN   ",
-            };
             if issue.challenge.is_empty() {
-                println!("  {} {}", prefix, issue.message);
-            } else if let Some(ref field) = issue.field {
-                println!(
-                    "  {} [{}.{}] {}",
-                    prefix, issue.challenge, field, issue.message
-                );
+                global.push(issue);
             } else {
-                println!("  {} [{}] {}", prefix, issue.challenge, issue.message);
+                by_challenge
+                    .entry(issue.challenge.as_str())
+                    .or_default()
+                    .push(issue);
             }
         }
 
-        println!();
-        let e = self.error_count();
-        let w = self.warning_count();
-        if e > 0 && w > 0 {
-            println!("  {} error(s), {} warning(s)", e, w);
-        } else if e > 0 {
-            println!("  {} error(s)", e);
+        // ── Parse failures (always shown) ─────────────────────────────────────
+        if !failures.is_empty() {
+            println!("PARSE FAILURES  ({} file(s) could not be loaded)", failures.len());
+            for f in failures {
+                println!("  ❌  {}", f.path.display());
+                // Indent each line of the error message
+                for line in f.error.lines() {
+                    println!("      {}", line);
+                }
+            }
+            println!();
+        }
+
+        // ── Global issues (e.g. duplicate names) ─────────────────────────────
+        if !global.is_empty() {
+            println!("GLOBAL ISSUES");
+            for i in &global {
+                let tag = if i.severity == Severity::Error { "[E]" } else { "[W]" };
+                println!("  {}  {}", tag, i.message);
+            }
+            println!();
+        }
+
+        // ── Per-challenge views ───────────────────────────────────────────────
+        for c in challenges {
+            let issues = by_challenge
+                .get(c.name.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            if verbose {
+                print_challenge_dict(c, issues);
+            } else {
+                print_challenge_compact(c, issues);
+            }
+        }
+
+        // ── Overall summary ───────────────────────────────────────────────────
+        let valid = challenges.len();
+        let failed = failures.len();
+        let total = valid + failed;
+        let problems = by_challenge.len();
+        let clean = valid.saturating_sub(problems);
+
+        if failed == 0 && self.is_clean() {
+            println!("✅ All {} challenge(s) valid — no issues found.", total);
         } else {
-            println!("  {} warning(s)", w);
+            let mut parts: Vec<String> = Vec::new();
+            if clean > 0 {
+                parts.push(format!("{} ✅ clean", clean));
+            }
+            if problems > 0 {
+                parts.push(format!(
+                    "{} with issues ({} error(s), {} warning(s))",
+                    problems,
+                    self.error_count(),
+                    self.warning_count()
+                ));
+            }
+            if failed > 0 {
+                parts.push(format!("{} ❌ failed to parse", failed));
+            }
+            println!("Validated {} challenge(s): {}", total, parts.join(", "));
+            if verbose {
+                println!("\nRun `nervctf validate` (without --debug) for a compact summary.");
+            } else {
+                println!("\nRun `nervctf validate --debug` for the full field-by-field view.");
+            }
         }
     }
 }
@@ -308,7 +366,342 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         }
     }
 
+    // unknown YAML keys
+    for key in &c.unknown_yaml_keys {
+        issues.push(Issue::warn(
+            name,
+            key,
+            format!("unknown YAML key '{}' — not in the ctfcli spec, will be ignored", key),
+        ));
+    }
+
     issues
+}
+
+// ── Display helpers ───────────────────────────────────────────────────────────
+
+/// Print a full dictionary view for one challenge with all fields and inline
+/// issue annotations.  Challenges with no issues show only a ✅ header line.
+fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
+    const FW: usize = 16; // field-name column width
+
+    // ── Build field → issues index ────────────────────────────────────────────
+    let mut by_field: HashMap<&str, Vec<&Issue>> = HashMap::new();
+    for issue in issues {
+        if let Some(f) = issue.field.as_deref() {
+            by_field.entry(f).or_default().push(*issue);
+        }
+    }
+
+    let fi = |field: &str| -> &[&Issue] {
+        by_field.get(field).map(|v| v.as_slice()).unwrap_or(&[])
+    };
+
+    // ── Header ────────────────────────────────────────────────────────────────
+    let has_err = issues.iter().any(|i| i.severity == Severity::Error);
+    let has_warn = issues.iter().any(|i| i.severity == Severity::Warning);
+    let hdr = if has_err { "❌" } else if has_warn { "⚠ " } else { "✅" };
+    println!("{} \"{}\"  [{}]", hdr, c.name, c.category);
+
+    if issues.is_empty() {
+        // Compact view for clean challenges
+        println!();
+        return;
+    }
+
+    // ── Field rows ────────────────────────────────────────────────────────────
+    frow(FW, "name", Some(c.name.as_str()), fi("name"));
+    frow(FW, "author", c.author.as_deref(), fi("author"));
+    frow(FW, "category", Some(c.category.as_str()), fi("category"));
+
+    let desc_val = c.description.as_deref().map(|d| {
+        let s = d.replace('\n', " ");
+        truncate_str(&s, 70)
+    });
+    frow(FW, "description", desc_val.as_deref(), fi("description"));
+
+    let type_str = match c.challenge_type {
+        ChallengeType::Standard => "standard",
+        ChallengeType::Dynamic => "dynamic",
+    };
+    frow(FW, "type", Some(type_str), fi("type"));
+
+    // value / extra — depends on challenge type
+    match c.challenge_type {
+        ChallengeType::Standard => {
+            let v = c.value.to_string();
+            frow(FW, "value", Some(&v), fi("value"));
+        }
+        ChallengeType::Dynamic => {
+            if let Some(e) = &c.extra {
+                let i_s = e.initial.map(|x| x.to_string());
+                let d_s = e.decay.map(|x| x.to_string());
+                let m_s = e.minimum.map(|x| x.to_string());
+                frow(FW, "extra.initial", i_s.as_deref(), fi("extra.initial"));
+                frow(FW, "extra.decay", d_s.as_deref(), fi("extra.decay"));
+                frow(FW, "extra.minimum", m_s.as_deref(), fi("extra.minimum"));
+            } else {
+                frow(FW, "extra", None, fi("extra"));
+            }
+        }
+    }
+
+    // flags
+    let flags_val = c.flags.as_ref().and_then(|f| {
+        if f.is_empty() {
+            None
+        } else {
+            let summaries: Vec<String> = f.iter().take(3).map(flag_display).collect();
+            let tail = if f.len() > 3 {
+                format!(", +{} more", f.len() - 3)
+            } else {
+                String::new()
+            };
+            Some(format!("{} flag(s): {}{}", f.len(), summaries.join(", "), tail))
+        }
+    });
+    frow(FW, "flags", flags_val.as_deref(), fi("flags"));
+    // per-flag sub-issues (flags[0], flags[1], …)
+    if let Some(flags) = &c.flags {
+        for (i, fc) in flags.iter().enumerate() {
+            let key = format!("flags[{}]", i);
+            let sub = by_field.get(key.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !sub.is_empty() {
+                let fval = flag_display(fc);
+                frow_sub(FW, &key, Some(&fval), sub);
+            }
+        }
+    }
+
+    // tags
+    let tags_val = c.tags.as_ref().and_then(|t| {
+        if t.is_empty() {
+            None
+        } else {
+            let names: Vec<&str> = t.iter().map(Tag::value_str).collect();
+            Some(format!("[{}]", names.join(", ")))
+        }
+    });
+    frow(FW, "tags", tags_val.as_deref(), fi("tags"));
+
+    // topics
+    let topics_val = c.topics.as_ref().and_then(|t| {
+        if t.is_empty() {
+            None
+        } else {
+            Some(format!("[{}]", t.join(", ")))
+        }
+    });
+    frow(FW, "topics", topics_val.as_deref(), fi("topics"));
+
+    // files
+    let files_val = c.files.as_ref().and_then(|f| {
+        if f.is_empty() {
+            None
+        } else {
+            Some(format!("[{}]", f.join(", ")))
+        }
+    });
+    frow(FW, "files", files_val.as_deref(), fi("files"));
+
+    // hints
+    let hints_val = c.hints.as_ref().and_then(|h| {
+        if h.is_empty() {
+            None
+        } else {
+            Some(format!("{} hint(s)", h.len()))
+        }
+    });
+    frow(FW, "hints", hints_val.as_deref(), fi("hints"));
+
+    // requirements
+    let reqs_val = c.requirements.as_ref().map(|r| {
+        let names = r.prerequisite_names();
+        let strs: Vec<String> = names.into_iter().filter_map(|n| Some(n)).collect();
+        format!("[{}]", strs.join(", "))
+    });
+    frow(FW, "requirements", reqs_val.as_deref(), fi("requirements"));
+
+    // next
+    frow(FW, "next", c.next.as_deref(), fi("next"));
+
+    // state
+    let state_val = match &c.state {
+        None => "(defaults to visible)",
+        Some(State::Visible) => "visible",
+        Some(State::Hidden) => "hidden",
+    };
+    frow(FW, "state", Some(state_val), fi("state"));
+
+    // connection_info
+    frow(
+        FW,
+        "connection_info",
+        c.connection_info.as_deref(),
+        fi("connection_info"),
+    );
+
+    // attempts
+    let att_val = c.attempts.map(|a| a.to_string());
+    frow(FW, "attempts", att_val.as_deref(), fi("attempts"));
+
+    // docker fields — only shown when set
+    if let Some(img) = &c.image {
+        frow(FW, "image", Some(img.as_str()), fi("image"));
+    }
+    if let Some(proto) = &c.protocol {
+        frow(FW, "protocol", Some(proto.as_str()), fi("protocol"));
+    }
+    if let Some(host) = &c.host {
+        frow(FW, "host", Some(host.as_str()), fi("host"));
+    }
+    if let Some(hc) = &c.healthcheck {
+        frow(FW, "healthcheck", Some(hc.as_str()), fi("healthcheck"));
+    }
+
+    // version
+    frow(FW, "version", Some(&c.version), fi("version"));
+
+    // unknown YAML keys
+    for key in &c.unknown_yaml_keys {
+        let sub = by_field.get(key.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+        frow(FW, key, Some("(present in YAML)"), sub);
+    }
+
+    // Catch any issue fields not already rendered above
+    const RENDERED: &[&str] = &[
+        "name", "author", "category", "description", "type", "value",
+        "extra", "extra.initial", "extra.decay", "extra.minimum",
+        "flags", "tags", "topics", "files", "hints", "requirements",
+        "next", "state", "connection_info", "attempts", "image",
+        "protocol", "host", "healthcheck", "version",
+    ];
+    for (field, field_issues) in &by_field {
+        if RENDERED.contains(field) { continue; }
+        if field.starts_with("flags[") || field.starts_with("files[") { continue; }
+        if c.unknown_yaml_keys.iter().any(|k| k == *field) { continue; }
+        frow(FW, field, None, field_issues.as_slice());
+    }
+
+    // ── Footer ────────────────────────────────────────────────────────────────
+    let e = issues.iter().filter(|i| i.severity == Severity::Error).count();
+    let w = issues.iter().filter(|i| i.severity == Severity::Warning).count();
+    println!("  {}", "─".repeat(FW + 12));
+    if e > 0 && w > 0 {
+        println!("  ❌ {} error(s), {} warning(s)", e, w);
+    } else if e > 0 {
+        println!("  ❌ {} error(s)", e);
+    } else {
+        println!("  ⚠  {} warning(s)", w);
+    }
+    println!();
+}
+
+/// Compact view for one challenge: header + one line per issue.
+/// Clean challenges produce no output (silent pass).
+fn print_challenge_compact(c: &Challenge, issues: &[&Issue]) {
+    if issues.is_empty() {
+        return;
+    }
+    let has_err = issues.iter().any(|i| i.severity == Severity::Error);
+    let hdr = if has_err { "❌" } else { "⚠ " };
+    println!("{} \"{}\"  [{}]", hdr, c.name, c.category);
+    for issue in issues {
+        let tag = if issue.severity == Severity::Error { "[E]" } else { "[W]" };
+        let field = issue.field.as_deref().unwrap_or("(global)");
+        println!("   {}  {}: {}", tag, field, issue.message);
+    }
+    println!();
+}
+
+/// Print one field row with status tag and optional inline issue messages.
+///
+/// Status tags (3 ASCII chars, always same display width):
+///   `[E]`  — field has at least one error
+///   `[W]`  — field has at least one warning
+///   ` ok`  — field is set, no issues
+///   ` --`  — field not set, no issues
+fn frow(fw: usize, field: &str, value: Option<&str>, issues: &[&Issue]) {
+    let has_e = issues.iter().any(|i| i.severity == Severity::Error);
+    let has_w = issues.iter().any(|i| i.severity == Severity::Warning);
+
+    let (tag, val_str): (&str, String) = if has_e {
+        ("[E]", value.unwrap_or("MISSING").to_owned())
+    } else if has_w {
+        ("[W]", value.unwrap_or("(not set)").to_owned())
+    } else if let Some(v) = value {
+        (" ok", v.to_owned())
+    } else {
+        (" --", "(not set)".to_owned())
+    };
+
+    if issues.is_empty() {
+        println!("  {:<fw$}  {}  {}", field, tag, val_str, fw = fw);
+    } else {
+        let msgs = issues
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+            .join(";  ");
+        println!("  {:<fw$}  {}  {}  →  {}", field, tag, val_str, msgs, fw = fw);
+    }
+}
+
+/// Like `frow` but indented one level for sub-field issues (e.g. flags[0]).
+fn frow_sub(fw: usize, field: &str, value: Option<&str>, issues: &[&Issue]) {
+    let has_e = issues.iter().any(|i| i.severity == Severity::Error);
+    let has_w = issues.iter().any(|i| i.severity == Severity::Warning);
+    let tag = if has_e { "[E]" } else if has_w { "[W]" } else { "   " };
+    let val_str = value.unwrap_or("(empty)");
+    let msgs = issues
+        .iter()
+        .map(|i| i.message.as_str())
+        .collect::<Vec<_>>()
+        .join(";  ");
+    println!("    {:<fw$}  {}  {}  →  {}", field, tag, val_str, msgs, fw = fw.saturating_sub(2));
+}
+
+/// Summarise one flag for display (truncated content with type prefix).
+fn flag_display(fc: &FlagContent) -> String {
+    match fc {
+        FlagContent::Simple(s) => {
+            if s.is_empty() {
+                "(empty)".to_owned()
+            } else {
+                truncate_str(s, 40)
+            }
+        }
+        FlagContent::Detailed { content, type_, .. } => {
+            let prefix = match type_ {
+                FlagType::Static => "static",
+                FlagType::Regex => "regex",
+            };
+            if content.is_empty() {
+                format!("{}: (empty)", prefix)
+            } else {
+                format!("{}: {}", prefix, truncate_str(content, 34))
+            }
+        }
+    }
+}
+
+/// Truncate a string to at most `max_chars` characters, appending "…" if cut.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut result = String::with_capacity(max_chars);
+    for _ in 0..max_chars.saturating_sub(1) {
+        match chars.next() {
+            Some(c) => result.push(c),
+            None => return result,
+        }
+    }
+    // check if more chars remain
+    if chars.next().is_some() {
+        result.push('…');
+    } else if let Some(last) = s.chars().last() {
+        result.push(last);
+    }
+    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -355,6 +748,7 @@ mod tests {
             template: None,
             version: "0.1".to_string(),
             source_path: String::new(),
+            unknown_yaml_keys: Vec::new(),
         }
     }
 

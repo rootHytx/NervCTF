@@ -36,6 +36,13 @@ impl Default for ScannerConfig {
     }
 }
 
+/// A challenge file that could not be loaded during a directory scan.
+#[derive(Debug)]
+pub struct ScanFailure {
+    pub path: PathBuf,
+    pub error: String,
+}
+
 /// Scans directories for challenge configuration files
 pub struct DirectoryScanner {
     config: ScannerConfig,
@@ -54,14 +61,35 @@ impl DirectoryScanner {
         Self { config }
     }
 
-    /// Scans a directory for challenge files
+    /// Scans a directory for challenge files (backwards-compatible wrapper).
+    /// Prints per-challenge progress; failures are printed to stderr.
     pub fn scan_directory(&self, base_path: &Path) -> Result<Vec<Challenge>> {
+        let (challenges, failures) = self.scan_directory_full(base_path, true)?;
+        for f in &failures {
+            eprintln!(
+                "❌ Failed to load challenge from {}: {}",
+                f.path.display(),
+                f.error
+            );
+        }
+        Ok(challenges)
+    }
+
+    /// Scans a directory and returns both loaded challenges and parse failures.
+    ///
+    /// When `verbose` is true, prints `📁 Found challenge:` for every success.
+    /// The `🔍 Scanning directory:` header is always printed.
+    pub fn scan_directory_full(
+        &self,
+        base_path: &Path,
+        verbose: bool,
+    ) -> Result<(Vec<Challenge>, Vec<ScanFailure>)> {
         let mut challenges = Vec::new();
+        let mut failures: Vec<ScanFailure> = Vec::new();
 
         if !base_path.exists() {
             return Err(anyhow!("Directory does not exist: {}", base_path.display()));
         }
-
         if !base_path.is_dir() {
             return Err(anyhow!("Path is not a directory: {}", base_path.display()));
         }
@@ -78,24 +106,34 @@ impl DirectoryScanner {
             if path.is_file() && self.is_challenge_file(path) {
                 match self.load_challenge_config(path) {
                     Ok(config) => {
-                        println!("📁 Found challenge: {} ({})", config.name, config.category);
+                        if verbose {
+                            println!(
+                                "📁 Found challenge: {} ({})",
+                                config.name, config.category
+                            );
+                        }
                         challenges.push(config);
                     }
                     Err(e) => {
-                        eprintln!("❌ Failed to load challenge from {}: {}", path.display(), e);
+                        // Use {:#} to include the full error chain (root cause
+                        // from serde_yaml includes line/column information).
+                        failures.push(ScanFailure {
+                            path: path.to_path_buf(),
+                            error: format!("{:#}", e),
+                        });
                     }
                 }
             }
         }
 
-        if challenges.is_empty() {
+        if verbose && challenges.is_empty() && failures.is_empty() {
             println!("ℹ️  No challenge files found. Supported patterns:");
             for pattern in &self.config.patterns {
                 println!("  - {}", pattern);
             }
         }
 
-        Ok(challenges)
+        Ok((challenges, failures))
     }
 
     /// Checks if a file is a challenge configuration file
@@ -138,6 +176,30 @@ impl DirectoryScanner {
             .unwrap_or(Path::new("."))
             .to_string_lossy()
             .to_string();
+
+        // Collect top-level YAML keys not recognised by the ctfcli spec so
+        // the validator can warn about them.  JSON files are skipped since
+        // they come from API responses, not from challenge authors.
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            const KNOWN_SPEC_KEYS: &[&str] = &[
+                "name", "author", "category", "description", "attribution",
+                "value", "type", "extra", "image", "protocol", "host",
+                "connection_info", "healthcheck", "attempts", "flags",
+                "topics", "tags", "files", "hints", "requirements", "next",
+                "state", "version", "id", "challenge_id",
+            ];
+            if let Ok(serde_yaml::Value::Mapping(map)) =
+                serde_yaml::from_str::<serde_yaml::Value>(&content)
+            {
+                for key in map.keys() {
+                    if let serde_yaml::Value::String(k) = key {
+                        if !KNOWN_SPEC_KEYS.contains(&k.as_str()) {
+                            config.unknown_yaml_keys.push(k.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(config)
     }

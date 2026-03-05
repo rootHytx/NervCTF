@@ -188,6 +188,11 @@ pub struct Challenge {
     pub version: String,
     #[serde(skip)]
     pub source_path: String,
+    /// Top-level YAML keys from the source file not recognised by the
+    /// ctfcli spec. Populated by DirectoryScanner; never serialised or
+    /// sent to the CTFd API.
+    #[serde(skip)]
+    pub unknown_yaml_keys: Vec<String>,
 }
 
 fn default_version() -> String {

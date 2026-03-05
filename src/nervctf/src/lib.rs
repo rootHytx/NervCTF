@@ -13,5 +13,5 @@ pub mod validator;
 // Re-export for convenience
 pub use challenge_manager::{utils as challenge_utils, ChallengeManager};
 pub use ctfd_api::CtfdClient;
-pub use directory_scanner::{ChallengeStats, DirectoryScanner};
+pub use directory_scanner::{ChallengeStats, DirectoryScanner, ScanFailure};
 pub use utils::*;

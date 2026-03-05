@@ -1,7 +1,7 @@
 //! Challenge YAML validator
 //! Checks challenge structs for correctness before deploying to CTFd.
 
-use crate::ctfd_api::models::{Challenge, ChallengeType, FlagContent, FlagType, State, Tag};
+use crate::ctfd_api::models::{Challenge, ChallengeType, FlagContent, FlagMode, FlagType, State, Tag};
 use crate::directory_scanner::ScanFailure;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -246,30 +246,22 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         issues.push(Issue::error(name, "category", "must not be empty"));
     }
 
-    // value / dynamic extra
+    // value / dynamic / container extra
     match c.challenge_type {
-        ChallengeType::Dynamic => match &c.extra {
+        ChallengeType::Dynamic | ChallengeType::Container => match &c.extra {
             None => issues.push(Issue::error(
                 name,
                 "extra",
-                "required for dynamic challenges — must have initial, decay, minimum",
+                "required — must have at least initial, decay, minimum",
             )),
             Some(extra) => {
                 match extra.initial {
-                    None => issues.push(Issue::error(
-                        name,
-                        "extra.initial",
-                        "required for dynamic challenges",
-                    )),
+                    None => issues.push(Issue::error(name, "extra.initial", "required")),
                     Some(0) => issues.push(Issue::error(name, "extra.initial", "must be > 0")),
                     _ => {}
                 }
                 match extra.decay {
-                    None => issues.push(Issue::error(
-                        name,
-                        "extra.decay",
-                        "required for dynamic challenges",
-                    )),
+                    None => issues.push(Issue::error(name, "extra.decay", "required")),
                     Some(0) => issues.push(Issue::error(name, "extra.decay", "must be > 0")),
                     _ => {}
                 }
@@ -279,6 +271,24 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                         "extra.minimum",
                         "not set (CTFd will default to 0)",
                     ));
+                }
+                // Container-specific checks
+                if c.challenge_type == ChallengeType::Container {
+                    if extra.internal_port.is_none() && extra.internal_ports.is_none() {
+                        issues.push(Issue::error(
+                            name,
+                            "extra.internal_port",
+                            "required for container challenges",
+                        ));
+                    }
+                    // image must be present at top level or in extra
+                    if c.image.is_none() && extra.image.is_none() {
+                        issues.push(Issue::error(
+                            name,
+                            "image",
+                            "required for container challenges — set at top level or in extra",
+                        ));
+                    }
                 }
             }
         },
@@ -296,11 +306,18 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         _ => {}
     }
 
-    // flags
+    // flags: container challenges with flag_mode=random auto-generate flags,
+    // so the `flags:` block is not required.
+    let is_random_container = c.challenge_type == ChallengeType::Container
+        && matches!(
+            c.extra.as_ref().and_then(|e| e.flag_mode.as_ref()),
+            Some(FlagMode::Random)
+        );
+
     let flags = c.flags.as_deref().unwrap_or(&[]);
-    if flags.is_empty() {
+    if !is_random_container && flags.is_empty() {
         issues.push(Issue::error(name, "flags", "no flags defined"));
-    } else {
+    } else if !is_random_container {
         for (i, flag) in flags.iter().enumerate() {
             let content = match flag {
                 FlagContent::Simple(s) => s.as_str(),
@@ -423,10 +440,11 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     let type_str = match c.challenge_type {
         ChallengeType::Standard => "standard",
         ChallengeType::Dynamic => "dynamic",
+        ChallengeType::Container => "container",
     };
     frow(FW, "type", Some(type_str), fi("type"));
 
-    // value / extra — depends on challenge type
+    // value / extra — only the fields that are relevant per type
     match c.challenge_type {
         ChallengeType::Standard => {
             let v = c.value.to_string();
@@ -440,6 +458,49 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 frow(FW, "extra.initial", i_s.as_deref(), fi("extra.initial"));
                 frow(FW, "extra.decay", d_s.as_deref(), fi("extra.decay"));
                 frow(FW, "extra.minimum", m_s.as_deref(), fi("extra.minimum"));
+            } else {
+                frow(FW, "extra", None, fi("extra"));
+            }
+        }
+        ChallengeType::Container => {
+            if let Some(e) = &c.extra {
+                // Scoring
+                let i_s = e.initial.map(|x| x.to_string());
+                let d_s = e.decay.map(|x| x.to_string());
+                let m_s = e.minimum.map(|x| x.to_string());
+                frow(FW, "extra.initial", i_s.as_deref(), fi("extra.initial"));
+                frow(FW, "extra.decay", d_s.as_deref(), fi("extra.decay"));
+                frow(FW, "extra.minimum", m_s.as_deref(), fi("extra.minimum"));
+                // Docker image (prefer extra.image, fall back to top-level image)
+                let img = e.image.as_deref().or(c.image.as_deref());
+                frow(FW, "image", img, fi("image"));
+                // Port
+                let port_s = e.internal_port.map(|p| p.to_string());
+                let port_str = e.internal_ports.as_deref().or(port_s.as_deref());
+                frow(FW, "extra.internal_port", port_str, fi("extra.internal_port"));
+                // Flag mode
+                let fm_s = e.flag_mode.as_ref().map(|m| match m {
+                    FlagMode::Static => "static",
+                    FlagMode::Random => "random",
+                });
+                frow(FW, "extra.flag_mode", fm_s, fi("extra.flag_mode"));
+                if matches!(e.flag_mode, Some(FlagMode::Random)) {
+                    frow(FW, "extra.flag_prefix", e.flag_prefix.as_deref(), fi("extra.flag_prefix"));
+                    frow(FW, "extra.flag_suffix", e.flag_suffix.as_deref(), fi("extra.flag_suffix"));
+                    let rfl = e.random_flag_length.map(|n| n.to_string());
+                    frow(FW, "extra.flag_len", rfl.as_deref(), fi("extra.random_flag_length"));
+                }
+                // Optional container settings
+                if let Some(df) = &e.decay_function {
+                    frow(FW, "extra.decay_fn", Some(df.as_str()), fi("extra.decay_function"));
+                }
+                if let Some(tm) = e.timeout_minutes {
+                    let t = tm.to_string();
+                    frow(FW, "extra.timeout", Some(&t), fi("extra.timeout_minutes"));
+                }
+                if let Some(cmd) = &e.command {
+                    frow(FW, "extra.command", Some(cmd.as_str()), fi("extra.command"));
+                }
             } else {
                 frow(FW, "extra", None, fi("extra"));
             }
@@ -572,6 +633,10 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     const RENDERED: &[&str] = &[
         "name", "author", "category", "description", "type", "value",
         "extra", "extra.initial", "extra.decay", "extra.minimum",
+        // container extra
+        "extra.internal_port", "extra.flag_mode", "extra.flag_prefix",
+        "extra.flag_suffix", "extra.random_flag_length", "extra.decay_function",
+        "extra.timeout_minutes", "extra.command",
         "flags", "tags", "topics", "files", "hints", "requirements",
         "next", "state", "connection_info", "attempts", "image",
         "protocol", "host", "healthcheck", "version",
@@ -840,6 +905,7 @@ mod tests {
             initial: Some(500),
             decay: Some(50),
             minimum: Some(100),
+            ..Default::default()
         });
         let report = validate_challenges(&[c]);
         assert!(!has_issue(&report, "value", "must be > 0"));
@@ -853,14 +919,14 @@ mod tests {
         c.challenge_type = ChallengeType::Dynamic;
         c.extra = None;
         let report = validate_challenges(&[c]);
-        assert!(has_issue(&report, "extra", "required for dynamic"));
+        assert!(has_issue(&report, "extra", "required"));
     }
 
     #[test]
     fn dynamic_initial_zero_is_error() {
         let mut c = make_challenge("test");
         c.challenge_type = ChallengeType::Dynamic;
-        c.extra = Some(Extra { initial: Some(0), decay: Some(50), minimum: Some(10) });
+        c.extra = Some(Extra { initial: Some(0), decay: Some(50), minimum: Some(10), ..Default::default() });
         let report = validate_challenges(&[c]);
         assert!(has_issue(&report, "extra.initial", "must be > 0"));
     }
@@ -869,7 +935,7 @@ mod tests {
     fn dynamic_initial_missing_is_error() {
         let mut c = make_challenge("test");
         c.challenge_type = ChallengeType::Dynamic;
-        c.extra = Some(Extra { initial: None, decay: Some(50), minimum: Some(10) });
+        c.extra = Some(Extra { initial: None, decay: Some(50), minimum: Some(10), ..Default::default() });
         let report = validate_challenges(&[c]);
         assert!(has_issue(&report, "extra.initial", "required"));
     }
@@ -878,7 +944,7 @@ mod tests {
     fn dynamic_decay_zero_is_error() {
         let mut c = make_challenge("test");
         c.challenge_type = ChallengeType::Dynamic;
-        c.extra = Some(Extra { initial: Some(500), decay: Some(0), minimum: Some(10) });
+        c.extra = Some(Extra { initial: Some(500), decay: Some(0), minimum: Some(10), ..Default::default() });
         let report = validate_challenges(&[c]);
         assert!(has_issue(&report, "extra.decay", "must be > 0"));
     }
@@ -887,7 +953,7 @@ mod tests {
     fn dynamic_decay_missing_is_error() {
         let mut c = make_challenge("test");
         c.challenge_type = ChallengeType::Dynamic;
-        c.extra = Some(Extra { initial: Some(500), decay: None, minimum: Some(10) });
+        c.extra = Some(Extra { initial: Some(500), decay: None, minimum: Some(10), ..Default::default() });
         let report = validate_challenges(&[c]);
         assert!(has_issue(&report, "extra.decay", "required"));
     }
@@ -896,7 +962,7 @@ mod tests {
     fn dynamic_missing_minimum_is_warning() {
         let mut c = make_challenge("test");
         c.challenge_type = ChallengeType::Dynamic;
-        c.extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: None });
+        c.extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: None, ..Default::default() });
         let report = validate_challenges(&[c]);
         assert!(has_issue(&report, "extra.minimum", "not set"));
         assert!(warnings(&report).iter().any(|i| i.field.as_deref() == Some("extra.minimum")));
@@ -906,7 +972,7 @@ mod tests {
     fn dynamic_all_valid_no_errors() {
         let mut c = make_challenge("test");
         c.challenge_type = ChallengeType::Dynamic;
-        c.extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: Some(100) });
+        c.extra = Some(Extra { initial: Some(500), decay: Some(50), minimum: Some(100), ..Default::default() });
         let report = validate_challenges(&[c]);
         assert!(errors(&report).is_empty());
     }

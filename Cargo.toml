@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "src/nervctf",
+    "src/remote-monitor",
+]
+resolver = "2"

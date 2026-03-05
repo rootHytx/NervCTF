@@ -1,0 +1,29 @@
+[package]
+name = "nervctf"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "nervctf"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.6", features = ["codec"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "stream", "blocking", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+walkdir = "2.4"
+dotenv = "0.15"
+anyhow = "1.0"
+hyper = { version = "0.14", features = ["full"] }
+tempfile = "3.20.0"
+dialoguer = "0.11"
+
+[dev-dependencies]
+mockito = "1.3"

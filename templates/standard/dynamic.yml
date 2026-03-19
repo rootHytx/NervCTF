@@ -1,0 +1,34 @@
+name: "Challenge Name"
+author: "author"
+category: misc  # web, pwn, rev, crypto, forensics, misc, osint, ...
+description: |
+    Describe the challenge here.
+value: 500      # ignored at runtime — use extra.initial below
+type: dynamic
+state: visible
+
+# Dynamic scoring: starts at `initial`, decays toward `minimum` as more teams solve.
+# `decay` = number of solves at which the value reaches the midpoint.
+extra:
+    initial: 500
+    decay: 100
+    minimum: 50
+    # decay_function: logarithmic  # linear (default) | logarithmic
+
+flags:
+    - CTF{your_flag_here}
+
+tags:
+    - tag1
+    - tag2
+
+# files:
+#     - dist/challenge.zip
+
+# hints:
+#     - { content: "Hint text here", cost: 50 }
+
+# requirements:
+#     - "Other Challenge Name"
+
+version: "0.3"

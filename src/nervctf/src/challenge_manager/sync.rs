@@ -1,6 +1,3 @@
-//! Challenge synchronization module for CTFd challenge management
-//! Handles synchronization between local challenge files and remote CTFd instance
-
 use crate::challenge_manager::ChallengeManager;
 use crate::ctfd_api::models::{Challenge, FlagContent};
 use anyhow::{anyhow, Result};
@@ -99,25 +96,22 @@ pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
     false
 }
 
-/// Synchronizes challenges between local files and remote CTFd instance
 pub struct ChallengeSynchronizer {
     challenge_manager: ChallengeManager,
 }
 
 impl ChallengeSynchronizer {
-    /// Creates a new ChallengeSynchronizer instance
     pub fn new(challenge_manager: ChallengeManager) -> Self {
         Self { challenge_manager }
     }
 
-    /// Synchronizes challenges between local and remote
     pub async fn sync(&mut self, show_diff: bool) -> Result<()> {
-        println!("🔄 Starting challenge synchronization...");
+        println!("starting challenge synchronization...");
 
         let local_challenges = self.challenge_manager.scan_local_challenges()?;
-        println!("📊 Local challenges: {}", local_challenges.len());
+        println!("local challenges: {}", local_challenges.len());
         let remote_challenges = self.challenge_manager.get_all_challenges().await?.unwrap();
-        println!("📊 Remote challenges: {}", remote_challenges.len());
+        println!("remote challenges: {}", remote_challenges.len());
 
         self.challenge_manager
             .generate_requirements_list(local_challenges.clone());
@@ -171,106 +165,21 @@ impl ChallengeSynchronizer {
 
         self.execute_actions(actions).await?;
 
-        println!("✅ Synchronization completed!");
+        println!("synchronization complete.");
         Ok(())
     }
 
-    /// Gap 5 fix: comprehensive field comparison
-    fn needs_update(
-        &self,
-        remote: &crate::ctfd_api::models::Challenge,
-        local: &Challenge,
-    ) -> Result<bool> {
-        if remote.category != local.category {
-            return Ok(true);
-        }
-        if remote.value != local.value {
-            return Ok(true);
-        }
-        if remote.description != local.description {
-            return Ok(true);
-        }
-        if remote.state != local.state {
-            return Ok(true);
-        }
-        if remote.connection_info != local.connection_info {
-            return Ok(true);
-        }
-        if remote.attempts != local.attempts {
-            return Ok(true);
-        }
-
-        // Compare extra by JSON serialization
-        let remote_extra = serde_json::to_value(&remote.extra).unwrap_or_default();
-        let local_extra = serde_json::to_value(&local.extra).unwrap_or_default();
-        if remote_extra != local_extra {
-            return Ok(true);
-        }
-
-        // Flags, tags, hints: CTFd list endpoint never returns these fields,
-        // so remote.* is always None. Only compare when both sides have data.
-        if let (Some(rf_list), Some(lf_list)) = (&remote.flags, &local.flags) {
-            let mut remote_flags: Vec<String> = rf_list
-                .iter()
-                .map(|f| match f {
-                    FlagContent::Simple(s) => s.clone(),
-                    FlagContent::Detailed { content, .. } => content.clone(),
-                })
-                .collect();
-            remote_flags.sort();
-            let mut local_flags: Vec<String> = lf_list
-                .iter()
-                .map(|f| match f {
-                    FlagContent::Simple(s) => s.clone(),
-                    FlagContent::Detailed { content, .. } => content.clone(),
-                })
-                .collect();
-            local_flags.sort();
-            if remote_flags != local_flags {
-                return Ok(true);
-            }
-        }
-
-        if let (Some(rt_list), Some(lt_list)) = (&remote.tags, &local.tags) {
-            let mut remote_tags: Vec<String> =
-                rt_list.iter().map(|t| t.value_str().to_string()).collect();
-            remote_tags.sort();
-            let mut local_tags: Vec<String> =
-                lt_list.iter().map(|t| t.value_str().to_string()).collect();
-            local_tags.sort();
-            if remote_tags != local_tags {
-                return Ok(true);
-            }
-        }
-
-        if let (Some(rh_list), Some(lh_list)) = (&remote.hints, &local.hints) {
-            let mut remote_hints: Vec<String> =
-                rh_list.iter().map(|h| h.content_str().to_string()).collect();
-            remote_hints.sort();
-            let mut local_hints: Vec<String> =
-                lh_list.iter().map(|h| h.content_str().to_string()).collect();
-            local_hints.sort();
-            if remote_hints != local_hints {
-                return Ok(true);
-            }
-        }
-
-        // Requirements: detect presence change
-        if remote.requirements.is_some() != local.requirements.is_some() {
-            return Ok(true);
-        }
-
-        Ok(false)
+    fn needs_update(&self, remote: &Challenge, local: &Challenge) -> Result<bool> {
+        Ok(needs_update(remote, local))
     }
 
-    /// Shows the synchronization diff
     fn show_diff(&self, actions: &[SyncAction<'_>]) -> Result<()> {
-        println!("\n📋 Synchronization Diff:");
+        println!("\nsync diff:");
         println!("{}", "=".repeat(50));
-        let mut created_string = String::from("➕ CREATE:\n");
-        let mut updated_string = String::from("🔄 UPDATE:\n");
-        let mut up_to_date_string = String::from("✅ UP-TO-DATE:\n");
-        let mut remote_only_string = String::from("ℹ️  REMOTE-ONLY:\n");
+        let mut created_string = String::from("[+] CREATE:\n");
+        let mut updated_string = String::from("[~] UPDATE:\n");
+        let mut up_to_date_string = String::from("[=] UP-TO-DATE:\n");
+        let mut remote_only_string = String::from("[i] REMOTE-ONLY:\n");
         let mut has_creates = false;
         let mut has_updates = false;
         let mut has_up_to_date = false;
@@ -320,7 +229,6 @@ impl ChallengeSynchronizer {
         Ok(())
     }
 
-    /// Executes synchronization actions
     async fn execute_actions(&mut self, mut actions: Vec<SyncAction<'_>>) -> Result<()> {
         let mut created = 0;
         let mut updated = 0;
@@ -336,14 +244,14 @@ impl ChallengeSynchronizer {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if input.trim().to_lowercase() != "y" {
-            println!("❌ Aborting synchronization.");
+            println!("aborted.");
             return Ok(());
         }
-        println!("\n🚀 Executing synchronization actions...");
+        println!("\nexecuting synchronization actions...");
         for action in &actions {
             match action {
                 SyncAction::Create { name, challenge } => {
-                    println!("🆕 Creating: {}", name);
+                    println!("[+] creating: {}", name);
                     self.challenge_manager.create_challenge(challenge).await?;
                     created += 1;
                 }
@@ -352,7 +260,7 @@ impl ChallengeSynchronizer {
                     local,
                     remote,
                 } => {
-                    println!("🔄 Updating: {}", name);
+                    println!("[~] updating: {}", name);
                     let challenge_id = remote
                         .id
                         .ok_or_else(|| anyhow!("Remote challenge has no ID"))?;
@@ -362,16 +270,16 @@ impl ChallengeSynchronizer {
                     updated += 1;
                 }
                 SyncAction::UpToDate { name, .. } => {
-                    println!("✅ Up-to-date: {}", name);
+                    println!("[=] up-to-date: {}", name);
                     up_to_date += 1;
                 }
                 SyncAction::RemoteOnly { name, .. } => {
-                    println!("ℹ️  Remote-only: {}", name);
+                    println!("[i] remote-only: {}", name);
                     remote_only += 1;
                 }
             }
         }
-        println!("\n📊 Sync Summary:");
+        println!("\nsummary:");
         println!("  Created: {}", created);
         println!("  Updated: {}", updated);
         println!("  Up-to-date: {}", up_to_date);
@@ -401,6 +309,7 @@ mod tests {
             challenge_id: None,
             author: None,
             extra: None,
+            instance: None,
             image: None,
             protocol: None,
             host: None,

@@ -1,0 +1,44 @@
+name: "Challenge Name"
+author: "author"
+category: pwn   # web, pwn, rev, crypto, forensics, misc, ...
+description: |
+    Describe the challenge here.
+
+    Connect with: `nc <host> <port>`
+value: 500      # ignored at runtime — controlled by extra.initial
+type: instance
+state: visible
+
+instance:
+    backend: docker
+    image: .
+    internal_port: 4000
+    connection: nc  # nc | http | ssh
+
+    flag_mode: random
+    flag_prefix: "CTF{"
+    flag_suffix: "}"
+    random_flag_length: 16
+
+    command: "/bin/sh -c 'echo $FLAG > /challenge/flag && unset FLAG && exec /challenge/binary'"
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+# Dynamic scoring
+extra:
+    initial: 500
+    decay: 100
+    minimum: 50
+    # decay_function: logarithmic  # linear (default) | logarithmic
+
+tags:
+    - tag1
+
+# files:
+#     - dist/challenge.zip
+
+# hints:
+#     - { content: "Hint text here", cost: 50 }
+
+version: "0.3"

@@ -4,3 +4,7 @@ members = [
     "src/remote-monitor",
 ]
 resolver = "2"
+
+[workspace.package]
+name = "nervctf"
+version = "0.1.0"

@@ -1,0 +1,62 @@
+name: "Challenge Name"
+author: "author"
+category: web
+description: |
+    Describe the challenge here.
+
+    Access at: `http://<host>:<port>`
+value: 100
+type: instance
+state: visible
+
+instance:
+    backend: compose
+    compose_file: docker-compose.yml
+    compose_service: app
+    internal_port: 8080
+    connection: http  # nc | http | ssh
+
+    # Random per-team flag — the monitor generates a unique flag per instance.
+    flag_mode: random
+    flag_prefix: "CTF{"
+    flag_suffix: "}"
+    random_flag_length: 16
+
+    # How the flag reaches the container:
+    #
+    #   env (default): FLAG is passed as a Docker Compose environment variable.
+    #     Use ${FLAG} substitution in docker-compose.yml:
+    #       services:
+    #         app:
+    #           environment:
+    #             - FLAG=${FLAG}
+    #     Then in the entrypoint: write $FLAG to disk and `unset FLAG` (not `unset $FLAG`).
+    #
+    #   file: FLAG is written to a file and bind-mounted read-only into the container.
+    #     Requires flag_file_path (absolute path inside container).
+    #     Optionally specify flag_service if the target service differs from compose_service.
+    flag_delivery: env
+
+    # Required only when flag_delivery: file
+    # flag_file_path: /challenge/flag
+    # flag_service: app   # defaults to compose_service if omitted
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+# Dynamic scoring (optional)
+# extra:
+#     initial: 500
+#     decay: 100
+#     minimum: 50
+
+# flags: not needed — monitor generates and verifies at runtime
+
+tags:
+    - tag1
+    - web
+
+# files:
+#     - dist/source.zip
+
+version: "0.3"

@@ -2,69 +2,50 @@
 
 ## Overview
 
-The `validator` module provides a static analysis pass over a collection of parsed
-`Challenge` structs. It is called automatically before every `deploy` (blocking on
-errors) and is also exposed as the standalone `nervctf validate` subcommand.
-
-Unlike the scanner (which catches YAML parse failures) or `nervctf fix` (which
-patches missing fields interactively), the validator works on fully-parsed
-challenges and focuses on logical and referential correctness.
+The `validator` module performs static analysis over parsed `Challenge` structs. It runs
+automatically before every `deploy` (errors block deployment) and is exposed as `nervctf validate`.
 
 ---
 
 ## Architecture
 
 ```
-src/
-└── validator.rs
-    ├── Severity          (Error | Warning)
-    ├── Issue             (per-finding record)
-    ├── ValidationReport  (result set + print helper)
-    ├── validate_challenges()   ← public entry point
-    └── validate_one()          ← per-challenge checks (private)
+src/validator.rs
+├── Severity          (Error | Warning)
+├── Issue             (per-finding record)
+├── ValidationReport  (result set + print helper)
+├── RENDERED          (set of known field paths — suppresses unknown-key warnings)
+├── validate_challenges()   ← public entry point
+└── validate_one()          ← per-challenge checks (private)
 ```
 
 ---
 
 ## Public API
 
-### `validate_challenges(challenges: &[Challenge]) -> ValidationReport`
+### `validate_challenges(base_dir: &Path, fix_mode: bool) -> Result<()>`
 
-The main entry point. Accepts a slice of already-parsed challenges and returns a
-`ValidationReport` containing all findings sorted errors-first, then alphabetically
-by challenge name.
+Scans `base_dir` via `DirectoryScanner`, validates all found challenges, prints the report,
+and returns `Err` if any errors are present.
 
-```rust
-let challenges = scanner.scan_directory(&base_dir)?;
-let report = validate_challenges(&challenges);
-report.print();
-if report.has_errors() {
-    // block deployment
-}
+```sh
+nervctf validate --base-dir ./challenges
+echo $?   # 0 = clean or warnings only, 1 = errors present
 ```
-
-Cross-challenge checks (duplicate names) run first, then per-challenge checks for
-each entry.
 
 ---
 
 ### `ValidationReport`
 
-```rust
-pub struct ValidationReport {
-    pub issues: Vec<Issue>,
-}
-```
-
 | Method | Description |
 |--------|-------------|
 | `has_errors() -> bool` | True if any `Severity::Error` is present |
 | `is_clean() -> bool` | True if `issues` is empty |
-| `error_count() -> usize` | Number of errors |
-| `warning_count() -> usize` | Number of warnings |
-| `print()` | Pretty-prints all issues to stdout |
+| `error_count() -> usize` | |
+| `warning_count() -> usize` | |
+| `print()` | Pretty-prints to stdout |
 
-`print()` output format:
+Output format:
 ```
   ❌ ERROR   [challenge-name.field] message
   ⚠️  WARN   [challenge-name.field] message
@@ -74,38 +55,15 @@ pub struct ValidationReport {
 
 ---
 
-### `Issue`
-
-```rust
-pub struct Issue {
-    pub severity: Severity,
-    pub challenge: String,   // empty string for cross-challenge issues
-    pub field: Option<String>,
-    pub message: String,
-}
-```
-
----
-
-### `Severity`
-
-```rust
-pub enum Severity { Error, Warning }
-```
-
-`Error < Warning` in ordering (errors sort first in the report).
-
----
-
 ## Checks Reference
 
-### Cross-challenge checks
+### Cross-challenge
 
-| Check | Severity | Description |
-|-------|----------|-------------|
-| Duplicate names | Error | Two or more challenges share the same `name` |
+| Check | Severity |
+|-------|----------|
+| Duplicate challenge names | Error |
 
-### Per-challenge checks
+### Per-challenge
 
 | Field | Check | Severity |
 |-------|-------|----------|
@@ -117,30 +75,45 @@ pub enum Severity { Error, Warning }
 | `extra.decay` | Missing or 0 for `dynamic` | Error |
 | `extra.minimum` | Not set for `dynamic` | Warning |
 | `description` | Missing or empty | Warning |
-| `flags` | None defined | Error |
+| `flags` | None defined (for non-random-instance challenges) | Error |
 | `flags[i]` | Empty content | Error |
 | `files` | Referenced path not found on disk | Error |
 | `requirements` | Prerequisite is the challenge itself | Error |
 | `requirements` | Named prerequisite not in local set | Warning |
 | `next` | Points to the challenge itself | Error |
 | `next` | Target not found in local set | Warning |
+| `unknown_yaml_keys` | Unrecognised top-level key | Warning |
 
-**Note on numeric requirement IDs**: prerequisites that parse as `u32` (e.g.
-`- 1`) are assumed to reference remote CTFd IDs and are skipped during local
-validation.
+### `type: instance` specific checks
 
-**Note on `requirements` warnings vs. errors**: missing prerequisites are
-warnings rather than errors because they might exist on the remote CTFd instance
-already (e.g. imported from a previous campaign). If strict enforcement is
-desired, treat any warning as a failure in CI by checking the exit code and
-`error_count()`.
+| Field | Check | Severity |
+|-------|-------|----------|
+| `instance` | Block missing | Error |
+| `instance.internal_port` | Missing or 0 | Error |
+| `instance.connection` | Missing or empty | Error |
+| `instance.flag_mode: random` | `flags:` list also present (conflict) | Warning |
+| `instance.backend: compose` | No `compose_service` set | Warning |
+| `instance.flag_delivery: file` | `flag_file_path` not set | Warning |
+
+**Notes:**
+- Numeric requirement IDs (e.g. `- 1`) are skipped during local validation (assumed remote CTFd IDs).
+- Missing prerequisites are warnings (not errors) because they may already exist on the remote instance.
+
+---
+
+## `RENDERED` constant
+
+A `HashSet<&str>` of all known field paths. Any top-level YAML key not in this set (and not in
+`RENDERED`) produces an `unknown_yaml_keys` warning. Includes all `instance.*` subfields:
+`instance.flag_delivery`, `instance.flag_file_path`, `instance.flag_service`,
+`instance.flag_prefix`, `instance.flag_suffix`, `instance.random_flag_length`,
+`instance.compose_file`, `instance.compose_service`, `instance.lxc_image`,
+`instance.vagrantfile`, `instance.timeout_minutes`, `instance.max_per_team`,
+`instance.max_renewals`, `instance.command`.
 
 ---
 
 ## Integration with `deploy`
-
-`deploy_challenges()` in `main.rs` runs `validate_challenges()` immediately after
-scanning local challenges, before computing the diff or making any API call:
 
 ```
 scan_directory()
@@ -149,49 +122,27 @@ scan_directory()
            └─ warnings only? → print report, continue to diff
 ```
 
-This ensures bad challenge data never reaches CTFd and gives actionable feedback
-before any network I/O.
-
 ---
 
-## Standalone `nervctf validate`
+## Extending
 
-The `validate` subcommand does not require CTFd credentials — it is handled before
-credential resolution in `main.rs`. Exit code is 1 when any error is present,
-making it suitable for use in CI:
-
-```sh
-nervctf validate --base-dir ./challenges
-echo $?   # 0 = clean or warnings only, 1 = errors present
-```
-
----
-
-## Extending the Validator
-
-To add a new check, add a call to `validate_one()` in `validator.rs`. Use the
-`Issue::error()` or `Issue::warn()` constructors:
+Add calls in `validate_one()` for per-challenge checks, or in `validate_challenges()` for
+cross-challenge checks:
 
 ```rust
-// Error example
 if some_condition {
-    issues.push(Issue::error(name, "field_name", "human-readable message"));
+    issues.push(Issue::error(name, "field_name", "message"));
 }
-
-// Warning example
-if some_other_condition {
-    issues.push(Issue::warn(name, "field_name", "human-readable message"));
+if other_condition {
+    issues.push(Issue::warn(name, "field_name", "message"));
 }
 ```
 
-For cross-challenge checks (e.g. checking that all `next:` targets form a DAG),
-add logic in `validate_challenges()` before the per-challenge loop, using
-`Issue::error_global()` for issues that don't belong to a single challenge.
+For global issues (not tied to a single challenge), use `Issue::error_global()`.
 
 ---
 
 ## References
 
-- `src/nervctf/src/validator.rs` — implementation
+- `src/nervctf/src/validator.rs`
 - `src/nervctf/src/main.rs` — `validate_command()`, pre-deploy integration
-- [ctfcli challenge spec](https://github.com/CTFd/ctfcli)

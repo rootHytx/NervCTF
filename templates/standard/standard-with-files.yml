@@ -1,0 +1,34 @@
+name: "Challenge Name"
+author: "author"
+category: misc  # web, pwn, rev, crypto, forensics, misc, osint, ...
+description: |
+    Describe the challenge here.
+
+    Players can download the provided files to start solving.
+value: 100
+type: standard
+state: visible
+
+flags:
+    - CTF{your_flag_here}
+
+tags:
+    - tag1
+    - tag2
+
+# All files for a challenge must be listed here (paths relative to this challenge.yml).
+# All files are uploaded in a single request — do not split into multiple deploys.
+files:
+    - dist/challenge.zip
+    # - dist/source.c
+    # - dist/Dockerfile   # if players need the build environment
+
+# hints:
+#     - { content: "Hint text here", cost: 10 }
+
+# requirements:
+#     - "Other Challenge Name"
+
+# attempts: 5
+
+version: "0.3"

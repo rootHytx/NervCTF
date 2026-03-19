@@ -1,0 +1,40 @@
+name: "Challenge Name"
+author: "author"
+category: misc
+description: |
+    Describe the challenge here.
+
+    Connect with: `nc <host> <port>`
+value: 100
+type: instance
+state: visible
+
+instance:
+    backend: vagrant
+
+    # Path to the directory containing the Vagrantfile on the monitor server.
+    vagrantfile: /opt/challenges/challenge-name/vagrant
+
+    internal_port: 4000
+    connection: nc  # nc | http | ssh
+
+    # Static flag — bake it into the box image or provision it via the Vagrantfile.
+    # The Vagrant backend does not inject FLAG env var automatically.
+    flag_mode: static
+
+    timeout_minutes: 60  # VMs take longer to start
+    # max_renewals: 2
+
+# Dynamic scoring (optional)
+# extra:
+#     initial: 500
+#     decay: 100
+#     minimum: 50
+
+flags:
+    - CTF{your_static_flag_here}
+
+tags:
+    - tag1
+
+version: "0.3"

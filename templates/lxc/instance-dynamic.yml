@@ -1,0 +1,35 @@
+name: "Challenge Name"
+author: "author"
+category: misc
+description: |
+    Describe the challenge here.
+
+    Connect with: `nc <host> <port>`
+value: 500
+type: instance
+state: visible
+
+instance:
+    backend: lxc
+    lxc_image: ubuntu:22.04
+    internal_port: 4000
+    connection: nc
+
+    flag_mode: random
+    flag_prefix: "CTF{"
+    flag_suffix: "}"
+    random_flag_length: 16
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+extra:
+    initial: 500
+    decay: 100
+    minimum: 50
+    # decay_function: logarithmic
+
+tags:
+    - tag1
+
+version: "0.3"

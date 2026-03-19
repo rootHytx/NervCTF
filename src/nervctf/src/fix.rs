@@ -1,8 +1,144 @@
 use anyhow::Result;
 use dialoguer::{Confirm, Input, Select};
+use serde_yaml::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+// Fields from extra: that move into instance:
+const INSTANCE_FIELDS: &[&str] = &[
+    "image",
+    "internal_port",
+    "flag_mode",
+    "flag_prefix",
+    "flag_suffix",
+    "random_flag_length",
+    "timeout_minutes",
+    "command",
+    "max_renewals",
+];
+
+// Fields dropped entirely (docker-only, not in new model)
+const DROP_FIELDS: &[&str] = &[
+    "internal_ports",
+    "decay_function",
+    "memory_limit",
+    "cpu_limit",
+    "pids_limit",
+];
+
+fn migrate_file(path: &Path, dry_run: bool) -> Result<bool> {
+    let contents = fs::read_to_string(path)?;
+
+    // Quick pre-check before full parse
+    if !contents
+        .lines()
+        .any(|l| l.starts_with("type:") && l.contains("container"))
+    {
+        return Ok(false);
+    }
+
+    let mut doc: Value = serde_yaml::from_str(&contents)?;
+
+    let type_val = doc
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if type_val != "container" {
+        return Ok(false);
+    }
+
+    // Change type
+    if let Some(m) = doc.as_mapping_mut() {
+        m.insert(
+            Value::String("type".into()),
+            Value::String("instance".into()),
+        );
+    }
+
+    // Build instance block
+    let mut instance = serde_yaml::Mapping::new();
+    instance.insert(
+        Value::String("backend".into()),
+        Value::String("docker".into()),
+    );
+
+    let mut connection_set = false;
+
+    if let Some(Value::Mapping(extra)) = doc.get_mut("extra") {
+        // Rename connection_type → connection
+        if let Some(ct) = extra.remove("connection_type") {
+            instance.insert(Value::String("connection".into()), ct);
+            connection_set = true;
+        }
+
+        for &field in INSTANCE_FIELDS {
+            if let Some(val) = extra.remove(field) {
+                instance.insert(Value::String(field.into()), val);
+            }
+        }
+
+        for &field in DROP_FIELDS {
+            extra.remove(field);
+        }
+    }
+
+    if !connection_set {
+        instance.insert(
+            Value::String("connection".into()),
+            Value::String("nc".into()),
+        );
+    }
+
+    // Add instance block; remove extra if now empty
+    if let Some(m) = doc.as_mapping_mut() {
+        m.insert(Value::String("instance".into()), Value::Mapping(instance));
+
+        if let Some(Value::Mapping(extra)) = m.get("extra") {
+            if extra.is_empty() {
+                m.remove("extra");
+            }
+        }
+    }
+
+    if dry_run {
+        println!("  [dry-run] {}", path.display());
+        return Ok(true);
+    }
+
+    fs::write(path, serde_yaml::to_string(&doc)?)?;
+    println!("  Migrated: {}", path.display());
+    Ok(true)
+}
+
+pub fn run_migrate_containers(base_dir: &Path, dry_run: bool) -> Result<()> {
+    println!(
+        "Scanning for type:container challenges in {} ...",
+        base_dir.display()
+    );
+
+    let mut count = 0;
+    for entry in WalkDir::new(base_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name() == "challenge.yml")
+    {
+        if migrate_file(entry.path(), dry_run)? {
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        println!("No type:container challenges found.");
+    } else if dry_run {
+        println!("\nDry run: {} file(s) would be migrated.", count);
+    } else {
+        println!("\nMigrated {} file(s) to type:instance.", count);
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, Default)]
 struct Issues {
@@ -257,7 +393,7 @@ pub fn run_fix(base_dir: &Path, dry_run: bool) -> Result<()> {
     }
 
     if dry_run {
-        println!("\nDry run complete — no files were modified.");
+        println!("\nDry run complete -- no files were modified.");
     } else {
         println!("\nFix complete.");
     }

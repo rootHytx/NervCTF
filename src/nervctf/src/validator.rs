@@ -1,7 +1,7 @@
 //! Challenge YAML validator
 //! Checks challenge structs for correctness before deploying to CTFd.
 
-use crate::ctfd_api::models::{Challenge, ChallengeType, FlagContent, FlagMode, FlagType, State, Tag};
+use crate::ctfd_api::models::{Challenge, ChallengeType, FlagContent, FlagType, InstanceFlagMode, State, Tag};
 use crate::directory_scanner::ScanFailure;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -125,7 +125,7 @@ impl ValidationReport {
         if !failures.is_empty() {
             println!("PARSE FAILURES  ({} file(s) could not be loaded)", failures.len());
             for f in failures {
-                println!("  ❌  {}", f.path.display());
+                println!("  [x]  {}", f.path.display());
                 // Indent each line of the error message
                 for line in f.error.lines() {
                     println!("      {}", line);
@@ -165,11 +165,11 @@ impl ValidationReport {
         let clean = valid.saturating_sub(problems);
 
         if failed == 0 && self.is_clean() {
-            println!("✅ All {} challenge(s) valid — no issues found.", total);
+            println!("all {} challenge(s) valid -- no issues found.", total);
         } else {
             let mut parts: Vec<String> = Vec::new();
             if clean > 0 {
-                parts.push(format!("{} ✅ clean", clean));
+                parts.push(format!("{} clean", clean));
             }
             if problems > 0 {
                 parts.push(format!(
@@ -180,7 +180,7 @@ impl ValidationReport {
                 ));
             }
             if failed > 0 {
-                parts.push(format!("{} ❌ failed to parse", failed));
+                parts.push(format!("{} failed to parse", failed));
             }
             println!("Validated {} challenge(s): {}", total, parts.join(", "));
             if verbose {
@@ -246,9 +246,9 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         issues.push(Issue::error(name, "category", "must not be empty"));
     }
 
-    // value / dynamic / container extra
+    // value / dynamic / instance extra
     match c.challenge_type {
-        ChallengeType::Dynamic | ChallengeType::Container => match &c.extra {
+        ChallengeType::Dynamic => match &c.extra {
             None => issues.push(Issue::error(
                 name,
                 "extra",
@@ -272,26 +272,52 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                         "not set (CTFd will default to 0)",
                     ));
                 }
-                // Container-specific checks
-                if c.challenge_type == ChallengeType::Container {
-                    if extra.internal_port.is_none() && extra.internal_ports.is_none() {
+            }
+        },
+        ChallengeType::Instance => {
+            match &c.instance {
+                None => issues.push(Issue::error(
+                    name,
+                    "instance",
+                    "required for instance challenges — must have backend, internal_port, connection",
+                )),
+                Some(inst) => {
+                    if inst.internal_port == 0 {
+                        issues.push(Issue::error(name, "instance.internal_port", "must be > 0"));
+                    }
+                    if inst.connection.trim().is_empty() {
+                        issues.push(Issue::error(name, "instance.connection", "required (e.g. 'nc', 'http', 'ssh')"));
+                    }
+                    // Flag requirements
+                    let is_random = matches!(inst.flag_mode, Some(InstanceFlagMode::Random));
+                    if !is_random && c.flags.as_ref().map(|f| f.is_empty()).unwrap_or(true) {
                         issues.push(Issue::error(
-                            name,
-                            "extra.internal_port",
-                            "required for container challenges",
+                            name, "flags",
+                            "required for instance challenges unless flag_mode: random",
                         ));
                     }
-                    // image must be present at top level or in extra
-                    if c.image.is_none() && extra.image.is_none() {
+                    // flag_delivery: file requires flag_file_path
+                    if matches!(inst.flag_delivery, Some(crate::ctfd_api::models::FlagDelivery::File))
+                        && inst.flag_file_path.is_none()
+                    {
                         issues.push(Issue::error(
                             name,
-                            "image",
-                            "required for container challenges — set at top level or in extra",
+                            "instance.flag_file_path",
+                            "required when flag_delivery: file — absolute path inside the container",
                         ));
                     }
                 }
             }
-        },
+            // Instance may optionally have extra for dynamic scoring
+            if let Some(extra) = &c.extra {
+                if let Some(0) = extra.initial {
+                    issues.push(Issue::error(name, "extra.initial", "must be > 0"));
+                }
+                if let Some(0) = extra.decay {
+                    issues.push(Issue::error(name, "extra.decay", "must be > 0"));
+                }
+            }
+        }
         ChallengeType::Standard => {
             if c.value == 0 {
                 issues.push(Issue::error(name, "value", "must be > 0"));
@@ -306,18 +332,21 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         _ => {}
     }
 
-    // flags: container challenges with flag_mode=random auto-generate flags,
-    // so the `flags:` block is not required.
-    let is_random_container = c.challenge_type == ChallengeType::Container
+    // Instance challenges with flag_mode=random auto-generate flags at runtime,
+    // so `flags:` is not required for those.
+    let is_random_instance = c.challenge_type == ChallengeType::Instance
         && matches!(
-            c.extra.as_ref().and_then(|e| e.flag_mode.as_ref()),
-            Some(FlagMode::Random)
+            c.instance.as_ref().and_then(|i| i.flag_mode.as_ref()),
+            Some(InstanceFlagMode::Random)
         );
 
     let flags = c.flags.as_deref().unwrap_or(&[]);
-    if !is_random_container && flags.is_empty() {
+    // For Instance type, flags are validated in the Instance match arm above.
+    // For Standard/Dynamic, require flags unless random instance.
+    let skip_flags_check = is_random_instance || c.challenge_type == ChallengeType::Instance;
+    if !skip_flags_check && flags.is_empty() {
         issues.push(Issue::error(name, "flags", "no flags defined"));
-    } else if !is_random_container {
+    } else if !skip_flags_check {
         for (i, flag) in flags.iter().enumerate() {
             let content = match flag {
                 FlagContent::Simple(s) => s.as_str(),
@@ -417,7 +446,7 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     // ── Header ────────────────────────────────────────────────────────────────
     let has_err = issues.iter().any(|i| i.severity == Severity::Error);
     let has_warn = issues.iter().any(|i| i.severity == Severity::Warning);
-    let hdr = if has_err { "❌" } else if has_warn { "⚠ " } else { "✅" };
+    let hdr = if has_err { "[x]" } else if has_warn { "[!]" } else { "[ok]" };
     println!("{} \"{}\"  [{}]", hdr, c.name, c.category);
 
     if issues.is_empty() {
@@ -440,7 +469,7 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     let type_str = match c.challenge_type {
         ChallengeType::Standard => "standard",
         ChallengeType::Dynamic => "dynamic",
-        ChallengeType::Container => "container",
+        ChallengeType::Instance => "instance",
     };
     frow(FW, "type", Some(type_str), fi("type"));
 
@@ -462,47 +491,31 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 frow(FW, "extra", None, fi("extra"));
             }
         }
-        ChallengeType::Container => {
+        ChallengeType::Instance => {
+            if let Some(inst) = &c.instance {
+                let port_s = inst.internal_port.to_string();
+                frow(FW, "instance.backend", Some(&format!("{:?}", inst.backend).to_lowercase()), fi("instance.backend"));
+                frow(FW, "instance.internal_port", Some(&port_s), fi("instance.internal_port"));
+                frow(FW, "instance.connection", Some(&inst.connection), fi("instance.connection"));
+                if let Some(img) = &inst.image {
+                    frow(FW, "instance.image", Some(img.as_str()), fi("instance.image"));
+                }
+                let fm_s = inst.flag_mode.as_ref().map(|m| match m {
+                    InstanceFlagMode::Static => "static",
+                    InstanceFlagMode::Random => "random",
+                });
+                frow(FW, "instance.flag_mode", fm_s, fi("instance.flag_mode"));
+            } else {
+                frow(FW, "instance", None, fi("instance"));
+            }
+            // Optional dynamic scoring for instance challenges
             if let Some(e) = &c.extra {
-                // Scoring
                 let i_s = e.initial.map(|x| x.to_string());
                 let d_s = e.decay.map(|x| x.to_string());
                 let m_s = e.minimum.map(|x| x.to_string());
                 frow(FW, "extra.initial", i_s.as_deref(), fi("extra.initial"));
                 frow(FW, "extra.decay", d_s.as_deref(), fi("extra.decay"));
                 frow(FW, "extra.minimum", m_s.as_deref(), fi("extra.minimum"));
-                // Docker image (prefer extra.image, fall back to top-level image)
-                let img = e.image.as_deref().or(c.image.as_deref());
-                frow(FW, "image", img, fi("image"));
-                // Port
-                let port_s = e.internal_port.map(|p| p.to_string());
-                let port_str = e.internal_ports.as_deref().or(port_s.as_deref());
-                frow(FW, "extra.internal_port", port_str, fi("extra.internal_port"));
-                // Flag mode
-                let fm_s = e.flag_mode.as_ref().map(|m| match m {
-                    FlagMode::Static => "static",
-                    FlagMode::Random => "random",
-                });
-                frow(FW, "extra.flag_mode", fm_s, fi("extra.flag_mode"));
-                if matches!(e.flag_mode, Some(FlagMode::Random)) {
-                    frow(FW, "extra.flag_prefix", e.flag_prefix.as_deref(), fi("extra.flag_prefix"));
-                    frow(FW, "extra.flag_suffix", e.flag_suffix.as_deref(), fi("extra.flag_suffix"));
-                    let rfl = e.random_flag_length.map(|n| n.to_string());
-                    frow(FW, "extra.flag_len", rfl.as_deref(), fi("extra.random_flag_length"));
-                }
-                // Optional container settings
-                if let Some(df) = &e.decay_function {
-                    frow(FW, "extra.decay_fn", Some(df.as_str()), fi("extra.decay_function"));
-                }
-                if let Some(tm) = e.timeout_minutes {
-                    let t = tm.to_string();
-                    frow(FW, "extra.timeout", Some(&t), fi("extra.timeout_minutes"));
-                }
-                if let Some(cmd) = &e.command {
-                    frow(FW, "extra.command", Some(cmd.as_str()), fi("extra.command"));
-                }
-            } else {
-                frow(FW, "extra", None, fi("extra"));
             }
         }
     }
@@ -633,10 +646,15 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     const RENDERED: &[&str] = &[
         "name", "author", "category", "description", "type", "value",
         "extra", "extra.initial", "extra.decay", "extra.minimum",
-        // container extra
-        "extra.internal_port", "extra.flag_mode", "extra.flag_prefix",
-        "extra.flag_suffix", "extra.random_flag_length", "extra.decay_function",
-        "extra.timeout_minutes", "extra.command",
+        // instance fields
+        "instance", "instance.backend", "instance.internal_port", "instance.connection",
+        "instance.image", "instance.flag_mode",
+        "instance.flag_delivery", "instance.flag_file_path", "instance.flag_service",
+        "instance.flag_prefix", "instance.flag_suffix", "instance.random_flag_length",
+        "instance.compose_file", "instance.compose_service",
+        "instance.lxc_image", "instance.vagrantfile",
+        "instance.timeout_minutes", "instance.max_per_team", "instance.max_renewals",
+        "instance.command",
         "flags", "tags", "topics", "files", "hints", "requirements",
         "next", "state", "connection_info", "attempts", "image",
         "protocol", "host", "healthcheck", "version",
@@ -651,13 +669,13 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     // ── Footer ────────────────────────────────────────────────────────────────
     let e = issues.iter().filter(|i| i.severity == Severity::Error).count();
     let w = issues.iter().filter(|i| i.severity == Severity::Warning).count();
-    println!("  {}", "─".repeat(FW + 12));
+    println!("  {}", "-".repeat(FW + 12));
     if e > 0 && w > 0 {
-        println!("  ❌ {} error(s), {} warning(s)", e, w);
+        println!("  [x] {} error(s), {} warning(s)", e, w);
     } else if e > 0 {
-        println!("  ❌ {} error(s)", e);
+        println!("  [x] {} error(s)", e);
     } else {
-        println!("  ⚠  {} warning(s)", w);
+        println!("  [!] {} warning(s)", w);
     }
     println!();
 }
@@ -669,7 +687,7 @@ fn print_challenge_compact(c: &Challenge, issues: &[&Issue]) {
         return;
     }
     let has_err = issues.iter().any(|i| i.severity == Severity::Error);
-    let hdr = if has_err { "❌" } else { "⚠ " };
+    let hdr = if has_err { "[x]" } else { "[!]" };
     println!("{} \"{}\"  [{}]", hdr, c.name, c.category);
     for issue in issues {
         let tag = if issue.severity == Severity::Error { "[E]" } else { "[W]" };
@@ -708,7 +726,7 @@ fn frow(fw: usize, field: &str, value: Option<&str>, issues: &[&Issue]) {
             .map(|i| i.message.as_str())
             .collect::<Vec<_>>()
             .join(";  ");
-        println!("  {:<fw$}  {}  {}  →  {}", field, tag, val_str, msgs, fw = fw);
+        println!("  {:<fw$}  {}  {}  ->  {}", field, tag, val_str, msgs, fw = fw);
     }
 }
 
@@ -723,7 +741,7 @@ fn frow_sub(fw: usize, field: &str, value: Option<&str>, issues: &[&Issue]) {
         .map(|i| i.message.as_str())
         .collect::<Vec<_>>()
         .join(";  ");
-    println!("    {:<fw$}  {}  {}  →  {}", field, tag, val_str, msgs, fw = fw.saturating_sub(2));
+    println!("    {:<fw$}  {}  {}  ->  {}", field, tag, val_str, msgs, fw = fw.saturating_sub(2));
 }
 
 /// Summarise one flag for display (truncated content with type prefix).
@@ -762,7 +780,7 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
     // check if more chars remain
     if chars.next().is_some() {
-        result.push('…');
+        result.push_str("...");
     } else if let Some(last) = s.chars().last() {
         result.push(last);
     }
@@ -793,6 +811,7 @@ mod tests {
             challenge_id: None,
             author: None,
             extra: None,
+            instance: None,
             image: None,
             protocol: None,
             host: None,

@@ -1,0 +1,54 @@
+name: "Challenge Name"
+author: "author"
+category: web   # web, pwn, rev, crypto, forensics, misc, ...
+description: |
+    Describe the challenge here.
+
+    Access at: `http://<host>:<port>`
+value: 100
+type: instance
+state: visible
+
+instance:
+    backend: compose
+
+    # Path to the docker-compose.yml on the monitor server.
+    compose_file: docker-compose.yml
+
+    # Service name whose port is exposed to players (defaults to "app" if omitted)
+    compose_service: app
+
+    # Port the service listens on inside the container (must match compose file)
+    internal_port: 8080
+
+    # How players connect: nc | http | ssh
+    connection: http
+
+    # Static flag — same for all teams.
+    # The compose backend does not inject FLAG automatically; bake it into the
+    # image or mount it via a volume in docker-compose.yml.
+    flag_mode: static
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+# Dynamic scoring (optional)
+# extra:
+#     initial: 500
+#     decay: 100
+#     minimum: 50
+
+flags:
+    - CTF{your_static_flag_here}
+
+tags:
+    - tag1
+    - web
+
+# files:
+#     - dist/source.zip
+
+# hints:
+#     - { content: "Hint text here", cost: 50 }
+
+version: "0.3"

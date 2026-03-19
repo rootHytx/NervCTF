@@ -1,0 +1,149 @@
+{% extends "admin/challenges/create.html" %}
+
+{% block create_content %}
+<div class="mb-3">
+    <label class="form-label">Scoring Type</label>
+    <select class="form-select" id="scoring-type-select" onchange="toggleScoringType(this.value)">
+        <option value="standard">Standard (Fixed)</option>
+        <option value="dynamic">Dynamic (Decay)</option>
+    </select>
+</div>
+
+<div id="standard-scoring">
+    <div class="mb-3">
+        <label class="form-label">Value</label>
+        <input class="form-control" type="number" name="value" placeholder="500">
+    </div>
+</div>
+
+<div id="dynamic-scoring" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">Initial Value</label>
+        <input class="form-control" type="number" name="initial" placeholder="500">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Minimum Value</label>
+        <input class="form-control" type="number" name="minimum" placeholder="50">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Decay</label>
+        <input class="form-control" type="number" name="decay" placeholder="100">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Decay Function</label>
+        <select class="form-select" name="decay_function">
+            <option value="linear">Linear</option>
+            <option value="logarithmic">Logarithmic</option>
+        </select>
+    </div>
+</div>
+
+<hr>
+<h6>Instance Configuration</h6>
+
+<div class="mb-3">
+    <label class="form-label">Backend</label>
+    <select class="form-select" name="backend" id="backend-select" onchange="toggleBackendFields(this.value)">
+        <option value="docker">Docker</option>
+        <option value="compose">Docker Compose</option>
+        <option value="lxc">LXC</option>
+        <option value="vagrant">Vagrant</option>
+    </select>
+</div>
+
+<!-- Docker fields -->
+<div id="fields-docker">
+    <div class="mb-3">
+        <label class="form-label">Docker Image</label>
+        <input class="form-control" type="text" name="image" placeholder="registry/image:tag or . for local build">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Command Override <small class="text-muted">(optional)</small></label>
+        <input class="form-control" type="text" name="command" placeholder="Leave blank to use image default">
+    </div>
+</div>
+
+<!-- Compose fields -->
+<div id="fields-compose" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">Compose File Path</label>
+        <input class="form-control" type="text" name="compose_file" placeholder="docker-compose.yml">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Service Name</label>
+        <input class="form-control" type="text" name="compose_service" placeholder="app">
+    </div>
+</div>
+
+<!-- LXC fields -->
+<div id="fields-lxc" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">LXC Image</label>
+        <input class="form-control" type="text" name="lxc_image" placeholder="ubuntu:22.04 or path/to/image.qcow2">
+    </div>
+</div>
+
+<!-- Vagrant fields -->
+<div id="fields-vagrant" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">Vagrantfile Directory</label>
+        <input class="form-control" type="text" name="vagrantfile" placeholder="path/to/vagrantfile-dir">
+    </div>
+</div>
+
+<div class="mb-3">
+    <label class="form-label">Internal Port</label>
+    <input class="form-control" type="number" name="internal_port" placeholder="1337" value="1337">
+</div>
+
+<div class="mb-3">
+    <label class="form-label">Connection Type</label>
+    <select class="form-select" name="connection">
+        <option value="nc">TCP / nc</option>
+        <option value="http">HTTP</option>
+        <option value="https">HTTPS</option>
+        <option value="ssh">SSH</option>
+    </select>
+</div>
+
+<div class="row">
+    <div class="col mb-3">
+        <label class="form-label">Timeout (minutes)</label>
+        <input class="form-control" type="number" name="timeout_minutes" placeholder="45" value="45">
+    </div>
+    <div class="col mb-3">
+        <label class="form-label">Max Renewals</label>
+        <input class="form-control" type="number" name="max_renewals" placeholder="3" value="3">
+    </div>
+</div>
+
+<hr>
+<h6>Flag Configuration</h6>
+
+<div class="mb-3">
+    <label class="form-label">Flag Mode</label>
+    <select class="form-select" name="flag_mode" id="flag-mode-select" onchange="toggleFlagMode(this.value)">
+        <option value="static">Static (enter flags below)</option>
+        <option value="random">Random (generated per-team)</option>
+    </select>
+</div>
+
+<div id="random-flag-fields" style="display:none">
+    <div class="row">
+        <div class="col mb-3">
+            <label class="form-label">Flag Prefix</label>
+            <input class="form-control" type="text" name="flag_prefix" placeholder="CTF{">
+        </div>
+        <div class="col mb-3">
+            <label class="form-label">Flag Suffix</label>
+            <input class="form-control" type="text" name="flag_suffix" placeholder="}">
+        </div>
+        <div class="col mb-3">
+            <label class="form-label">Random Part Length</label>
+            <input class="form-control" type="number" name="random_flag_length" placeholder="16" value="16">
+        </div>
+    </div>
+</div>
+
+<script src="/plugins/nervctf_instance/assets/create.js"></script>
+{% endblock %}

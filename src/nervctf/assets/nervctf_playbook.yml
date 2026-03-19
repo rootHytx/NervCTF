@@ -2,249 +2,307 @@
 - hosts: ctfd
   become: yes
   vars:
-    ansible_python_interpreter: /usr/bin/python3.12
+    ansible_python_interpreter: auto_silent
     docker_user: docker
-    #ctfd_path: "{{ lookup('env', 'CTFD_PATH') }}"
-    webhook_plugin_repo: https://github.com/iosifache/ctfd-solve-webhook-plugin.git
-    containers_plugin_repo: https://github.com/Bigyls/CTFdDockerContainersPlugin.git
-    vpn_ip: "{{ ansible_host }}"
-    webhook_url: "http://{{ ansible_host }}/webhook-endpoint"
-    #ssh_key: "{{ lookup('env', 'SSH_PUBKEY_PATH') }}"
-    remote_auth_keys: "/home/{{ docker_user }}/.ssh/authorized_keys"
-
-  handlers:
-    - name: reload systemd
-      systemd:
-        daemon_reload: yes
-      listen: "systemd reload"
-
-    - name: restart docker
-      systemd:
-        name: docker
-        state: restarted
-      listen: "restart docker"
+    monitor_port: "{{ monitor_port | default('33133') }}"
 
   tasks:
-    # Docker installation tasks (rootless)
-    - name: Check if Docker group exists
-      command: grep -q docker /etc/group
-      register: docker_group_exists
+    # ── Docker ─────────────────────────────────────────────────────────────────
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_installed
       changed_when: false
       ignore_errors: yes
 
-    - name: Install Docker prerequisites
-      apt:
-        name:
-          - ca-certificates
-          - curl
-        state: present
-        update_cache: yes
-      when: not docker_group_exists.rc == 0
-      tags: [docker_dependencies]
+    - name: Install Docker
+      when: docker_installed.rc != 0
+      block:
+        - name: Install apt prerequisites
+          apt:
+            name: [ca-certificates, curl]
+            state: present
+            update_cache: yes
 
-    - name: Create Docker apt keyrings directory
-      shell: install -m 0755 -d /etc/apt/keyrings
-      when: not docker_group_exists.rc == 0
-      tags: [docker_keyrings]
+        - name: Create keyring directory
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: "0755"
 
-    - name: Download Docker GPG key
-      shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-      when: not docker_group_exists.rc == 0
-      tags: [docker_gpg]
+        - name: Download Docker GPG key
+          get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: /etc/apt/keyrings/docker.asc
+            mode: "0644"
+            force: no
 
-    - name: Set permissions on Docker GPG key
-      shell: chmod a+r /etc/apt/keyrings/docker.asc
-      when: not docker_group_exists.rc == 0
-      tags: [docker_gpg]
+        - name: Add Docker apt repository
+          apt_repository:
+            repo: >-
+              deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+              signed-by=/etc/apt/keyrings/docker.asc]
+              https://download.docker.com/linux/ubuntu
+              {{ ansible_distribution_release }} stable
+            filename: docker
+            state: present
+            update_cache: yes
 
-    - name: Add Docker repository to apt sources
-      shell: |
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"${UBUNTU_CODENAME:-$VERSION_CODENAME}\") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-      when: not docker_group_exists.rc == 0
-      tags: [docker_repo]
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
 
-    - name: Update apt cache
-      apt:
-        update_cache: yes
-      when: not docker_group_exists.rc == 0
-      tags: [docker_update]
-
-    - name: Install Docker packages for rootless mode
-      apt:
-        name:
-          - uidmap
-          - docker-ce
-          - docker-ce-cli
-          - containerd.io
-          - docker-buildx-plugin
-          - docker-compose-plugin
-        state: present
-      when: not docker_group_exists.rc == 0
-      tags: [docker_install]
-
-    - name: Run dockerd-rootless-setuptool.sh
-      shell: /usr/bin/dockerd-rootless-setuptool.sh install
-      when: not docker_group_exists.rc == 0
-      tags: [docker_rootless]
-
+    # ── Docker user ────────────────────────────────────────────────────────────
     - name: Ensure docker group exists
       group:
         name: docker
         state: present
-      when: not docker_group_exists.rc == 0
-      tags: [docker_group]
 
-    # Docker user tasks
-    - name: Check if docker user exists
-      command: id -u {{ docker_user }}
-      register: docker_user_exists
-      changed_when: false
-      ignore_errors: yes
-
-    - name: Create docker user
+    - name: Ensure docker user exists
       user:
         name: "{{ docker_user }}"
         groups: docker
         shell: /bin/bash
         state: present
         create_home: yes
-      when: docker_user_exists.rc != 0
-      tags: [docker_user]
 
-    # SSH key tasks
-    # Gather the contents of the remote authorized_keys file
-    - name: Read remote authorized_keys file
-      slurp:
-        src: "{{ remote_auth_keys }}"
-      register: remote_auth_keys_content
-      ignore_errors: yes
-
-    # Check if the selected key is already present
-    - name: Check if selected key is present in remote authorized_keys
-      set_fact:
-        key_already_present: "{{ (remote_auth_keys_content.content | b64decode).split('\n') | select('equalto', (lookup('file', ssh_key) | trim)) | list | length > 0 }}"
-      when: remote_auth_keys_content is defined and remote_auth_keys_content.content is defined
-
-    # Add the key only if not present
-    - name: Add selected SSH public key to remote authorized_keys if missing
+    # ── SSH key ────────────────────────────────────────────────────────────────
+    - name: Authorize SSH public key for docker user
       authorized_key:
         user: "{{ docker_user }}"
         state: present
         key: "{{ lookup('file', ssh_key) }}"
-      when: not (key_already_present | default(false))
-      tags: [docker_ssh]
 
-    # Terminal configuration
-    - name: Check if TERM is set in .bashrc
-      command: grep -q 'TERM=xterm' /home/{{ docker_user }}/.bashrc
-      register: term_set
-      changed_when: false
-      ignore_errors: yes
-
-    - name: Ensure .bashrc TERM setting for docker user
-      lineinfile:
-        path: "/home/{{ docker_user }}/.bashrc"
-        line: "TERM=xterm"
-        create: yes
-        state: present
-      when: term_set.rc != 0
-      tags: [docker_bashrc]
-
-    # CTFd installation tasks
-    - name: Check if CTFd directory is valid
+    # ── CTFd ───────────────────────────────────────────────────────────────────
+    - name: Check if CTFd is already cloned
       stat:
         path: "{{ ctfd_path }}/requirements.txt"
-      register: ctfd_valid
-      tags: [ctfd_check]
+      register: ctfd_cloned
 
     - name: Clone CTFd
       git:
         repo: https://github.com/CTFd/CTFd.git
         dest: "{{ ctfd_path }}"
         version: master
+        depth: 1
       become_user: "{{ docker_user }}"
-      when: not ctfd_valid.stat.exists
-      tags: [ctfd_clone]
+      when: not ctfd_cloned.stat.exists
 
-    - name: Set plugins directory
-      set_fact:
-        plugin_dir: "{{ ctfd_path }}/CTFd/plugins/"
-      tags: [plugin_setup]
+    - name: Check if CTFd containers are running
+      shell: docker compose -f {{ ctfd_path }}/docker-compose.yml ps --status running 2>/dev/null | grep -q ctfd
+      register: ctfd_running
+      changed_when: false
+      ignore_errors: yes
+      become_user: "{{ docker_user }}"
 
-    - name: Check if plugins directory exists
-      stat:
-        path: "{{ ctfd_path }}/CTFd/plugins"
-      register: plugins_dir_exists
-      tags: [ctfd_plugins_dir]
+    - name: Start CTFd
+      command:
+        cmd: docker compose up --build --detach --no-recreate
+        chdir: "{{ ctfd_path }}"
+      become_user: "{{ docker_user }}"
+      when: ctfd_running.rc != 0
 
-    - name: Create plugins directory
+    # ── LXC / LXD ──────────────────────────────────────────────────────────────
+    - name: Check if LXD is installed
+      command: lxd --version
+      register: lxd_installed
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install LXD via snap
+      snap:
+        name: lxd
+        state: present
+      when: lxd_installed.rc != 0
+      ignore_errors: yes
+
+    - name: Initialize LXD (auto)
+      command: lxd init --auto
+      when: lxd_installed.rc != 0
+      ignore_errors: yes
+
+    - name: Add docker user to lxd group
+      user:
+        name: "{{ docker_user }}"
+        groups: lxd
+        append: yes
+      ignore_errors: yes
+
+    # ── Vagrant ────────────────────────────────────────────────────────────────
+    - name: Check if Vagrant is installed
+      command: vagrant --version
+      register: vagrant_installed
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install Vagrant build deps
+      apt:
+        name:
+          [
+            libvirt-daemon-system,
+            libvirt-clients,
+            qemu-kvm,
+            bridge-utils,
+            ruby-dev,
+          ]
+        state: present
+        update_cache: yes
+      when: vagrant_installed.rc != 0
+      ignore_errors: yes
+
+    - name: Add HashiCorp apt key
+      get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /etc/apt/keyrings/hashicorp.asc
+        mode: "0644"
+        force: no
+      when: vagrant_installed.rc != 0
+      ignore_errors: yes
+
+    - name: Add HashiCorp apt repository
+      apt_repository:
+        repo: >-
+          deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+          signed-by=/etc/apt/keyrings/hashicorp.asc]
+          https://apt.releases.hashicorp.com
+          {{ ansible_distribution_release }} main
+        filename: hashicorp
+        state: present
+        update_cache: yes
+      when: vagrant_installed.rc != 0
+      ignore_errors: yes
+
+    - name: Install Vagrant
+      apt:
+        name: vagrant
+        state: present
+      when: vagrant_installed.rc != 0
+      ignore_errors: yes
+
+    - name: Add docker user to libvirt group
+      user:
+        name: "{{ docker_user }}"
+        groups: libvirt
+        append: yes
+      ignore_errors: yes
+
+    # ── CTFd Plugin ────────────────────────────────────────────────────────────
+    - name: Deploy NervCTF instance plugin to CTFd
+      when: plugin_src is defined
+      block:
+        - name: Ensure CTFd plugins directory exists
+          file:
+            path: "{{ ctfd_path }}/CTFd/plugins/nervctf_instance"
+            state: directory
+            owner: "{{ docker_user }}"
+            group: docker
+            mode: "0755"
+
+        - name: Copy plugin files
+          synchronize:
+            src: "{{ plugin_src }}/"
+            dest: "{{ ctfd_path }}/CTFd/plugins/nervctf_instance/"
+            delete: yes
+            rsync_opts:
+              - "--chown={{ docker_user }}:docker"
+
+    # ── Remote Monitor Docker image ────────────────────────────────────────────
+    - name: Ensure remote-monitor directory exists
       file:
-        path: "{{ ctfd_path }}/CTFd/plugins"
+        path: "{{ ctfd_path }}/remote-monitor"
         state: directory
         owner: "{{ docker_user }}"
         group: docker
         mode: "0755"
-      when: not plugins_dir_exists.stat.exists
-      tags: [ctfd_plugins_dir]
+      when: monitor_binary is defined
 
-    # Webhook plugin tasks
-    - name: Check if webhook plugin exists
-      stat:
-        path: "{{ plugin_dir }}/solve-webhook-plugin"
-      register: webhook_plugin_stat
-      tags: [webhook_check]
-
-    - name: Install webhook plugin
-      block:
-        - name: Install containers plugin
-          command: git clone "{{ webhook_plugin_repo }}" "{{ plugin_dir }}/ctfd-solve-webhook-plugin"
-          when: not webhook_plugin_stat.stat.exists
-
-        - name: Move plugin to correct location
-          command: "mv {{ plugin_dir }}/ctfd-solve-webhook-plugin/solve-webhook-plugin {{ plugin_dir }}/solve-webhook-plugin"
-          become_user: "{{ docker_user }}"
-
-        - name: Remove parent plugin directory
-          file:
-            path: "{{ ctfd_path }}/CTFd/plugins/ctfd-solve-webhook-plugin"
-            state: absent
-      when: not webhook_plugin_stat.stat.exists
-
-    - name: Add webhook environment variables to .bashrc
-      blockinfile:
-        path: "/home/{{ docker_user }}/.bashrc"
-        block: |
-          SOLVE_WEBHOOK_URL={{ webhook_url }}
-          SOLVE_WEBHOOK_LIMIT=3
-        marker: "# {mark} ANSIBLE MANAGED BLOCK - Webhook variables"
-        insertafter: EOF
-        create: yes
-      when: not webhook_plugin_stat.stat.exists
-      tags: [webhook_config]
-
-    # containers plugin tasks
-    - name: Check if containers plugin exists
-      stat:
-        path: "{{ plugin_dir }}/containers"
-      register: containers_plugin_stat
-      tags: [containers_check]
-
-    - name: Install containers plugin
-      command: git clone "{{ containers_plugin_repo }}" "{{ plugin_dir }}/containers"
-      when: not containers_plugin_stat.stat.exists
-
-    - name: Copy docker-compose.yml to CTFd path
+    - name: Copy remote-monitor binary
       copy:
-        src: ./docker-compose.yml
-        dest: "{{ ctfd_path }}/docker-compose.yml"
+        src: "{{ monitor_binary }}"
+        dest: "{{ ctfd_path }}/remote-monitor/remote-monitor"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: monitor_binary is defined
+
+    - name: Write remote-monitor Dockerfile
+      copy:
+        content: |
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              docker.io ca-certificates && rm -rf /var/lib/apt/lists/*
+          COPY remote-monitor /usr/local/bin/remote-monitor
+          CMD ["/usr/local/bin/remote-monitor"]
+        dest: "{{ ctfd_path }}/remote-monitor/Dockerfile"
         owner: "{{ docker_user }}"
         group: docker
         mode: "0644"
-      tags: [ctfd_plugins_compose]
+      when: monitor_binary is defined
 
-    - name: Start CTFd Docker containers
-      command: docker compose --profile ctfd up --build --detach
-      args:
+    - name: Build remote-monitor Docker image
+      command: docker build -t nervctf-monitor:latest {{ ctfd_path }}/remote-monitor
+      become_user: "{{ docker_user }}"
+      when: monitor_binary is defined
+
+    # ── Challenges directory (bind mount — must be same path on host and in container
+    #    so the host Docker daemon can resolve build contexts and volume paths during
+    #    compose builds and runtime. The named volume at /data holds the SQLite DB;
+    #    the bind mount at /data/challenges shadows that subdirectory so challenge
+    #    files written by the monitor are visible to the host Docker daemon at the
+    #    same absolute path referenced in challenge docker-compose.yml files.)
+    - name: Create challenges base directory on host
+      file:
+        path: /data/challenges
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+
+    # ── docker-compose override (monitor service + CTFd env) ───────────────────
+    - name: Write docker-compose override
+      when: monitor_token is defined
+      copy:
+        content: |
+          services:
+            ctfd:
+              environment:
+                - NERVCTF_MONITOR_URL=http://remote-monitor:{{ monitor_port }}
+                - NERVCTF_MONITOR_TOKEN={{ monitor_token }}
+
+            remote-monitor:
+              image: nervctf-monitor:latest
+              restart: unless-stopped
+              environment:
+                - CTFD_URL=http://ctfd:8000
+                - CTFD_API_KEY={{ ctfd_api_key | default('') }}
+                - MONITOR_TOKEN={{ monitor_token }}
+                - PUBLIC_HOST={{ ansible_host }}
+                - MONITOR_PORT={{ monitor_port }}
+                - DB_PATH=/data/monitor.db
+                - CHALLENGES_BASE_DIR=/data/challenges
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock
+                - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+                - remote_monitor_data:/data
+                - /data/challenges:/data/challenges
+              ports:
+                - "{{ monitor_port }}:{{ monitor_port }}"
+
+          volumes:
+            remote_monitor_data:
+        dest: "{{ ctfd_path }}/docker-compose.override.yml"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+
+    - name: Apply docker-compose override (recreate CTFd, start monitor)
+      command:
+        cmd: docker compose up -d --force-recreate
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
-      tags: [ctfd_start]
+      when: plugin_src is defined or monitor_token is defined

@@ -3,38 +3,13 @@
 
 use crate::ctfd_api::models::Challenge;
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-/// Configuration for directory scanning
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ScannerConfig {
-    /// File patterns to search for
-    pub patterns: Vec<String>,
-    /// Maximum search depth
-    pub max_depth: usize,
-    /// Whether to follow symlinks
-    pub follow_symlinks: bool,
-    /// File extensions to consider
-    pub extensions: Vec<String>,
-}
-
-impl Default for ScannerConfig {
-    fn default() -> Self {
-        Self {
-            patterns: vec![
-                "challenge.yml".to_string(),
-                "challenge.yaml".to_string(),
-                "challenge.json".to_string(),
-            ],
-            max_depth: 5,
-            follow_symlinks: false,
-            extensions: vec!["yml".to_string(), "yaml".to_string(), "json".to_string()],
-        }
-    }
-}
+const CHALLENGE_PATTERNS: &[&str] = &["challenge.yml", "challenge.yaml", "challenge.json"];
+const CHALLENGE_EXTENSIONS: &[&str] = &["yml", "yaml", "json"];
 
 /// A challenge file that could not be loaded during a directory scan.
 #[derive(Debug)]
@@ -44,21 +19,11 @@ pub struct ScanFailure {
 }
 
 /// Scans directories for challenge configuration files
-pub struct DirectoryScanner {
-    config: ScannerConfig,
-}
+pub struct DirectoryScanner;
 
 impl DirectoryScanner {
-    /// Creates a new directory scanner with default configuration
     pub fn new() -> Self {
-        Self {
-            config: ScannerConfig::default(),
-        }
-    }
-
-    /// Creates a new directory scanner with custom configuration
-    pub fn with_config(config: ScannerConfig) -> Self {
-        Self { config }
+        Self
     }
 
     /// Scans a directory for challenge files (backwards-compatible wrapper).
@@ -67,7 +32,7 @@ impl DirectoryScanner {
         let (challenges, failures) = self.scan_directory_full(base_path, true)?;
         for f in &failures {
             eprintln!(
-                "❌ Failed to load challenge from {}: {}",
+                "[x] failed to load challenge from {}: {}",
                 f.path.display(),
                 f.error
             );
@@ -94,11 +59,11 @@ impl DirectoryScanner {
             return Err(anyhow!("Path is not a directory: {}", base_path.display()));
         }
 
-        println!("🔍 Scanning directory: {}", base_path.display());
+        println!("scanning: {}", base_path.display());
 
         for entry in WalkDir::new(base_path)
-            .max_depth(self.config.max_depth)
-            .follow_links(self.config.follow_symlinks)
+            .max_depth(5)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
         {
@@ -108,7 +73,7 @@ impl DirectoryScanner {
                     Ok(config) => {
                         if verbose {
                             println!(
-                                "📁 Found challenge: {} ({})",
+                                "found challenge: {} ({})",
                                 config.name, config.category
                             );
                         }
@@ -127,8 +92,8 @@ impl DirectoryScanner {
         }
 
         if verbose && challenges.is_empty() && failures.is_empty() {
-            println!("ℹ️  No challenge files found. Supported patterns:");
-            for pattern in &self.config.patterns {
+            println!("note: no challenge files found. supported patterns:");
+            for pattern in CHALLENGE_PATTERNS {
                 println!("  - {}", pattern);
             }
         }
@@ -136,17 +101,16 @@ impl DirectoryScanner {
         Ok((challenges, failures))
     }
 
-    /// Checks if a file is a challenge configuration file
     fn is_challenge_file(&self, path: &Path) -> bool {
         if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
             // Check exact filename patterns
-            if self.config.patterns.iter().any(|p| filename == p) {
+            if CHALLENGE_PATTERNS.iter().any(|p| filename == *p) {
                 return true;
             }
 
             // Check file extension
             if let Some(extension) = path.extension().and_then(|ext| ext.to_str()) {
-                if self.config.extensions.iter().any(|ext| extension == ext) {
+                if CHALLENGE_EXTENSIONS.iter().any(|ext| extension == *ext) {
                     // Also check if filename contains "challenge"
                     return filename.to_lowercase().contains("challenge");
                 }
@@ -155,7 +119,6 @@ impl DirectoryScanner {
         false
     }
 
-    /// Loads a challenge configuration from file
     fn load_challenge_config(&self, path: &Path) -> Result<Challenge> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -187,6 +150,8 @@ impl DirectoryScanner {
                 "connection_info", "healthcheck", "attempts", "flags",
                 "topics", "tags", "files", "hints", "requirements", "next",
                 "state", "version", "id", "challenge_id",
+                // NervCTF extensions
+                "instance",
             ];
             if let Ok(serde_yaml::Value::Mapping(map)) =
                 serde_yaml::from_str::<serde_yaml::Value>(&content)
@@ -204,7 +169,6 @@ impl DirectoryScanner {
         Ok(config)
     }
 
-    /// Gets the relative path of a challenge file from base directory
     pub fn get_relative_path(&self, base_path: &Path, file_path: &Path) -> Result<PathBuf> {
         file_path
             .strip_prefix(base_path)
@@ -212,7 +176,6 @@ impl DirectoryScanner {
             .map_err(|e| anyhow!("Failed to get relative path: {}", e))
     }
 
-    /// Validates that all required files for a challenge exist
     pub fn validate_challenge_files(&self, config: &Challenge, base_path: &Path) -> Result<()> {
         // Check if files referenced in challenge exist
         if let Some(files) = &config.files {
@@ -230,13 +193,12 @@ impl DirectoryScanner {
         Ok(())
     }
 
-    /// Finds all challenge files in a directory
     pub fn find_challenge_files(&self, base_path: &Path) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
 
         for entry in WalkDir::new(base_path)
-            .max_depth(self.config.max_depth)
-            .follow_links(self.config.follow_symlinks)
+            .max_depth(5)
+            .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
         {
@@ -249,7 +211,6 @@ impl DirectoryScanner {
         Ok(files)
     }
 
-    /// Gets statistics about scanned challenges
     pub fn get_stats(&self, challenges: &[Challenge]) -> ChallengeStats {
         let mut stats = ChallengeStats::default();
 
@@ -291,7 +252,7 @@ pub struct ChallengeStats {
 impl ChallengeStats {
     /// Prints statistics in a human-readable format
     pub fn print(&self) {
-        println!("📊 Challenge Statistics:");
+        println!("stats:");
         println!("  Total Challenges: {}", self.total_challenges);
         println!("  Total Points: {}", self.total_points);
         println!("  Total Flags: {}", self.total_flags);

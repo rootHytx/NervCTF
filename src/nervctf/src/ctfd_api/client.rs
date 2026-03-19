@@ -8,7 +8,6 @@ use std::time::Duration;
 const BASE_PATH: &str = "/api/v1";
 const DEFAULT_TIMEOUT: u64 = 10;
 
-/// Main client for interacting with the CTFd API
 #[derive(Clone)]
 pub struct CtfdClient {
     client: Client,
@@ -17,23 +16,17 @@ pub struct CtfdClient {
 }
 
 impl CtfdClient {
-    /// Creates a new CTFd client instance
-    ///
-    /// # Arguments
-    /// * `base_url` - Base URL of the CTFd instance (e.g., "https://ctfd.example.com")
-    /// * `api_key` - API key for authentication
     pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
-        // Only set Authorization as a default header.
-        // Content-Type is intentionally omitted here:
-        //   - JSON requests set it via .json(body) in request()
-        //   - Multipart requests set it via .multipart(form) in upload_file()
-        // Having Content-Type: application/json as a default causes 500s on
-        // CTFd's file upload endpoint.
+        // Content-Type omitted: json() sets it for JSON, multipart() sets it for uploads
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "Authorization",
             header::HeaderValue::from_str(&format!("Token {}", api_key))
                 .map_err(|e| anyhow!("Invalid API key: {}", e))?,
+        );
+        headers.insert(
+            "Accept",
+            header::HeaderValue::from_static("application/json"),
         );
 
         let client = Client::builder()
@@ -54,7 +47,6 @@ impl CtfdClient {
         })
     }
 
-    /// Executes an API request
     pub async fn request<T: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -84,7 +76,7 @@ impl CtfdClient {
         }
     }
 
-    pub async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T> {
+    async fn parse_response<T: DeserializeOwned>(response: Response) -> Result<T> {
         let url = response.url().to_string();
         let status = response.status();
         let bytes = response.bytes().await?;
@@ -123,7 +115,6 @@ impl CtfdClient {
         }
     }
 
-    /// Executes a request and parses the response
     pub async fn execute<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
@@ -139,7 +130,6 @@ impl CtfdClient {
         }
     }
 
-    /// Executes a request and parses the response (multipart/form-data)
     /// NOTE: kept for legacy callers; prefer upload_file for async contexts.
     pub async fn post_file<T: DeserializeOwned>(
         &self,
@@ -173,38 +163,6 @@ impl CtfdClient {
         }
     }
 
-    /// Executes a request with query parameters and parses the response
-    pub async fn execute_with_params<T: DeserializeOwned, B: Serialize + ?Sized, P: Serialize>(
-        &self,
-        method: Method,
-        endpoint: &str,
-        body: Option<&B>,
-        params: &P,
-    ) -> Result<T> {
-        let url = format!("{}{}{}", self.base_url, BASE_PATH, endpoint);
-        let mut builder = self.client.request(method.clone(), &url).query(params);
-
-        if let Some(body) = body {
-            builder = builder.json(body);
-        }
-
-        let response = builder.send().await?;
-        let status = response.status();
-
-        if status.is_success() {
-            Self::parse_response(response).await
-        } else {
-            let error_text = response.text().await?;
-            Err(anyhow!(
-                "API error ({} {}): {}",
-                method,
-                endpoint,
-                error_text
-            ))
-        }
-    }
-
-    /// Executes a request without expecting a response body
     pub async fn request_without_body<T: Serialize + ?Sized>(
         &self,
         method: Method,

@@ -1,13 +1,14 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use nervctf::{
     challenge_manager::sync::needs_update,
     ctfd_api::{
-        models::{Challenge, FlagContent, HintContent, State, Tag},
+        models::{Challenge, ChallengeType, FlagContent, HintContent, State, Tag},
         CtfdClient,
     },
     directory_scanner::DirectoryScanner,
-    fix::run_fix,
+    fix::{run_fix, run_migrate_containers},
     load_config,
     setup::run_setup,
     validator::validate_challenges,
@@ -77,6 +78,10 @@ enum Commands {
         /// Preview changes without modifying any files
         #[arg(short, long)]
         dry_run: bool,
+
+        /// Migrate type:container challenges to the new type:instance format
+        #[arg(long)]
+        migrate_containers: bool,
     },
 
     /// Validate challenge YAML files and report errors/warnings
@@ -111,19 +116,39 @@ struct NextJob {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Commands that don't need CTFd credentials
+    // Setup has no config and no base_dir — handle it first.
     if let Commands::Setup = cli.command {
         return run_setup();
     }
-    if let Commands::Fix { dry_run } = cli.command {
-        return run_fix(&cli.base_dir, dry_run);
+
+    // Load config from .nervctf.yml — always search from CWD upwards so the
+    // file is found regardless of what --base-dir is set to.
+    let cwd = env::current_dir().unwrap_or_else(|_| cli.base_dir.clone());
+    let (file_config, config_path) = load_config(&cwd);
+
+    // Resolve effective base_dir: CLI flag > .nervctf.yml > "."
+    // We treat the clap default (".") as "not explicitly set", so the config
+    // file can override it.
+    let effective_base_dir: PathBuf = if cli.base_dir != PathBuf::from(".") {
+        cli.base_dir.clone() // explicitly passed by the user
+    } else {
+        file_config
+            .base_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or(cli.base_dir.clone())
+    };
+
+    // Commands that only need base_dir (no CTFd credentials required)
+    if let Commands::Fix { dry_run, migrate_containers } = cli.command {
+        if migrate_containers {
+            return run_migrate_containers(&effective_base_dir, dry_run);
+        }
+        return run_fix(&effective_base_dir, dry_run);
     }
     if let Commands::Validate { debug } = cli.command {
-        return validate_command(&cli.base_dir, debug);
+        return validate_command(&effective_base_dir, debug);
     }
-
-    // Load config from .nervctf.yml (walk up from base_dir)
-    let file_config = load_config(&cli.base_dir);
 
     // Resolve CTFD_URL: env var > config file
     let ctfd_url = env::var("CTFD_URL")
@@ -149,12 +174,16 @@ async fn main() -> Result<()> {
         .or_else(|| file_config.monitor_token.clone());
 
     if cli.verbose {
-        if let Some(ref url) = monitor_url {
-            println!("✅ Using remote monitor at {}", url);
-        } else {
-            println!("✅ Connected to CTFd at {}", ctfd_url);
+        match &config_path {
+            Some(p) => println!("config: {}", p.display()),
+            None => println!("config: none found (using env vars / CLI flags only)"),
         }
-        println!("📁 Base directory: {}", cli.base_dir.display());
+        if let Some(ref url) = monitor_url {
+            println!("monitor: {}", url);
+        } else {
+            println!("ctfd:    {}", ctfd_url);
+        }
+        println!("base-dir: {}", effective_base_dir.display());
     }
 
     if cli.remote {
@@ -174,15 +203,22 @@ async fn main() -> Result<()> {
 
     let scanner = DirectoryScanner::new();
 
+    // Optional monitor client for instance registration
+    let monitor_client = if let (Some(ref url), Some(ref token)) = (&monitor_url, &monitor_token) {
+        Some(CtfdClient::new(url, token)?)
+    } else {
+        None
+    };
+
     match cli.command {
         Commands::Deploy { dry_run } => {
-            deploy_challenges(&client, &scanner, &cli.base_dir, dry_run).await?;
+            deploy_challenges(&client, monitor_client.as_ref(), &monitor_url, &scanner, &effective_base_dir, dry_run).await?;
         }
         Commands::List { detailed } => {
-            list_challenges(&scanner, &cli.base_dir, detailed).await?;
+            list_challenges(&scanner, &effective_base_dir, detailed).await?;
         }
         Commands::Scan { detailed } => {
-            scan_challenges(&scanner, &cli.base_dir, detailed).await?;
+            scan_challenges(&scanner, &effective_base_dir, detailed).await?;
         }
         Commands::Setup | Commands::Fix { .. } | Commands::Validate { .. } => {
             unreachable!("handled before credential resolution")
@@ -202,16 +238,16 @@ fn validate_command(base_dir: &PathBuf, debug: bool) -> Result<()> {
         scanner.scan_directory_full(base_dir, debug)?;
 
     if challenges.is_empty() && failures.is_empty() {
-        println!("ℹ️  No challenge files found in {}", base_dir.display());
+        println!("note: no challenge files found in {}", base_dir.display());
         return Ok(());
     }
 
     let total = challenges.len() + failures.len();
     if failures.is_empty() {
-        println!("🔍 Validating {} challenge(s)...\n", total);
+        println!("validating {} challenge(s)...\n", total);
     } else {
         println!(
-            "🔍 Validating {} challenge(s) ({} failed to parse)...\n",
+            "validating {} challenge(s) ({} failed to parse)...\n",
             total,
             failures.len()
         );
@@ -230,6 +266,8 @@ fn validate_command(base_dir: &PathBuf, debug: bool) -> Result<()> {
 
 async fn deploy_challenges(
     client: &CtfdClient,
+    monitor_client: Option<&CtfdClient>,
+    monitor_url: &Option<String>,
     scanner: &DirectoryScanner,
     base_dir: &PathBuf,
     dry_run: bool,
@@ -239,17 +277,17 @@ async fn deploy_challenges(
     // ── Gather local and remote challenges ────────────────────────────────────
     let local_challenges = scanner.scan_directory(base_dir)?;
     if local_challenges.is_empty() {
-        println!("ℹ️  No challenge files found in {}", base_dir.display());
+        println!("note: no challenge files found in {}", base_dir.display());
         return Ok(());
     }
-    println!("📊 Local:  {} challenge(s)", local_challenges.len());
+    println!("local:  {} challenge(s)", local_challenges.len());
 
     // ── Pre-deploy validation ─────────────────────────────────────────────────
-    println!("\n🔍 Validating challenges...");
+    println!("\nvalidating challenges...");
     let report = validate_challenges(&local_challenges);
     report.print(&local_challenges, &[], false);
     if report.has_errors() {
-        println!("\n❌ Fix the errors above before deploying. Run `nervctf validate` for details.");
+        println!("\n[x] fix the errors above before deploying. run `nervctf validate` for details.");
         return Ok(());
     }
     if !report.is_clean() {
@@ -257,7 +295,7 @@ async fn deploy_challenges(
     }
 
     let remote_challenges = client.get_challenges().await?.unwrap_or_default();
-    println!("📊 Remote: {} challenge(s)", remote_challenges.len());
+    println!("remote: {} challenge(s)", remote_challenges.len());
 
     let remote_map: HashMap<String, &Challenge> = remote_challenges
         .iter()
@@ -285,22 +323,22 @@ async fn deploy_challenges(
     }
 
     // ── Show diff ─────────────────────────────────────────────────────────────
-    println!("\n📋 Diff:");
+    println!("\ndiff:");
     println!("{}", "=".repeat(50));
     if !to_create.is_empty() {
-        println!("➕ CREATE ({}):", to_create.len());
+        println!("[+] CREATE ({}):", to_create.len());
         for c in &to_create {
             println!("    - {}", c.name);
         }
     }
     if !to_update.is_empty() {
-        println!("🔄 UPDATE ({}):", to_update.len());
+        println!("[~] UPDATE ({}):", to_update.len());
         for (c, _) in &to_update {
             println!("    - {}", c.name);
         }
     }
     if !up_to_date_names.is_empty() {
-        println!("✅ UP-TO-DATE ({}):", up_to_date_names.len());
+        println!("[=] UP-TO-DATE ({}):", up_to_date_names.len());
         for name in &up_to_date_names {
             println!("    - {}", name);
         }
@@ -308,12 +346,12 @@ async fn deploy_challenges(
     println!("{}", "=".repeat(50));
 
     if dry_run {
-        println!("ℹ️  Dry run — no changes applied.");
+        println!("note: dry run -- no changes applied.");
         return Ok(());
     }
 
     if to_create.is_empty() && to_update.is_empty() {
-        println!("✅ Everything is up to date.");
+        println!("everything is up to date.");
         return Ok(());
     }
 
@@ -322,12 +360,12 @@ async fn deploy_challenges(
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     if input.trim().to_lowercase() != "y" {
-        println!("❌ Aborted.");
+        println!("aborted.");
         return Ok(());
     }
 
     // ── Phase 1: core + flags + tags + topics + hints ─────────────────────────
-    println!("\n🚀 Phase 1: cores, flags, tags, hints...");
+    println!("\n-- phase 1: cores, flags, tags, hints");
     let mut file_jobs: Vec<FileUploadJob> = Vec::new();
     let mut req_jobs: Vec<ReqJob> = Vec::new();
     let mut next_jobs: Vec<NextJob> = Vec::new();
@@ -335,12 +373,22 @@ async fn deploy_challenges(
     let mut updated = 0usize;
 
     for local in &to_create {
-        print!("  ➕ {}: ", local.name);
+        print!("  [+] {}: ", local.name);
         std::io::stdout().flush()?;
-        match create_challenge_phase1(client, local).await {
+        match create_challenge_phase1(client, monitor_url, local).await {
             Ok((id, has_files, has_reqs, has_next)) => {
-                println!("✅ (ID {})", id);
+                println!("ok (ID {})", id);
                 created += 1;
+                // Register instance config with monitor if applicable
+                if local.challenge_type == ChallengeType::Instance {
+                    if let Some(mc) = monitor_client {
+                        if let Err(e) = deploy_instance(mc, local, id).await {
+                            eprintln!("  [!] instance deploy error for '{}': {}", local.name, e);
+                        }
+                    } else {
+                        eprintln!("  [!] '{}' is an instance challenge but no monitor is configured.", local.name);
+                    }
+                }
                 if has_files {
                     file_jobs.push(FileUploadJob {
                         challenge_id: id,
@@ -361,17 +409,26 @@ async fn deploy_challenges(
                     });
                 }
             }
-            Err(e) => eprintln!("❌ {}", e),
+            Err(e) => eprintln!("[x] {}", e),
         }
     }
 
     for (local, remote_id) in &to_update {
-        print!("  🔄 {}: ", local.name);
+        print!("  [~] {}: ", local.name);
         std::io::stdout().flush()?;
-        match update_challenge_phase1(client, *remote_id, local).await {
+        match update_challenge_phase1(client, monitor_url, *remote_id, local).await {
             Ok((has_files, has_reqs, has_next)) => {
-                println!("✅ (ID {})", remote_id);
+                println!("ok (ID {})", remote_id);
                 updated += 1;
+                if local.challenge_type == ChallengeType::Instance {
+                    if let Some(mc) = monitor_client {
+                        if let Err(e) = deploy_instance(mc, local, *remote_id).await {
+                            eprintln!("  [!] instance deploy error for '{}': {}", local.name, e);
+                        }
+                    } else {
+                        eprintln!("  [!] '{}' is an instance challenge but no monitor is configured.", local.name);
+                    }
+                }
                 if has_files {
                     file_jobs.push(FileUploadJob {
                         challenge_id: *remote_id,
@@ -392,7 +449,7 @@ async fn deploy_challenges(
                     });
                 }
             }
-            Err(e) => eprintln!("❌ {}", e),
+            Err(e) => eprintln!("[x] {}", e),
         }
     }
 
@@ -401,7 +458,7 @@ async fn deploy_challenges(
     // matching ctfcli's _create_all_files() approach (multiple "file" parts,
     // plus "challenge_id" and "type" as form text fields).
     if !file_jobs.is_empty() {
-        println!("\n📁 Phase 2: uploading files...");
+        println!("\n-- phase 2: uploading files");
         for job in &file_jobs {
             // Collect all existing files for this challenge
             let mut file_parts: Vec<(String, reqwest::multipart::Part)> = Vec::new();
@@ -424,7 +481,7 @@ async fn deploy_challenges(
             }
 
             for f in &missing {
-                eprintln!("  ⚠️  Not found: {}/{}", job.source_path, f);
+                eprintln!("  [!] not found: {}/{}", job.source_path, f);
             }
 
             if file_parts.is_empty() {
@@ -442,19 +499,19 @@ async fn deploy_challenges(
 
             match client.upload_file("/files", form).await {
                 Ok(_) => println!(
-                    "  ✅ Uploaded {} file(s) → challenge {}: {}",
+                    "  [+] uploaded {} file(s) -> challenge {}: {}",
                     names.len(),
                     job.challenge_id,
                     names.join(", ")
                 ),
-                Err(e) => eprintln!("  ❌ Upload for challenge {}: {}", job.challenge_id, e),
+                Err(e) => eprintln!("  [x] upload for challenge {}: {}", job.challenge_id, e),
             }
         }
     }
 
     // ── Phase 3: requirements ─────────────────────────────────────────────────
     if !req_jobs.is_empty() {
-        println!("\n🔗 Phase 3: patching requirements...");
+        println!("\n-- phase 3: patching requirements");
         let all_remote = client.get_challenges().await?.unwrap_or_default();
         let name_to_id: HashMap<String, u32> = all_remote
             .iter()
@@ -472,15 +529,15 @@ async fn deploy_challenges(
                 } else if let Some(&id) = name_to_id.get(req.as_str()) {
                     prereq_ids.push(id);
                 } else {
-                    eprintln!("  ⚠️  Prerequisite '{}' not found on remote", req);
+                    eprintln!("  [!] prerequisite '{}' not found on remote", req);
                 }
             }
             if !prereq_ids.is_empty() {
                 let req_data =
                     serde_json::json!({ "requirements": { "prerequisites": prereq_ids } });
                 match client.update_challenge(job.challenge_id, &req_data).await {
-                    Ok(_) => println!("  ✅ Requirements set for challenge {}", job.challenge_id),
-                    Err(e) => eprintln!("  ❌ Requirements for {}: {}", job.challenge_id, e),
+                    Ok(_) => println!("  [ok] requirements set for challenge {}", job.challenge_id),
+                    Err(e) => eprintln!("  [x] requirements for {}: {}", job.challenge_id, e),
                 }
             }
         }
@@ -488,7 +545,7 @@ async fn deploy_challenges(
 
     // ── Phase 4: next pointers ────────────────────────────────────────────────
     if !next_jobs.is_empty() {
-        println!("\n➡️  Phase 4: patching next pointers...");
+        println!("\n-- phase 4: patching next pointers");
         let all_remote = client.get_challenges().await?.unwrap_or_default();
         let name_to_id: HashMap<String, u32> = all_remote
             .iter()
@@ -500,24 +557,194 @@ async fn deploy_challenges(
                 let next_data = serde_json::json!({ "next_id": next_id });
                 match client.update_challenge(job.challenge_id, &next_data).await {
                     Ok(_) => println!(
-                        "  ✅ next → '{}' (ID {}) for challenge {}",
+                        "  [ok] next -> '{}' (ID {}) for challenge {}",
                         job.next_name, next_id, job.challenge_id
                     ),
-                    Err(e) => eprintln!("  ❌ next for {}: {}", job.challenge_id, e),
+                    Err(e) => eprintln!("  [x] next for {}: {}", job.challenge_id, e),
                 }
             } else {
                 eprintln!(
-                    "  ⚠️  Next challenge '{}' not found on remote",
+                    "  [!] next challenge '{}' not found on remote",
                     job.next_name
                 );
             }
         }
     }
 
-    println!("\n✅ Done!");
+    println!("\ndone.");
     println!("   Created:    {}", created);
     println!("   Updated:    {}", updated);
     println!("   Up-to-date: {}", up_to_date_names.len());
+
+    Ok(())
+}
+
+/// Spread `InstanceConfig` fields as top-level keys in a JSON payload so the
+/// nervctf_instance CTFd plugin can read them from `request.get_json()`.
+fn merge_instance_fields(
+    payload: &mut serde_json::Value,
+    instance: &Option<nervctf::ctfd_api::models::InstanceConfig>,
+) {
+    let Some(inst) = instance else { return };
+    if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(inst) {
+        for (k, v) in map {
+            if v != serde_json::Value::Null {
+                payload[k] = v;
+            }
+        }
+    }
+}
+
+/// Spread `Extra` fields as top-level keys in a JSON payload.
+/// The `dynamic` plugin passes request data as `**kwargs` to the SQLAlchemy model
+/// constructor — it doesn't accept a nested `extra` dict.
+fn merge_extra_fields(payload: &mut serde_json::Value, extra: &nervctf::ctfd_api::models::Extra) {
+    if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(extra) {
+        for (k, v) in map {
+            if v != serde_json::Value::Null {
+                payload[k] = v;
+            }
+        }
+    }
+}
+
+/// Determine the CTFd challenge type string and description for a challenge.
+/// Instance challenges are deployed as `"instance"` (requires the nervctf_instance CTFd plugin).
+fn resolve_challenge_type_and_description(
+    challenge: &Challenge,
+    _monitor_url: &Option<String>,
+) -> (String, String) {
+    let base_desc = challenge.description.as_deref().unwrap_or("").to_string();
+    match challenge.challenge_type {
+        ChallengeType::Instance => ("instance".to_string(), base_desc),
+        ChallengeType::Dynamic => ("dynamic".to_string(), base_desc),
+        ChallengeType::Standard => ("standard".to_string(), base_desc),
+    }
+}
+
+/// Register an instance challenge with the remote monitor after CTFd creation/update.
+async fn deploy_instance(
+    monitor_client: &CtfdClient,
+    challenge: &Challenge,
+    ctfd_id: u32,
+) -> Result<()> {
+    use reqwest::Method;
+
+    let inst = match &challenge.instance {
+        Some(i) => i,
+        None => return Ok(()), // no instance config, nothing to register
+    };
+
+    let backend_str = serde_json::to_value(&inst.backend)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "docker".to_string());
+
+    let register_payload = json!({
+        "challenge_name": challenge.name,
+        "ctfd_id": ctfd_id,
+        "backend": backend_str,
+        "config_json": serde_json::to_string(inst)?,
+    });
+
+    match monitor_client
+        .execute::<serde_json::Value, _>(
+            Method::POST,
+            "/instance/register",
+            Some(&register_payload),
+        )
+        .await
+    {
+        Ok(_) => println!("   [ok] instance registered with monitor"),
+        Err(e) => eprintln!("   [!] monitor registration failed for '{}': {}", challenge.name, e),
+    }
+
+    // If Compose backend with relative compose_file, upload challenge dir for pre-building
+    if let nervctf::ctfd_api::models::InstanceBackend::Compose = inst.backend {
+        if let Some(cf) = &inst.compose_file {
+            let is_local = !cf.starts_with('/');
+            if is_local {
+                let context_dir = std::path::PathBuf::from(&challenge.source_path);
+                match tokio::process::Command::new("tar")
+                    .args(["-czf", "-", "."])
+                    .current_dir(&context_dir)
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => {
+                        let form = reqwest::multipart::Form::new()
+                            .text("challenge_name", challenge.name.clone())
+                            .part(
+                                "context",
+                                reqwest::multipart::Part::bytes(out.stdout)
+                                    .file_name("context.tar.gz")
+                                    .mime_str("application/gzip")
+                                    .unwrap(),
+                            );
+                        match monitor_client.upload_file("/instance/build-compose", form).await {
+                            Ok(_) => println!("   [ok] compose context uploaded and images built on monitor"),
+                            Err(e) => eprintln!("   [!] monitor compose build failed for '{}': {}", challenge.name, e),
+                        }
+                    }
+                    Ok(out) => eprintln!(
+                        "   [!] tar failed for '{}': {}",
+                        challenge.name,
+                        String::from_utf8_lossy(&out.stderr)
+                    ),
+                    Err(e) => eprintln!(
+                        "   [!] failed to create build context for '{}': {}",
+                        challenge.name, e
+                    ),
+                }
+            }
+        }
+    }
+
+    // If Docker backend with local image path, pack and send the build context
+    if let nervctf::ctfd_api::models::InstanceBackend::Docker = inst.backend {
+        if let Some(img) = &inst.image {
+            let is_local = img == "." || img.starts_with("./") || img.starts_with("../");
+            if is_local {
+                let context_dir = if img == "." {
+                    std::path::PathBuf::from(&challenge.source_path)
+                } else {
+                    std::path::PathBuf::from(&challenge.source_path).join(img)
+                };
+
+                match tokio::process::Command::new("tar")
+                    .args(["-czf", "-", "."])
+                    .current_dir(&context_dir)
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => {
+                        let form = reqwest::multipart::Form::new()
+                            .text("challenge_name", challenge.name.clone())
+                            .part(
+                                "context",
+                                reqwest::multipart::Part::bytes(out.stdout)
+                                    .file_name("context.tar.gz")
+                                    .mime_str("application/gzip")
+                                    .unwrap(),
+                            );
+                        match monitor_client.upload_file("/instance/build", form).await {
+                            Ok(_) => println!("   [ok] image build triggered on monitor"),
+                            Err(e) => eprintln!("   [!] monitor build failed for '{}': {}", challenge.name, e),
+                        }
+                    }
+                    Ok(out) => eprintln!(
+                        "   [!] tar failed for '{}': {}",
+                        challenge.name,
+                        String::from_utf8_lossy(&out.stderr)
+                    ),
+                    Err(e) => eprintln!(
+                        "   [!] failed to create build context for '{}': {}",
+                        challenge.name, e
+                    ),
+                }
+            }
+        }
+    }
 
     Ok(())
 }
@@ -526,22 +753,25 @@ async fn deploy_challenges(
 /// Returns `(id, has_files, has_requirements, next_challenge_name)`.
 async fn create_challenge_phase1(
     client: &CtfdClient,
+    monitor_url: &Option<String>,
     challenge: &Challenge,
 ) -> Result<(u32, bool, bool, Option<String>)> {
     use reqwest::Method;
-    use serde_json::json;
 
     let state_str = match challenge.state.as_ref().unwrap_or(&State::Visible) {
         State::Visible => "visible",
         State::Hidden => "hidden",
     };
 
+    // Resolve the CTFd challenge type and description for instance challenges
+    let (ctfd_type, description) = resolve_challenge_type_and_description(challenge, monitor_url);
+
     let mut payload = json!({
         "name":        challenge.name,
         "category":    challenge.category,
-        "description": challenge.description.as_deref().unwrap_or(""),
+        "description": description,
         "value":       challenge.value,
-        "type":        challenge.challenge_type,
+        "type":        ctfd_type,
         "state":       state_str,
     });
     if let Some(ref ci) = challenge.connection_info {
@@ -550,8 +780,17 @@ async fn create_challenge_phase1(
     if let Some(attempts) = challenge.attempts {
         payload["attempts"] = json!(attempts);
     }
+    // Merge scoring extra fields for Dynamic challenges (and Instance with decay scoring)
     if let Some(ref extra) = challenge.extra {
-        payload["extra"] = serde_json::to_value(extra).unwrap_or_default();
+        if matches!(challenge.challenge_type, ChallengeType::Dynamic)
+            || (challenge.challenge_type == ChallengeType::Instance && extra.initial.is_some())
+        {
+            merge_extra_fields(&mut payload, extra);
+        }
+    }
+    // Include instance config fields so the CTFd plugin can store them
+    if challenge.challenge_type == ChallengeType::Instance {
+        merge_instance_fields(&mut payload, &challenge.instance);
     }
 
     let created: Challenge = client
@@ -562,10 +801,19 @@ async fn create_challenge_phase1(
         .id
         .ok_or_else(|| anyhow!("Created challenge returned no ID"))?;
 
-    post_flags(client, id, &challenge.flags).await?;
-    post_tags(client, id, &challenge.tags).await?;
-    post_topics(client, id, &challenge.topics).await?;
-    post_hints(client, id, &challenge.hints).await?;
+    // Post sub-resources; on any error delete the partially-created challenge
+    // so CTFd is never left with a broken entry.
+    let sub_result: Result<()> = async {
+        post_flags(client, id, &challenge.flags).await?;
+        post_tags(client, id, &challenge.tags).await?;
+        post_topics(client, id, &challenge.topics).await?;
+        post_hints(client, id, &challenge.hints).await?;
+        Ok(())
+    }.await;
+    if let Err(e) = sub_result {
+        let _ = client.delete_challenge(id).await;
+        return Err(e);
+    }
 
     let has_files = challenge
         .files
@@ -580,22 +828,22 @@ async fn create_challenge_phase1(
 /// Returns `(has_files, has_requirements, next_challenge_name)`.
 async fn update_challenge_phase1(
     client: &CtfdClient,
+    monitor_url: &Option<String>,
     challenge_id: u32,
     challenge: &Challenge,
 ) -> Result<(bool, bool, Option<String>)> {
-    use serde_json::{json, Value};
-
     let state_str = match challenge.state.as_ref().unwrap_or(&State::Visible) {
         State::Visible => "visible",
         State::Hidden => "hidden",
     };
 
+    let (_ctfd_type, description) = resolve_challenge_type_and_description(challenge, monitor_url);
+
     let mut payload = json!({
         "name":        challenge.name,
         "category":    challenge.category,
-        "description": challenge.description.as_deref().unwrap_or(""),
+        "description": description,
         "value":       challenge.value,
-        "type":        challenge.challenge_type,
         "state":       state_str,
     });
     if let Some(ref ci) = challenge.connection_info {
@@ -605,105 +853,200 @@ async fn update_challenge_phase1(
         payload["attempts"] = json!(attempts);
     }
     if let Some(ref extra) = challenge.extra {
-        payload["extra"] = serde_json::to_value(extra).unwrap_or_default();
+        if matches!(challenge.challenge_type, ChallengeType::Dynamic)
+            || (challenge.challenge_type == ChallengeType::Instance && extra.initial.is_some())
+        {
+            merge_extra_fields(&mut payload, extra);
+        }
+    }
+    if challenge.challenge_type == ChallengeType::Instance {
+        merge_instance_fields(&mut payload, &challenge.instance);
     }
     client.update_challenge(challenge_id, &payload).await?;
 
     // Replace flags (best-effort: skip if CTFd sub-endpoints are unavailable,
     // e.g. when Challenge Visibility is set to Private in CTFd Admin → Config)
-    match client.get_challenge_flags_endpoint(challenge_id).await {
-        Ok(Some(existing)) => {
-            for flag in existing.as_array().unwrap_or(&vec![]) {
-                if let Some(flag_id) = flag.get("id").and_then(Value::as_u64) {
-                    client.delete_flag(flag_id as u32).await?;
-                }
-            }
-            post_flags(client, challenge_id, &challenge.flags).await?;
-        }
-        Ok(None) => {
-            post_flags(client, challenge_id, &challenge.flags).await?;
-        }
-        Err(e) => {
-            return Err(visibility_or_err(e, "flags", challenge_id));
-        }
-    }
-
-    // Replace tags
-    match client.get_challenge_tags_endpoint(challenge_id).await {
-        Ok(Some(existing)) => {
-            for tag in existing.as_array().unwrap_or(&vec![]) {
-                if let Some(tag_id) = tag.get("id").and_then(Value::as_u64) {
-                    client.delete_tag(tag_id as u32).await?;
-                }
-            }
-            post_tags(client, challenge_id, &challenge.tags).await?;
-        }
-        Ok(None) => {
-            post_tags(client, challenge_id, &challenge.tags).await?;
-        }
-        Err(e) => {
-            return Err(visibility_or_err(e, "tags", challenge_id));
-        }
-    }
+    replace_flags(client, challenge_id, &challenge.flags).await?;
+    replace_tags(client, challenge_id, &challenge.tags).await?;
     post_topics(client, challenge_id, &challenge.topics).await?;
-
-    // Replace hints
-    match client.get_challenge_hints_endpoint(challenge_id).await {
-        Ok(Some(existing)) => {
-            for hint in existing.as_array().unwrap_or(&vec![]) {
-                if let Some(hint_id) = hint.get("id").and_then(Value::as_u64) {
-                    client.delete_hint(hint_id as u32).await?;
-                }
-            }
-            post_hints(client, challenge_id, &challenge.hints).await?;
-        }
-        Ok(None) => {
-            post_hints(client, challenge_id, &challenge.hints).await?;
-        }
-        Err(e) => {
-            return Err(visibility_or_err(e, "hints", challenge_id));
-        }
-    }
-
-    // Delete existing files; new ones will be uploaded in Phase 2
-    match client.get_challenge_files_endpoint(challenge_id).await {
-        Ok(Some(existing)) => {
-            for file in existing.as_array().unwrap_or(&vec![]) {
-                if let Some(file_id) = file.get("id").and_then(Value::as_u64) {
-                    client.delete_file(file_id as u32).await?;
-                }
-            }
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return Err(visibility_or_err(e, "files", challenge_id));
-        }
-    }
-
-    let has_files = challenge
-        .files
-        .as_ref()
-        .map(|f| !f.is_empty())
-        .unwrap_or(false);
+    replace_hints(client, challenge_id, &challenge.hints).await?;
+    let has_files = sync_files(client, challenge_id, &challenge.files).await;
     let has_reqs = challenge.requirements.is_some();
     Ok((has_files, has_reqs, challenge.next.clone()))
 }
 
-// ── Small helpers ─────────────────────────────────────────────────────────────
+// ── Sub-resource replace helpers ──────────────────────────────────────────────
 
-/// Converts a sub-endpoint error to a helpful message when it is a CTFd login
-/// redirect (which happens when Challenge Visibility is set to Private).
-fn visibility_or_err(e: anyhow::Error, resource: &str, id: u32) -> anyhow::Error {
+/// Returns true if the error looks like a non-JSON / HTML response (login redirect,
+/// CTFd Private-mode catch-all, or missing endpoint).
+fn is_html_or_redirect(e: &anyhow::Error) -> bool {
     let msg = e.to_string();
-    if msg.contains("/login") || msg.contains("Redirecting") {
-        anyhow::anyhow!(
-            "challenge {} {}: CTFd returned a login redirect — \
-             set Challenge Visibility to Public in CTFd Admin → Config → Visibility",
-            id,
-            resource
-        )
-    } else {
-        e
+    msg.contains("<!DOCTYPE") || msg.contains("/login") || msg.contains("Redirecting")
+        || msg.contains("JSON parse error")
+}
+
+async fn replace_flags(
+    client: &CtfdClient,
+    challenge_id: u32,
+    flags: &Option<Vec<FlagContent>>,
+) -> Result<()> {
+    match client.get_challenge_flags_endpoint(challenge_id).await {
+        Ok(Some(existing)) => {
+            let arr = existing.as_array().cloned().unwrap_or_default();
+            // Compare remote vs local content — skip if already identical
+            let mut remote: Vec<String> = arr.iter()
+                .filter_map(|f| f.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            remote.sort();
+            let mut local: Vec<String> = flags.as_ref().map(|fs| fs.iter().map(|f| match f {
+                FlagContent::Simple(s) => s.clone(),
+                FlagContent::Detailed { content, .. } => content.clone(),
+            }).collect()).unwrap_or_default();
+            local.sort();
+            if remote == local {
+                return Ok(());
+            }
+            for flag in &arr {
+                if let Some(id) = flag.get("id").and_then(|v| v.as_u64()) {
+                    client.delete_flag(id as u32).await?;
+                }
+            }
+            post_flags(client, challenge_id, flags).await?;
+        }
+        Ok(None) => post_flags(client, challenge_id, flags).await?,
+        Err(e) if is_html_or_redirect(&e) => {
+            eprintln!(
+                "  [!] challenge {}: flags endpoint unavailable (CTFd Private mode?) -- \
+                 flags not updated. set Visibility to Public in CTFd Admin -> Config.",
+                challenge_id
+            );
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+async fn replace_tags(
+    client: &CtfdClient,
+    challenge_id: u32,
+    tags: &Option<Vec<Tag>>,
+) -> Result<()> {
+    match client.get_challenge_tags_endpoint(challenge_id).await {
+        Ok(Some(existing)) => {
+            let arr = existing.as_array().cloned().unwrap_or_default();
+            let mut remote: Vec<String> = arr.iter()
+                .filter_map(|t| t.get("value").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            remote.sort();
+            let mut local: Vec<String> = tags.as_ref().map(|ts| ts.iter().map(|t| match t {
+                Tag::Simple(s) => s.clone(),
+                Tag::Detailed { value, .. } => value.clone(),
+            }).collect()).unwrap_or_default();
+            local.sort();
+            if remote == local {
+                return Ok(());
+            }
+            for tag in &arr {
+                if let Some(id) = tag.get("id").and_then(|v| v.as_u64()) {
+                    client.delete_tag(id as u32).await?;
+                }
+            }
+            post_tags(client, challenge_id, tags).await?;
+        }
+        Ok(None) => post_tags(client, challenge_id, tags).await?,
+        Err(e) if is_html_or_redirect(&e) => {
+            eprintln!("  [!] challenge {}: tags endpoint unavailable -- tags not updated.", challenge_id);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+async fn replace_hints(
+    client: &CtfdClient,
+    challenge_id: u32,
+    hints: &Option<Vec<HintContent>>,
+) -> Result<()> {
+    match client.get_challenge_hints_endpoint(challenge_id).await {
+        Ok(Some(existing)) => {
+            let arr = existing.as_array().cloned().unwrap_or_default();
+            let mut remote: Vec<String> = arr.iter()
+                .filter_map(|h| h.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            remote.sort();
+            let mut local: Vec<String> = hints.as_ref().map(|hs| hs.iter().map(|h| match h {
+                HintContent::Simple(s) => s.clone(),
+                HintContent::Detailed { content, .. } => content.clone(),
+            }).collect()).unwrap_or_default();
+            local.sort();
+            if remote == local {
+                return Ok(());
+            }
+            for hint in &arr {
+                if let Some(id) = hint.get("id").and_then(|v| v.as_u64()) {
+                    client.delete_hint(id as u32).await?;
+                }
+            }
+            post_hints(client, challenge_id, hints).await?;
+        }
+        Ok(None) => post_hints(client, challenge_id, hints).await?,
+        Err(e) if is_html_or_redirect(&e) => {
+            eprintln!("  [!] challenge {}: hints endpoint unavailable -- hints not updated.", challenge_id);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
+/// Compare remote filenames with local file list. If identical, return false (no re-upload needed).
+/// If different, delete remote files and return true so phase 2 re-uploads the local set.
+/// On endpoint error (CTFd Private mode), prints a warning and returns false to avoid duplicates.
+async fn sync_files(
+    client: &CtfdClient,
+    challenge_id: u32,
+    local_files: &Option<Vec<String>>,
+) -> bool {
+    let mut local_names: Vec<String> = local_files.as_ref()
+        .map(|fs| fs.iter()
+            .map(|f| std::path::Path::new(f)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(f.as_str())
+                .to_string())
+            .collect())
+        .unwrap_or_default();
+    local_names.sort();
+
+    if local_names.is_empty() {
+        return false;
+    }
+
+    match client.get_challenge_files_endpoint(challenge_id).await {
+        Ok(Some(existing)) => {
+            let arr = existing.as_array().cloned().unwrap_or_default();
+            let mut remote_names: Vec<String> = arr.iter()
+                .filter_map(|f| f.get("location").and_then(|v| v.as_str())
+                    .and_then(|loc| loc.split('/').next_back())
+                    .map(|s| s.to_string()))
+                .collect();
+            remote_names.sort();
+            if remote_names == local_names {
+                return false; // already in sync
+            }
+            // Delete remote files before phase 2 re-uploads
+            for file in &arr {
+                if let Some(id) = file.get("id").and_then(|v| v.as_u64()) {
+                    let _ = client.delete_file(id as u32).await;
+                }
+            }
+            true
+        }
+        Ok(None) => true, // no remote files yet, upload local ones
+        Err(e) if is_html_or_redirect(&e) => {
+            eprintln!("  [!] challenge {}: files endpoint unavailable -- files not synced.", challenge_id);
+            false // don't re-upload blindly if we can't delete first
+        }
+        Err(_) => false,
     }
 }
 
@@ -713,7 +1056,6 @@ async fn post_flags(
     flags: &Option<Vec<FlagContent>>,
 ) -> Result<()> {
     use reqwest::Method;
-    use serde_json::json;
     if let Some(flags) = flags {
         for flag in flags {
             let data = match flag {
@@ -751,7 +1093,6 @@ async fn post_flags(
 
 async fn post_tags(client: &CtfdClient, challenge_id: u32, tags: &Option<Vec<Tag>>) -> Result<()> {
     use reqwest::Method;
-    use serde_json::json;
     if let Some(tags) = tags {
         for tag in tags {
             let value = match tag {
@@ -776,7 +1117,6 @@ async fn post_topics(
     topics: &Option<Vec<String>>,
 ) -> Result<()> {
     use reqwest::Method;
-    use serde_json::json;
     if let Some(topics) = topics {
         for topic in topics {
             client
@@ -801,7 +1141,6 @@ async fn post_hints(
     hints: &Option<Vec<HintContent>>,
 ) -> Result<()> {
     use reqwest::Method;
-    use serde_json::json;
     if let Some(hints) = hints {
         for hint in hints {
             let (content, cost) = match hint {
@@ -836,11 +1175,11 @@ async fn list_challenges(
     let challenges = scanner.scan_directory(base_dir)?;
 
     if challenges.is_empty() {
-        println!("ℹ️  No challenge files found");
+        println!("note: no challenge files found");
         return Ok(());
     }
 
-    println!("📋 Found {} challenges:", challenges.len());
+    println!("found {} challenges:", challenges.len());
     for challenge in challenges {
         if detailed {
             match challenge.to_yaml_string() {
@@ -849,7 +1188,7 @@ async fn list_challenges(
             }
         } else {
             println!(
-                "  - {} ({}) — {} pts",
+                "  - {} ({}) - {} pts",
                 challenge.name, challenge.category, challenge.value
             );
         }
@@ -865,14 +1204,14 @@ async fn scan_challenges(
     let challenges = scanner.scan_directory(base_dir)?;
 
     if challenges.is_empty() {
-        println!("ℹ️  No challenge files found");
+        println!("note: no challenge files found");
         return Ok(());
     }
 
     if detailed {
-        println!("\n📋 {} challenges:", challenges.len());
+        println!("\n{} challenges:", challenges.len());
         for c in &challenges {
-            println!("  - {} ({}) — {} pts", c.name, c.category, c.value);
+            println!("  - {} ({}) - {} pts", c.name, c.category, c.value);
             if let Some(flags) = &c.flags {
                 println!("    Flags: {}", flags.len());
             }
@@ -881,7 +1220,7 @@ async fn scan_challenges(
             }
         }
     } else {
-        println!("📋 Found {} challenges", challenges.len());
+        println!("found {} challenges", challenges.len());
     }
 
     let stats = scanner.get_stats(&challenges);

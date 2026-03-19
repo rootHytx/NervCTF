@@ -1,0 +1,30 @@
+name: "Challenge Name"
+author: "author"
+category: misc  # web, pwn, rev, crypto, forensics, misc, osint, ...
+description: |
+    Describe the challenge here.
+
+    Provide any relevant context or hints about what players need to do.
+value: 100
+type: standard
+state: visible
+
+flags:
+    - CTF{your_flag_here}
+
+tags:
+    - tag1
+    - tag2
+
+# files:
+#     - dist/challenge.zip
+
+# hints:
+#     - { content: "Hint text here", cost: 10 }
+
+# requirements:
+#     - "Other Challenge Name"
+
+# attempts: 5  # max submission attempts (0 = unlimited)
+
+version: "0.3"

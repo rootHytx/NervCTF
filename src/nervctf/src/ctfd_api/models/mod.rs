@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub enum ChallengeType {
     Standard,
     Dynamic,
-    Container,
+    Instance,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -69,45 +69,82 @@ impl HintContent {
     }
 }
 
-/// Flag generation mode for container challenges.
+/// `extra` block — used by Dynamic challenges for scoring configuration.
+#[derive(Debug, Deserialize, Clone, Serialize, Default)]
+pub struct Extra {
+    pub initial: Option<u32>,
+    pub decay: Option<u32>,
+    pub minimum: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum FlagMode {
+pub enum InstanceBackend {
+    Docker,
+    Compose,
+    Lxc,
+    Vagrant,
+}
+
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstanceFlagMode {
     Static,
     Random,
 }
 
-/// `extra` block — shared by Dynamic and Container challenge types.
-/// Dynamic uses only the scoring fields; Container uses all of them.
-/// All fields are optional so serde silently ignores unknown sub-keys.
-#[derive(Debug, Deserialize, Clone, Serialize, Default)]
-pub struct Extra {
-    // ── Scoring (dynamic + container) ────────────────────────────────────────
-    pub initial: Option<u32>,
-    pub decay: Option<u32>,
-    pub minimum: Option<u32>,
+/// How the per-instance flag is delivered into the container.
+///
+/// - `env` (default): `FLAG` is exposed as an environment variable via Docker Compose
+///   variable substitution (`${FLAG}` in any service's `environment:` block).
+/// - `file`: the flag is written to a bind-mounted file at `flag_file_path` inside
+///   the container.  Optionally `flag_service` names which compose service receives
+///   the mount (defaults to `compose_service`).
+#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FlagDelivery {
+    Env,
+    File,
+}
 
-    // ── Container-specific ────────────────────────────────────────────────────
-    /// Docker image name or local build path (`.` = build from Dockerfile).
+#[derive(Debug, Deserialize, Clone, Serialize)]
+pub struct InstanceConfig {
+    pub backend: InstanceBackend,
+
+    // Docker / Compose
     pub image: Option<String>,
-    /// TCP port the container service listens on (integer form).
-    pub internal_port: Option<u32>,
-    /// TCP port as a string (some plugins prefer this form).
-    pub internal_ports: Option<String>,
-    /// How the flag is generated: `static` (from `flags:`) or `random`.
-    pub flag_mode: Option<FlagMode>,
-    /// Prefix prepended to random flags (e.g. `"upCTF{"`).
-    pub flag_prefix: Option<String>,
-    /// Suffix appended to random flags (e.g. `"}"`).
-    pub flag_suffix: Option<String>,
-    /// Length of the random part of an auto-generated flag.
-    pub random_flag_length: Option<u32>,
-    /// Scoring decay function: `"linear"` or `"logarithmic"`.
-    pub decay_function: Option<String>,
-    /// How many minutes before an idle container is destroyed.
+    pub compose_file: Option<String>,
+    pub compose_service: Option<String>,
+
+    // LXC
+    pub lxc_image: Option<String>,
+
+    // Vagrant
+    pub vagrantfile: Option<String>,
+
+    // Common
+    pub internal_port: u32,
+    pub connection: String,
     pub timeout_minutes: Option<u32>,
-    /// Override entrypoint / command run inside the container.
+    pub max_per_team: Option<u32>,
+    pub max_renewals: Option<u32>,
     pub command: Option<String>,
+
+    // Flag config (static flags live in flags:; random generated at runtime)
+    pub flag_mode: Option<InstanceFlagMode>,
+    pub flag_prefix: Option<String>,
+    pub flag_suffix: Option<String>,
+    pub random_flag_length: Option<u32>,
+
+    // Flag delivery
+    /// `env` (default) or `file`.
+    pub flag_delivery: Option<FlagDelivery>,
+    /// Absolute path inside the target container where the flag file is written.
+    /// Required when `flag_delivery: file`.
+    pub flag_file_path: Option<String>,
+    /// Compose service that receives the flag.  Defaults to `compose_service`.
+    /// Useful when the port-exposing service differs from the one that holds the flag.
+    pub flag_service: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -193,6 +230,7 @@ pub struct Challenge {
     pub challenge_id: Option<u32>,
     pub author: Option<String>,
     pub extra: Option<Extra>,
+    pub instance: Option<InstanceConfig>,
     pub image: Option<String>,
     pub protocol: Option<String>,
     pub host: Option<String>,
@@ -307,9 +345,9 @@ impl RequirementsQueue {
 
     pub fn print(&self) {
         if self.queue.is_empty() {
-            println!("✅ All challenges are ready to be processed.");
+            println!("all challenges are ready to be processed.");
         } else {
-            println!("⏳ Challenges waiting for dependencies:");
+            println!("challenges waiting for dependencies:");
             for cw in &self.queue {
                 println!(
                     "  - {} (waiting for: {})",

@@ -1,0 +1,54 @@
+name: "Challenge Name"
+author: "author"
+category: pwn   # web, pwn, rev, crypto, forensics, misc, ...
+description: |
+    Describe the challenge here.
+
+    Connect with: `nc <host> <port>`
+value: 100
+type: instance
+state: visible
+
+instance:
+    backend: docker
+
+    # "." = build from Dockerfile in this directory (uploaded as tar.gz to monitor)
+    # Or a registry image: "ubuntu:22.04", "registry.example.com/my-image:latest"
+    image: .
+
+    # Port the service listens on inside the container
+    internal_port: 4000
+
+    # How players connect: nc | http | ssh
+    connection: nc
+
+    # Static flag — same for all teams.
+    # The monitor does NOT inject a FLAG env var in static mode.
+    flag_mode: static
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+    # Override the container entrypoint/CMD (optional, parsed with shlex)
+    # command: "/bin/sh -c 'exec /challenge/binary'"
+
+# Dynamic scoring (optional — remove extra block entirely for fixed value)
+# extra:
+#     initial: 500
+#     decay: 100
+#     minimum: 50
+#     # decay_function: logarithmic
+
+flags:
+    - CTF{your_static_flag_here}
+
+tags:
+    - tag1
+
+# files:
+#     - dist/challenge.zip
+
+# hints:
+#     - { content: "Hint text here", cost: 50 }
+
+version: "0.3"

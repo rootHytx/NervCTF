@@ -1,7 +1,3 @@
-//! CTFd Challenge Manager
-//! Provides comprehensive challenge management functionality including CRUD operations,
-//! synchronization, and local file system management for CTFd challenges.
-
 use crate::ctfd_api::models::{Challenge, FlagContent, HintContent, Tag};
 use crate::ctfd_api::{CtfdClient, RequirementsQueue};
 use anyhow::{anyhow, Context, Result};
@@ -13,7 +9,6 @@ use walkdir::WalkDir;
 
 pub mod sync;
 
-/// Main challenge manager for CTFd challenge operations
 #[derive(Clone)]
 pub struct ChallengeManager {
     client: CtfdClient,
@@ -22,7 +17,6 @@ pub struct ChallengeManager {
 }
 
 impl ChallengeManager {
-    /// Creates a new ChallengeManager instance
     pub fn new(client: CtfdClient, base_path: &Path) -> Self {
         Self {
             client,
@@ -31,17 +25,10 @@ impl ChallengeManager {
         }
     }
 
-    /// Get all challenges from the remote CTFd instance
     pub async fn get_all_challenges(&self) -> Result<Option<Vec<Challenge>>> {
         self.client.get_challenges().await
     }
 
-    /// Get a specific challenge by ID
-    pub async fn get_challenge(&self, id: u32) -> Result<Option<Challenge>> {
-        self.client.get_challenge(id).await
-    }
-
-    /// Get a challenge by name
     pub async fn get_challenge_by_name(&self, name: &str) -> Result<Option<Challenge>> {
         let challenges = self.get_all_challenges().await?.unwrap();
         Ok(Option::from(
@@ -49,7 +36,6 @@ impl ChallengeManager {
         ))
     }
 
-    /// Get the base path for challenge files
     pub fn get_base_path(&self) -> &Path {
         &self.base_path
     }
@@ -63,7 +49,6 @@ impl ChallengeManager {
         }
     }
 
-    /// Create a new challenge from a configuration object
     pub async fn create_challenge(&self, config: &Challenge) -> Result<Option<Challenge>> {
         let challenge_data = json!({
             "name": config.name,
@@ -77,7 +62,6 @@ impl ChallengeManager {
         Ok(challenge)
     }
 
-    /// Update an existing challenge
     pub async fn update_challenge(&self, id: u32, config: &Challenge) -> Result<Option<Challenge>> {
         // Update: challenge core
         let challenge_data = json!({
@@ -278,12 +262,10 @@ impl ChallengeManager {
         Ok(Option::from(challenge))
     }
 
-    /// Delete a challenge by ID
     pub async fn delete_challenge(&self, id: u32) -> Result<()> {
         self.client.delete_challenge(id).await
     }
 
-    /// Create flags for a challenge
     pub async fn create_flag(
         &self,
         challenge_id: u32,
@@ -319,7 +301,6 @@ impl ChallengeManager {
             .await
     }
 
-    /// Scan local challenges from the file system
     pub fn scan_local_challenges(&self) -> Result<Vec<Challenge>> {
         let mut challenges = Vec::new();
         let challenges_dir = self.base_path.join("challenges");
@@ -350,7 +331,7 @@ impl ChallengeManager {
                                     challenges.push(config);
                                 }
                                 Err(e) => {
-                                    eprintln!("❌ Failed to parse {}: {}", yml_path.display(), e);
+                                    eprintln!("[x] failed to parse {}: {}", yml_path.display(), e);
                                 }
                             }
                         }
@@ -361,18 +342,16 @@ impl ChallengeManager {
         Ok(challenges)
     }
 
-    /// Get a local challenge by name
     pub fn get_local_challenge(&self, name: &str) -> Result<Option<Challenge>> {
         match self.scan_local_challenges() {
             Ok(challenges) => Ok(challenges.into_iter().find(|c| c.name == name)),
             Err(e) => {
-                eprintln!("⚠️  Warning: Some challenges failed to scan: {}", e);
+                eprintln!("[!] some challenges failed to scan: {}", e);
                 Ok(None)
             }
         }
     }
 
-    /// Create a new challenge from a YAML file
     pub async fn create_challenge_from_file(&self, yaml_path: &Path) -> Result<Option<Challenge>> {
         let yml_content = fs::read_to_string(yaml_path)
             .with_context(|| format!("Failed to read {}", yaml_path.display()))?;
@@ -383,7 +362,6 @@ impl ChallengeManager {
         self.create_challenge(&config).await
     }
 
-    /// Update a challenge from a YAML file
     pub async fn update_challenge_from_file(
         &self,
         challenge_id: u32,
@@ -398,7 +376,6 @@ impl ChallengeManager {
         self.update_challenge(challenge_id, &config).await
     }
 
-    /// Export challenges to a directory structure
     pub async fn export_challenges(&self, export_path: &Path) -> Result<()> {
         let challenges = self.get_all_challenges().await?.unwrap();
 
@@ -416,17 +393,14 @@ impl ChallengeManager {
         Ok(())
     }
 
-    /// Create a synchronization instance
     pub fn synchronizer(&self) -> sync::ChallengeSynchronizer {
         sync::ChallengeSynchronizer::new(self.clone())
     }
 }
 
-/// Utility functions for challenge management
 pub mod utils {
     use super::*;
 
-    /// Validate a challenge configuration
     pub fn validate_challenge_config(config: &Challenge) -> Result<()> {
         if config.name.trim().is_empty() {
             return Err(anyhow!("Challenge name cannot be empty"));

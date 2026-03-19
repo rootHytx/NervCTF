@@ -1,0 +1,41 @@
+name: "Challenge Name"
+author: "author"
+category: misc
+description: |
+    Describe the challenge here.
+
+    Connect with: `nc <host> <port>`
+value: 100
+type: instance
+state: visible
+
+instance:
+    backend: lxc
+
+    # LXC image name or path accessible on the monitor server.
+    # Examples: ubuntu:22.04  |  images:alpine/3.18  |  /opt/images/chall.qcow2
+    lxc_image: ubuntu:22.04
+
+    internal_port: 4000
+    connection: nc  # nc | http | ssh
+
+    # Static flag — bake it into the image or place it via a provisioning script.
+    # The LXC backend does not inject FLAG env var automatically.
+    flag_mode: static
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+# Dynamic scoring (optional)
+# extra:
+#     initial: 500
+#     decay: 100
+#     minimum: 50
+
+flags:
+    - CTF{your_static_flag_here}
+
+tags:
+    - tag1
+
+version: "0.3"

@@ -1,0 +1,44 @@
+name: "Challenge Name"
+author: "author"
+category: web
+description: |
+    Describe the challenge here.
+
+    Access at: `http://<host>:<port>`
+value: 500
+type: instance
+state: visible
+
+instance:
+    backend: compose
+    compose_file: docker-compose.yml
+    compose_service: app
+    internal_port: 8080
+    connection: http  # nc | http | ssh
+
+    flag_mode: random
+    flag_prefix: "CTF{"
+    flag_suffix: "}"
+    random_flag_length: 16
+
+    # How the flag reaches the container:
+    #   env (default): passed as ${FLAG} env var for substitution in docker-compose.yml
+    #   file: bind-mounted read-only at flag_file_path inside the container
+    flag_delivery: env
+    # flag_file_path: /challenge/flag   # required when flag_delivery: file
+    # flag_service: app                 # defaults to compose_service if omitted
+
+    timeout_minutes: 45
+    # max_renewals: 3
+
+extra:
+    initial: 500
+    decay: 100
+    minimum: 50
+    # decay_function: logarithmic
+
+tags:
+    - tag1
+    - web
+
+version: "0.3"

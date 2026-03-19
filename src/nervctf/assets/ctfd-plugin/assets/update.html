@@ -1,0 +1,149 @@
+{% extends "admin/challenges/update.html" %}
+
+{% block update_content %}
+<div class="mb-3">
+    <label class="form-label">Scoring Type</label>
+    <select class="form-select" id="scoring-type-select" onchange="toggleScoringType(this.value)">
+        <option value="standard" {% if not challenge.initial_value %}selected{% endif %}>Standard (Fixed)</option>
+        <option value="dynamic" {% if challenge.initial_value %}selected{% endif %}>Dynamic (Decay)</option>
+    </select>
+</div>
+
+<div id="standard-scoring" {% if challenge.initial_value %}style="display:none"{% endif %}>
+    <div class="mb-3">
+        <label class="form-label">Value</label>
+        <input class="form-control" type="number" name="value" value="{{ challenge.value }}">
+    </div>
+</div>
+
+<div id="dynamic-scoring" {% if not challenge.initial_value %}style="display:none"{% endif %}>
+    <div class="mb-3">
+        <label class="form-label">Current Value</label>
+        <input class="form-control" type="number" value="{{ challenge.value }}" disabled>
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Initial Value</label>
+        <input class="form-control" type="number" name="initial" value="{{ challenge.initial_value or '' }}">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Minimum Value</label>
+        <input class="form-control" type="number" name="minimum" value="{{ challenge.minimum_value or '' }}">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Decay</label>
+        <input class="form-control" type="number" name="decay" value="{{ challenge.decay_value or '' }}">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Decay Function</label>
+        <select class="form-select" name="decay_function">
+            <option value="linear" {% if challenge.decay_function == 'linear' %}selected{% endif %}>Linear</option>
+            <option value="logarithmic" {% if challenge.decay_function == 'logarithmic' %}selected{% endif %}>Logarithmic</option>
+        </select>
+    </div>
+</div>
+
+<hr>
+<h6>Instance Configuration</h6>
+
+<div class="mb-3">
+    <label class="form-label">Backend</label>
+    <select class="form-select" name="backend" id="backend-select" onchange="toggleBackendFields(this.value)">
+        <option value="docker" {% if challenge.backend == 'docker' %}selected{% endif %}>Docker</option>
+        <option value="compose" {% if challenge.backend == 'compose' %}selected{% endif %}>Docker Compose</option>
+        <option value="lxc" {% if challenge.backend == 'lxc' %}selected{% endif %}>LXC</option>
+        <option value="vagrant" {% if challenge.backend == 'vagrant' %}selected{% endif %}>Vagrant</option>
+    </select>
+</div>
+
+<div id="fields-docker">
+    <div class="mb-3">
+        <label class="form-label">Docker Image</label>
+        <input class="form-control" type="text" name="image" value="{{ challenge.image or '' }}" placeholder="registry/image:tag">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Command Override</label>
+        <input class="form-control" type="text" name="command" value="{{ challenge.command or '' }}">
+    </div>
+</div>
+
+<div id="fields-compose" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">Compose File Path</label>
+        <input class="form-control" type="text" name="compose_file" value="{{ challenge.compose_file or 'docker-compose.yml' }}">
+    </div>
+    <div class="mb-3">
+        <label class="form-label">Service Name</label>
+        <input class="form-control" type="text" name="compose_service" value="{{ challenge.compose_service or '' }}">
+    </div>
+</div>
+
+<div id="fields-lxc" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">LXC Image</label>
+        <input class="form-control" type="text" name="lxc_image" value="{{ challenge.lxc_image or '' }}">
+    </div>
+</div>
+
+<div id="fields-vagrant" style="display:none">
+    <div class="mb-3">
+        <label class="form-label">Vagrantfile Directory</label>
+        <input class="form-control" type="text" name="vagrantfile" value="{{ challenge.vagrantfile or '' }}">
+    </div>
+</div>
+
+<div class="mb-3">
+    <label class="form-label">Internal Port</label>
+    <input class="form-control" type="number" name="internal_port" value="{{ challenge.internal_port or 1337 }}">
+</div>
+
+<div class="mb-3">
+    <label class="form-label">Connection Type</label>
+    <select class="form-select" name="connection">
+        <option value="nc" {% if challenge.connection == 'nc' %}selected{% endif %}>TCP / nc</option>
+        <option value="http" {% if challenge.connection == 'http' %}selected{% endif %}>HTTP</option>
+        <option value="https" {% if challenge.connection == 'https' %}selected{% endif %}>HTTPS</option>
+        <option value="ssh" {% if challenge.connection == 'ssh' %}selected{% endif %}>SSH</option>
+    </select>
+</div>
+
+<div class="row">
+    <div class="col mb-3">
+        <label class="form-label">Timeout (minutes)</label>
+        <input class="form-control" type="number" name="timeout_minutes" value="{{ challenge.timeout_minutes or 45 }}">
+    </div>
+    <div class="col mb-3">
+        <label class="form-label">Max Renewals</label>
+        <input class="form-control" type="number" name="max_renewals" value="{{ challenge.max_renewals or 3 }}">
+    </div>
+</div>
+
+<hr>
+<h6>Flag Configuration</h6>
+
+<div class="mb-3">
+    <label class="form-label">Flag Mode</label>
+    <select class="form-select" name="flag_mode" id="flag-mode-select" onchange="toggleFlagMode(this.value)">
+        <option value="static" {% if challenge.flag_mode == 'static' %}selected{% endif %}>Static</option>
+        <option value="random" {% if challenge.flag_mode == 'random' %}selected{% endif %}>Random</option>
+    </select>
+</div>
+
+<div id="random-flag-fields" {% if challenge.flag_mode != 'random' %}style="display:none"{% endif %}>
+    <div class="row">
+        <div class="col mb-3">
+            <label class="form-label">Flag Prefix</label>
+            <input class="form-control" type="text" name="flag_prefix" value="{{ challenge.flag_prefix or '' }}">
+        </div>
+        <div class="col mb-3">
+            <label class="form-label">Flag Suffix</label>
+            <input class="form-control" type="text" name="flag_suffix" value="{{ challenge.flag_suffix or '' }}">
+        </div>
+        <div class="col mb-3">
+            <label class="form-label">Random Part Length</label>
+            <input class="form-control" type="number" name="random_flag_length" value="{{ challenge.random_flag_length or 16 }}">
+        </div>
+    </div>
+</div>
+
+<script src="/plugins/nervctf_instance/assets/update.js"></script>
+{% endblock %}

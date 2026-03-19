@@ -1,6 +1,3 @@
-//! CTFd Challenge API endpoints
-//! Handles all challenge-related API operations
-
 use super::super::models::Challenge;
 use crate::ctfd_api::client::CtfdClient;
 use anyhow::Result;
@@ -50,7 +47,6 @@ impl CtfdClient {
         if all.is_empty() { Ok(None) } else { Ok(Some(all)) }
     }
 
-    /// Get a specific challenge by ID
     pub async fn get_challenge(&self, id: u32) -> Result<Option<Challenge>> {
         self.execute(Method::GET, &format!("/challenges/{}", id), None::<&()>)
             .await
@@ -67,58 +63,51 @@ impl CtfdClient {
         Ok(None)
     }
 
-    /// Create a new challenge
     pub async fn create_challenge(&self, data: &Value) -> Result<Option<Challenge>> {
         self.execute(Method::POST, "/challenges", Some(data)).await
     }
 
-    /// Update a challenge
     pub async fn update_challenge(&self, id: u32, data: &Value) -> Result<Option<Challenge>> {
         self.execute(Method::PATCH, &format!("/challenges/{}", id), Some(data))
             .await
     }
 
-    /// Delete a challenge
     pub async fn delete_challenge(&self, id: u32) -> Result<()> {
         self.request_without_body(Method::DELETE, &format!("/challenges/{}", id), None::<&()>)
             .await
     }
 
-    /// Get challenge files
     pub async fn get_challenge_files_endpoint(&self, id: u32) -> Result<Option<Value>> {
         self.execute(
             Method::GET,
-            &format!("/challenges/{}/files", id),
+            &format!("/files?challenge_id={}", id),
             None::<&()>,
         )
         .await
     }
 
-    /// Get challenge flags
     pub async fn get_challenge_flags_endpoint(&self, id: u32) -> Result<Option<Value>> {
         self.execute(
             Method::GET,
-            &format!("/challenges/{}/flags", id),
+            &format!("/flags?challenge_id={}", id),
             None::<&()>,
         )
         .await
     }
 
-    /// Get challenge tags
     pub async fn get_challenge_tags_endpoint(&self, id: u32) -> Result<Option<Value>> {
         self.execute(
             Method::GET,
-            &format!("/challenges/{}/tags", id),
+            &format!("/tags?challenge_id={}", id),
             None::<&()>,
         )
         .await
     }
 
-    /// Get challenge hints
     pub async fn get_challenge_hints_endpoint(&self, id: u32) -> Result<Option<Value>> {
         self.execute(
             Method::GET,
-            &format!("/challenges/{}/hints", id),
+            &format!("/hints?challenge_id={}", id),
             None::<&()>,
         )
         .await

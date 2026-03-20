@@ -159,7 +159,6 @@ nervctf list
 ```sh
 nervctf fix              # patch missing state/author/version fields interactively
 nervctf fix --dry-run
-nervctf fix --migrate-containers   # rewrite type:container → type:instance YAML
 ```
 
 ### Setup
@@ -291,15 +290,34 @@ CLI  ──Token<monitor>──▶  remote-monitor:33133  ──Token<ctfd>─�
 
 Deployed automatically by `nervctf setup`. For manual details see `docs/remote-monitor.md`.
 
+### Admin dashboard
+
+Open in a browser — no extra tools needed:
+
+```
+http://<monitor-host>:33133/admin?token=<MONITOR_TOKEN>
+```
+
+The token is the `monitor_token` value in your `.nervctf.yml` (written there by `nervctf setup`).
+
+The dashboard shows three auto-refreshing tables:
+- **Flag Sharing Alerts** — submissions where the flag belonged to a *different* team's instance (refreshes every 15 s)
+- **Active Instances** — all running containers with host/port and expiry (refreshes every 15 s)
+- **Recent Flag Attempts** — last 200 submissions across all teams (refreshes every 30 s)
+
 ### Key routes
 
 | Auth | Path | Description |
 |------|------|-------------|
 | None | `GET /health` | Liveness check |
+| `?token=` or header | `GET /admin` | Admin dashboard HTML |
 | None | `GET /instance/:name` | Player instance UI |
 | Admin | `POST /api/v1/instance/build` | Upload Docker build context |
 | Admin | `POST /api/v1/instance/build-compose` | Upload Compose challenge context |
 | Admin | `POST /api/v1/instance/register` | Register challenge config |
+| Admin | `GET /api/v1/admin/instances` | JSON list of all active instances |
+| Admin | `GET /api/v1/admin/attempts` | JSON flag attempt log (`?alerts_only=true` for sharing only) |
+| Plugin | `POST /api/v1/plugin/attempt` | Record a flag submission + detect sharing |
 | Player | `POST /api/v1/instance/request` | Provision instance |
 | Player | `POST /api/v1/instance/renew` | Extend expiry |
 | Player | `DELETE /api/v1/instance/stop` | Destroy instance |

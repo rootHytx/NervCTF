@@ -8,3 +8,10 @@ resolver = "2"
 [workspace.package]
 name = "nervctf"
 version = "0.1.0"
+
+[profile.release]
+opt-level   = "z"   # optimize for size over speed
+lto         = true  # cross-crate dead-code elimination
+codegen-units = 1   # single unit enables better LTO
+strip       = true  # remove symbols and debug info
+panic       = "abort" # no unwinding machinery (~5-10% smaller)

@@ -9,6 +9,7 @@ use tempfile::tempdir;
 use crate::{find_config_path, load_config, save_config};
 
 const PLAYBOOK: &str = include_str!("../assets/nervctf_playbook.yml");
+const UPGRADE_PLAYBOOK: &str = include_str!("../assets/nervctf_upgrade_playbook.yml");
 
 /// Walk up from cwd until we find a flake.nix.
 fn find_flake_nix() -> Option<PathBuf> {
@@ -328,17 +329,6 @@ pub fn run_setup() -> Result<()> {
         None => println!("  [!] CTFd plugin not found -- plugin will not be deployed."),
     }
 
-    // ── Extract embedded assets to a temp dir ─────────────────────────────────
-    let tmp = tempdir()?;
-    let playbook_path = tmp.path().join("nervctf_playbook.yml");
-    let inventory_path = tmp.path().join("inventory.ini");
-
-    fs::write(&playbook_path, PLAYBOOK)?;
-    fs::write(
-        &inventory_path,
-        format!("[ctfd]\n{} ansible_user={}\n", target_ip, target_user),
-    )?;
-
     // ── Build ansible extra-vars ───────────────────────────────────────────────
     let mut evars: Vec<String> = vec![
         format!("ssh_key={}", ssh_pubkey_path),
@@ -356,19 +346,48 @@ pub fn run_setup() -> Result<()> {
         evars.push(format!("ctfd_api_key={}", key));
     }
 
-    let mut ansible_args: Vec<String> = vec![
+    let inventory = format!("[ctfd]\n{} ansible_user={}\n", target_ip, target_user);
+
+    println!("\nRunning Ansible playbook...");
+    run_ansible_playbook(PLAYBOOK, &inventory, &evars)?;
+
+    prompt_and_save_api_key(&mut config, &config_path)?;
+
+    println!("\nNervCTF setup complete!");
+    println!("  CTFd URL:      {}", ctfd_url);
+    println!("  Monitor URL:   {}", monitor_url);
+    println!("  Monitor Token: {}", monitor_token);
+    println!("  Config:        {}", config_path.display());
+    if monitor_binary.is_none() {
+        println!("\n[!] remember to build and deploy the Remote Monitor:");
+        println!("   cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor");
+        println!("   Then re-run `nervctf setup` to deploy it.");
+    }
+    Ok(())
+}
+
+// ── Shared ansible runner ─────────────────────────────────────────────────────
+
+/// Write the playbook + inventory to a tempdir and invoke ansible-playbook.
+/// Falls back to `nix develop ... --command ansible-playbook` if not in PATH.
+fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Result<()> {
+    let tmp = tempdir()?;
+    let playbook_path = tmp.path().join("playbook.yml");
+    let inventory_path = tmp.path().join("inventory.ini");
+    fs::write(&playbook_path, playbook)?;
+    fs::write(&inventory_path, inventory)?;
+
+    let mut args: Vec<String> = vec![
         "-i".to_string(),
         inventory_path.to_str().unwrap().to_string(),
         playbook_path.to_str().unwrap().to_string(),
     ];
-    for ev in &evars {
-        ansible_args.push("-e".to_string());
-        ansible_args.push(ev.clone());
+    for ev in evars {
+        args.push("-e".to_string());
+        args.push(ev.clone());
     }
 
-    println!("\nRunning Ansible playbook...");
-
-    let status = match Command::new("ansible-playbook").args(&ansible_args).status() {
+    let status = match Command::new("ansible-playbook").args(&args).status() {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let flake_nix = find_flake_nix().ok_or_else(|| {
@@ -387,7 +406,7 @@ pub fn run_setup() -> Result<()> {
                 .arg(flake_dir.to_str().unwrap())
                 .arg("--command")
                 .arg("ansible-playbook")
-                .args(&ansible_args)
+                .args(&args)
                 .status()?
         }
         Err(e) => return Err(e.into()),
@@ -399,19 +418,99 @@ pub fn run_setup() -> Result<()> {
             status.code()
         ));
     }
+    Ok(())
+}
 
-    prompt_and_save_api_key(&mut config, &config_path)?;
+// ── Upgrade ───────────────────────────────────────────────────────────────────
 
-    println!("\nNervCTF setup complete!");
-    println!("  CTFd URL:      {}", ctfd_url);
-    println!("  Monitor URL:   {}", monitor_url);
-    println!("  Monitor Token: {}", monitor_token);
-    println!("  Config:        {}", config_path.display());
-    if monitor_binary.is_none() {
-        println!("\n[!] remember to build and deploy the Remote Monitor:");
-        println!("   cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor");
-        println!("   Then re-run `nervctf setup` to deploy it.");
+/// Upgrade an existing NervCTF deployment: push the updated CTFd plugin, rebuild
+/// the remote-monitor Docker image, and restart the affected containers.
+/// Reads all connection details from the existing .nervctf.yml — no re-prompting.
+pub fn run_upgrade() -> Result<()> {
+    println!("==============================================");
+    println!(" NervCTF Upgrade: Updating Deployed Services");
+    println!("----------------------------------------------");
+    println!("This will:");
+    println!(" - Sync the CTFd plugin (rsync, delete stale files)");
+    println!(" - Copy the new remote-monitor binary");
+    println!(" - Rebuild the nervctf-monitor Docker image");
+    println!(" - Restart the remote-monitor container");
+    println!(" - Restart CTFd (to reload the plugin)");
+    println!("==============================================\n");
+
+    let cwd = std::env::current_dir()?;
+    let (config, config_file) = load_config(&cwd);
+
+    // Require an existing config — upgrade makes no sense without a prior setup.
+    let config_file = config_file.ok_or_else(|| {
+        anyhow!(
+            "No .nervctf.yml found. Run `nervctf setup` first to create a deployment."
+        )
+    })?;
+    println!("Using config: {}", config_file.display());
+
+    let target_ip = config.target_ip.as_deref().ok_or_else(|| {
+        anyhow!("target_ip not set in .nervctf.yml — run `nervctf setup` to fix.")
+    })?;
+    let target_user = config.target_user.as_deref().unwrap_or("root");
+    let ctfd_path = config
+        .ctfd_remote_path
+        .as_deref()
+        .unwrap_or("/home/docker/CTFd");
+    let monitor_port = config.monitor_port.as_deref().unwrap_or("33133");
+
+    // ── Find local artifacts ───────────────────────────────────────────────────
+    let monitor_binary = find_monitor_binary();
+    let plugin_src = find_plugin_src();
+
+    if monitor_binary.is_none() && plugin_src.is_none() {
+        return Err(anyhow!(
+            "Neither the remote-monitor binary nor the CTFd plugin could be found locally.\n\
+             Build the binary first:\n\
+             cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor"
+        ));
     }
+
+    println!("Target:   {}@{}", target_user, target_ip);
+    println!("CTFd dir: {}", ctfd_path);
+    match &monitor_binary {
+        Some(p) => println!("Monitor binary: {}", p.display()),
+        None     => println!("[!] remote-monitor binary not found — skipping binary upgrade"),
+    }
+    match &plugin_src {
+        Some(p) => println!("CTFd plugin:    {}", p.display()),
+        None     => println!("[!] CTFd plugin not found — skipping plugin upgrade"),
+    }
+
+    println!();
+    let confirmed = Confirm::new()
+        .with_prompt("Proceed with upgrade?")
+        .default(true)
+        .interact()?;
+    if !confirmed {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    // ── Build extra-vars ───────────────────────────────────────────────────────
+    let mut evars: Vec<String> = vec![
+        format!("ctfd_path={}", ctfd_path),
+        format!("monitor_port={}", monitor_port),
+    ];
+    if let Some(ref bin) = monitor_binary {
+        evars.push(format!("monitor_binary={}", bin.display()));
+    }
+    if let Some(ref plugin) = plugin_src {
+        evars.push(format!("plugin_src={}", plugin.display()));
+    }
+
+    let inventory = format!("[ctfd]\n{} ansible_user={}\n", target_ip, target_user);
+
+    println!("\nRunning upgrade playbook...");
+    run_ansible_playbook(UPGRADE_PLAYBOOK, &inventory, &evars)?;
+
+    println!("\nUpgrade complete!");
+    println!("  Monitor URL: {}", config.monitor_url.as_deref().unwrap_or("-"));
     Ok(())
 }
 

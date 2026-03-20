@@ -243,39 +243,56 @@ class InstanceChallengeType(BaseChallenge):
 
     @classmethod
     def attempt(cls, challenge, request):
-        from .models.challenge import InstanceChallenge
-
-        chall = InstanceChallenge.query.filter_by(id=challenge.id).first()
-
-        if chall and chall.flag_mode == "random":
-            submission = (request.form.get("submission") or "").strip()
-            team_id = _team_id()
-            if team_id:
-                m = _monitor()
-                if m:
-                    try:
-                        resp = req_lib.get(
-                            f"{m['url']}/api/v1/plugin/flag",
-                            headers={"Authorization": f"Token {m['token']}"},
-                            params={
-                                "challenge_name": challenge.name,
-                                "team_id": team_id,
-                            },
-                            timeout=5,
-                        )
-                        if resp.ok:
-                            correct_flag = resp.json().get("flag", "")
-                            if correct_flag and submission == correct_flag:
-                                return True, "Correct"
-                    except Exception as e:
-                        logger.error("Monitor flag check error: %s", e)
-            return False, "Incorrect"
-
-        return BaseChallenge.attempt(challenge, request)
+        result = BaseChallenge.attempt(challenge, request)
+        # CTFd returns a tuple (bool, str) in older versions and a ChallengeResponse
+        # object in newer versions. Handle both without assuming attribute names.
+        try:
+            is_correct = bool(result[0])
+        except TypeError:
+            is_correct = bool(getattr(result, "success", False))
+        data = request.form or request.get_json() or {}
+        submitted = data.get("submission", "").strip()
+        team_id = _team_id()
+        from CTFd.utils.user import get_current_user
+        user = get_current_user()
+        user_id = user.id if user else None
+        if team_id and user_id and submitted:
+            m = _monitor()
+            if m:
+                try:
+                    req_lib.post(
+                        f"{m['url']}/api/v1/plugin/attempt",
+                        headers=_monitor_headers(m),
+                        json={
+                            "challenge_name": challenge.name,
+                            "team_id": team_id,
+                            "user_id": user_id,
+                            "submitted_flag": submitted,
+                            "is_correct": is_correct,
+                        },
+                        timeout=0.5,  # fire-and-forget; never block flag submission
+                    )
+                except Exception:
+                    pass  # monitor down — still return verdict
+        return result
 
     @classmethod
     def solve(cls, user, team, challenge, request):
         BaseChallenge.solve(user, team, challenge, request)
+        # Tear down the instance now that the team has solved the challenge.
+        team_id = team.id if team else None
+        if team_id:
+            m = _monitor()
+            if m:
+                try:
+                    req_lib.post(
+                        f"{m['url']}/api/v1/plugin/solve",
+                        headers=_monitor_headers(m),
+                        json={"challenge_name": challenge.name, "team_id": team_id},
+                        timeout=10,
+                    )
+                except Exception as e:
+                    logger.error("Monitor solve teardown error: %s", e)
 
     @classmethod
     def fail(cls, user, team, challenge, request):
@@ -401,11 +418,17 @@ def request_instance():
     if not m:
         return {"error": "Monitor not configured"}, 503
 
+    from CTFd.utils.user import get_current_user
+    user = get_current_user()
     try:
         resp = req_lib.post(
             f"{m['url']}/api/v1/plugin/request",
             headers=_monitor_headers(m),
-            json={"challenge_name": challenge.name, "team_id": team_id},
+            json={
+                "challenge_name": challenge.name,
+                "team_id": team_id,
+                "user_id": user.id if user else None,
+            },
             timeout=60,
             allow_redirects=False,
         )

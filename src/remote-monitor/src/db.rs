@@ -36,15 +36,47 @@ fn init_schema(conn: &Connection) -> Result<()> {
             connection_type TEXT NOT NULL,
             status          TEXT NOT NULL,
             flag            TEXT,
+            ctfd_flag_id    INTEGER,
             renewals_used   INTEGER DEFAULT 0,
             created_at      TEXT DEFAULT (datetime('now')),
             expires_at      TEXT NOT NULL,
             UNIQUE(challenge_name, team_id)
         );
+
+        CREATE TABLE IF NOT EXISTS flag_attempts (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            challenge_name  TEXT NOT NULL,
+            team_id         INTEGER NOT NULL,
+            user_id         INTEGER NOT NULL,
+            submitted_flag  TEXT NOT NULL,
+            is_correct      INTEGER NOT NULL DEFAULT 0,
+            is_flag_sharing INTEGER NOT NULL DEFAULT 0,
+            owner_team_id   INTEGER,
+            timestamp       TEXT DEFAULT (datetime('now'))
+        );
+
+        -- Permanent record of every flag ever generated for a team on a challenge.
+        -- Never deleted when an instance is stopped or expires so that flag sharing
+        -- detection works even after the original instance is gone.
+        CREATE TABLE IF NOT EXISTS team_flags (
+            challenge_name  TEXT NOT NULL,
+            team_id         INTEGER NOT NULL,
+            flag            TEXT NOT NULL,
+            created_at      TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (challenge_name, team_id, flag)
+        );
         "#,
     )?;
-    // Migration: add flag column to existing databases that predate the column.
+    // Migrations for existing databases.
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN flag TEXT", []);
+    let _ = conn.execute("ALTER TABLE instances ADD COLUMN ctfd_flag_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE instances ADD COLUMN user_id INTEGER", []);
+    // Backfill team_flags from any instances that already have a flag recorded.
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO team_flags (challenge_name, team_id, flag)
+         SELECT challenge_name, team_id, flag FROM instances WHERE flag IS NOT NULL",
+        [],
+    );
     Ok(())
 }
 
@@ -75,6 +107,20 @@ pub fn get_config(db: &Db, challenge_name: &str) -> Result<Option<String>> {
         Ok(Some(row.get(0)?))
     } else {
         Ok(None)
+    }
+}
+
+pub fn get_ctfd_id(db: &Db, challenge_name: &str) -> Result<Option<i64>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let result = conn.query_row(
+        "SELECT ctfd_id FROM instance_configs WHERE challenge_name = ?1",
+        params![challenge_name],
+        |row| row.get::<_, i64>(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -167,23 +213,34 @@ pub fn insert_instance(
     db: &Db,
     challenge_name: &str,
     team_id: i64,
+    user_id: Option<i64>,
     container_id: &str,
     host: &str,
     port: i64,
     connection_type: &str,
     expires_at: &str,
     flag: Option<&str>,
+    ctfd_flag_id: Option<i64>,
 ) -> Result<()> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     conn.execute(
-        r#"INSERT INTO instances (challenge_name, team_id, container_id, host, port, connection_type, status, flag, expires_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)
+        r#"INSERT INTO instances (challenge_name, team_id, user_id, container_id, host, port, connection_type, status, flag, ctfd_flag_id, expires_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, ?9, ?10)
            ON CONFLICT(challenge_name, team_id) DO UPDATE SET
-             container_id=excluded.container_id, host=excluded.host, port=excluded.port,
+             user_id=excluded.user_id, container_id=excluded.container_id,
+             host=excluded.host, port=excluded.port,
              connection_type=excluded.connection_type, status='running',
-             flag=excluded.flag, expires_at=excluded.expires_at, renewals_used=0"#,
-        params![challenge_name, team_id, container_id, host, port, connection_type, flag, expires_at],
+             flag=excluded.flag, ctfd_flag_id=excluded.ctfd_flag_id,
+             expires_at=excluded.expires_at, renewals_used=0"#,
+        params![challenge_name, team_id, user_id, container_id, host, port, connection_type, flag, ctfd_flag_id, expires_at],
     )?;
+    // Persist the flag permanently so sharing detection works after the instance is gone.
+    if let Some(f) = flag {
+        conn.execute(
+            "INSERT OR IGNORE INTO team_flags (challenge_name, team_id, flag) VALUES (?1, ?2, ?3)",
+            params![challenge_name, team_id, f],
+        )?;
+    }
     Ok(())
 }
 
@@ -196,18 +253,26 @@ pub fn update_expires_at(db: &Db, challenge_name: &str, team_id: i64, expires_at
     Ok(())
 }
 
-pub fn delete_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<String>> {
+/// Delete an instance row and return `(container_id, ctfd_flag_id)` for cleanup.
+/// Returns `Ok(None)` if no matching row existed.
+pub fn delete_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<(Option<String>, Option<i64>)>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-    let container_id: Option<String> = conn.query_row(
-        "SELECT container_id FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
+    let row = conn.query_row(
+        "SELECT container_id, ctfd_flag_id FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
         params![challenge_name, team_id],
-        |row| row.get(0),
-    ).ok().flatten();
-    conn.execute(
-        "DELETE FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
-        params![challenge_name, team_id],
-    )?;
-    Ok(container_id)
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    );
+    match row {
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+        Ok((container_id, ctfd_flag_id)) => {
+            conn.execute(
+                "DELETE FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
+                params![challenge_name, team_id],
+            )?;
+            Ok(Some((container_id, ctfd_flag_id)))
+        }
+    }
 }
 
 /// Returns all host ports currently in use by running instances.
@@ -224,17 +289,18 @@ pub fn get_used_ports(db: &Db) -> Result<std::collections::HashSet<u16>> {
     Ok(ports)
 }
 
-/// Returns (challenge_name, container_id, team_id) for all expired running instances.
-pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64)>> {
+/// Returns `(challenge_name, container_id, team_id, ctfd_flag_id)` for all expired running instances.
+pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64, Option<i64>)>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT challenge_name, container_id, team_id FROM instances WHERE expires_at < datetime('now') AND status = 'running'",
+        "SELECT challenge_name, container_id, team_id, ctfd_flag_id FROM instances WHERE expires_at < datetime('now') AND status = 'running'",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, i64>(2)?,
+            row.get::<_, Option<i64>>(3)?,
         ))
     })?;
     let mut result = Vec::new();
@@ -244,36 +310,141 @@ pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64
     Ok(result)
 }
 
-/// Get the random flag stored for a team's instance (returns None if not set or no instance).
-pub fn get_instance_flag(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<String>> {
+/// Returns all active instances as JSON values for the admin dashboard.
+pub fn list_all_instances(db: &Db) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_name, team_id, user_id, host, port, connection_type, status, expires_at, created_at FROM instances ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "challenge_name": row.get::<_, String>(0)?,
+            "team_id": row.get::<_, i64>(1)?,
+            "user_id": row.get::<_, Option<i64>>(2)?,
+            "host": row.get::<_, String>(3)?,
+            "port": row.get::<_, i64>(4)?,
+            "connection_type": row.get::<_, String>(5)?,
+            "status": row.get::<_, String>(6)?,
+            "expires_at": row.get::<_, String>(7)?,
+            "created_at": row.get::<_, String>(8)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+// ── Flag attempts ─────────────────────────────────────────────────────────────
+
+pub fn insert_flag_attempt(
+    db: &Db,
+    challenge_name: &str,
+    team_id: i64,
+    user_id: i64,
+    submitted_flag: &str,
+    is_correct: bool,
+    is_flag_sharing: bool,
+    owner_team_id: Option<i64>,
+) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute(
+        r#"INSERT INTO flag_attempts (challenge_name, team_id, user_id, submitted_flag, is_correct, is_flag_sharing, owner_team_id)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+        params![
+            challenge_name, team_id, user_id, submitted_flag,
+            is_correct as i64, is_flag_sharing as i64, owner_team_id,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn list_flag_attempts(db: &Db, limit: i64) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, challenge_name, team_id, user_id, submitted_flag, is_correct, is_flag_sharing, owner_team_id, timestamp
+         FROM flag_attempts ORDER BY timestamp DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "challenge_name": row.get::<_, String>(1)?,
+            "team_id": row.get::<_, i64>(2)?,
+            "user_id": row.get::<_, i64>(3)?,
+            "submitted_flag": row.get::<_, String>(4)?,
+            "is_correct": row.get::<_, i64>(5)? != 0,
+            "is_flag_sharing": row.get::<_, i64>(6)? != 0,
+            "owner_team_id": row.get::<_, Option<i64>>(7)?,
+            "timestamp": row.get::<_, String>(8)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+pub fn list_sharing_alerts(db: &Db) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, challenge_name, team_id, user_id, submitted_flag, is_correct, owner_team_id, timestamp
+         FROM flag_attempts WHERE is_flag_sharing = 1 ORDER BY timestamp DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "challenge_name": row.get::<_, String>(1)?,
+            "team_id": row.get::<_, i64>(2)?,
+            "user_id": row.get::<_, i64>(3)?,
+            "submitted_flag": row.get::<_, String>(4)?,
+            "is_correct": row.get::<_, i64>(5)? != 0,
+            "owner_team_id": row.get::<_, Option<i64>>(6)?,
+            "timestamp": row.get::<_, String>(7)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
+/// Finds if a flag value belongs to a different team's instance (flag sharing detection).
+/// Returns Some(owner_team_id) if sharing is detected, None otherwise.
+/// Returns Some(owner_team_id) if the submitted flag was generated for a different team,
+/// even if that team's instance has already been stopped or expired.
+/// Queries `team_flags` (permanent) rather than `instances` (ephemeral).
+pub fn find_flag_owner(db: &Db, challenge_name: &str, submitted_flag: &str, submitting_team_id: i64) -> Result<Option<i64>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let result = conn.query_row(
-        "SELECT flag FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
-        params![challenge_name, team_id],
-        |row| row.get::<_, Option<String>>(0),
+        "SELECT team_id FROM team_flags WHERE challenge_name = ?1 AND flag = ?2 AND team_id != ?3",
+        params![challenge_name, submitted_flag, submitting_team_id],
+        |row| row.get::<_, i64>(0),
     );
     match result {
-        Ok(flag) => Ok(flag),
+        Ok(id) => Ok(Some(id)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Delete all instances for a challenge (used when challenge is deleted).
-/// Returns list of container_ids to clean up.
-pub fn delete_all_instances_for_challenge(db: &Db, challenge_name: &str) -> Result<Vec<String>> {
+/// Delete all instances for a challenge and return `(container_id, ctfd_flag_id)` pairs for cleanup.
+pub fn delete_all_instances_for_challenge(db: &Db, challenge_name: &str) -> Result<Vec<(Option<String>, Option<i64>)>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT container_id FROM instances WHERE challenge_name = ?1 AND container_id IS NOT NULL",
+        "SELECT container_id, ctfd_flag_id FROM instances WHERE challenge_name = ?1",
     )?;
-    let cids: Vec<String> = stmt
-        .query_map(params![challenge_name], |row| row.get(0))?
+    let pairs: Vec<(Option<String>, Option<i64>)> = stmt
+        .query_map(params![challenge_name], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
     conn.execute(
         "DELETE FROM instances WHERE challenge_name = ?1",
         params![challenge_name],
     )?;
-    Ok(cids)
+    Ok(pairs)
 }
-

@@ -52,6 +52,7 @@ release-linux: ## [Debian/Ubuntu/Fedora/Arch/RHEL] x86_64 Linux GNU binary
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64
+	@upx --best dist/$(BINARY_A)-linux-x86_64 dist/$(BINARY_B)-linux-x86_64 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-linux-x86_64"
 
 release-musl: ## [Alpine/containers/any Linux] Static x86_64 binary — via nix develop
@@ -59,6 +60,7 @@ release-musl: ## [Alpine/containers/any Linux] Static x86_64 binary — via nix 
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64-static
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64-static
+	@upx --best dist/$(BINARY_A)-linux-x86_64-static dist/$(BINARY_B)-linux-x86_64-static 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-linux-x86_64-static"
 
 release-arm64: ## [Raspberry Pi 4/5, AWS Graviton, Oracle ARM] aarch64 GNU — via nix develop
@@ -93,6 +95,7 @@ release-windows: ## [Windows] x86_64 GNU Windows binary — via nix develop (Min
 	@mkdir -p dist
 	cp target/x86_64-pc-windows-gnu/release/$(BINARY_A).exe dist/$(BINARY_A)-windows-x86_64.exe
 	cp target/x86_64-pc-windows-gnu/release/$(BINARY_B).exe dist/$(BINARY_B)-windows-x86_64.exe
+	@upx --best dist/$(BINARY_A)-windows-x86_64.exe dist/$(BINARY_B)-windows-x86_64.exe 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-windows-x86_64.exe"
 
 # ── All platforms ─────────────────────────────────────────────────────────────

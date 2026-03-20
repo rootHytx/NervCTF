@@ -46,10 +46,11 @@
         aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
         mingw64 = pkgs.pkgsCross.mingwW64;
 
-        commonBuildInputs = with pkgs; [ openssl ];
+        commonBuildInputs = with pkgs; [ openssl sqlite ];
         commonNativeBuildInputs = [ pkgs.pkg-config rustToolchain ];
         commonEnv = {
-          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig";
+          PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.sqlite.dev}/lib/pkgconfig";
+          LIBRARY_PATH = "${pkgs.sqlite}/lib";
         };
 
         # ── crane setup ──────────────────────────────────────────────────────
@@ -65,7 +66,9 @@
             (craneLib.filterCargoSources path type)
             || (builtins.match ".*\\.yml$" path != null)
             || (builtins.match ".*\\.yaml$" path != null)
-            || (builtins.match ".*\\.sh$" path != null);
+            || (builtins.match ".*\\.sh$" path != null)
+            || (builtins.match ".*\\.html$" path != null)
+            || (builtins.match ".*\\.css$" path != null);
         };
 
         commonArgs = commonEnv // {
@@ -120,6 +123,9 @@
               pkgs.openssl.dev
               pkgs.ansible
               pkgs.sccache
+              pkgs.upx
+              pkgs.sqlite
+              pkgs.sqlite.dev
               # C cross-compilers (linker + cc for ring/cc-rs build scripts)
               musl64.stdenv.cc
               aarch64.stdenv.cc

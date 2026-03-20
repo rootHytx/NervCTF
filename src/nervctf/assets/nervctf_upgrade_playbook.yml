@@ -1,0 +1,85 @@
+---
+# NervCTF upgrade playbook — updates an existing deployment without reinstalling infrastructure.
+# Upgrades: CTFd plugin, remote-monitor binary, Docker image, restarts affected containers.
+# Assumes Docker, CTFd, and the monitor service are already running.
+- hosts: ctfd
+  become: yes
+  vars:
+    ansible_python_interpreter: auto_silent
+    docker_user: docker
+    monitor_port: "{{ monitor_port | default('33133') }}"
+
+  tasks:
+    # ── CTFd Plugin ────────────────────────────────────────────────────────────
+    - name: Ensure CTFd plugins directory exists
+      file:
+        path: "{{ ctfd_path }}/CTFd/plugins/nervctf_instance"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: plugin_src is defined
+
+    - name: Sync updated plugin files
+      synchronize:
+        src: "{{ plugin_src }}/"
+        dest: "{{ ctfd_path }}/CTFd/plugins/nervctf_instance/"
+        delete: yes
+        rsync_opts:
+          - "--chown={{ docker_user }}:docker"
+      when: plugin_src is defined
+
+    # ── Remote Monitor binary + Docker image ───────────────────────────────────
+    - name: Ensure remote-monitor directory exists
+      file:
+        path: "{{ ctfd_path }}/remote-monitor"
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: monitor_binary is defined
+
+    - name: Copy updated remote-monitor binary
+      copy:
+        src: "{{ monitor_binary }}"
+        dest: "{{ ctfd_path }}/remote-monitor/remote-monitor"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"
+      when: monitor_binary is defined
+
+    - name: Write remote-monitor Dockerfile
+      copy:
+        content: |
+          FROM debian:bookworm-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+              docker.io ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
+          COPY remote-monitor /usr/local/bin/remote-monitor
+          CMD ["/usr/local/bin/remote-monitor"]
+        dest: "{{ ctfd_path }}/remote-monitor/Dockerfile"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
+      when: monitor_binary is defined
+
+    - name: Rebuild remote-monitor Docker image
+      command: docker build -t nervctf-monitor:latest {{ ctfd_path }}/remote-monitor
+      become_user: "{{ docker_user }}"
+      when: monitor_binary is defined
+
+    # ── Restart services ───────────────────────────────────────────────────────
+    # Restart remote-monitor first (new image, no state loss — DB is on a named volume).
+    - name: Restart remote-monitor container
+      command:
+        cmd: docker compose up -d --force-recreate remote-monitor
+        chdir: "{{ ctfd_path }}"
+      become_user: "{{ docker_user }}"
+      when: monitor_binary is defined
+
+    # Restart CTFd so it reloads the plugin from disk.
+    - name: Restart CTFd container (reloads plugin)
+      command:
+        cmd: docker compose restart ctfd
+        chdir: "{{ ctfd_path }}"
+      become_user: "{{ docker_user }}"
+      when: plugin_src is defined

@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NervCTF Monitor Admin</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: monospace; background: #111; color: #ddd; margin: 0; padding: 20px; }
+  h1 { color: #eee; font-size: 1.4rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.1rem; margin: 1.8rem 0 0.6rem; color: #bbb; border-bottom: 1px solid #333; padding-bottom: 4px; }
+  #token-info { font-size: 0.8rem; color: #666; margin-bottom: 1rem; }
+  .status { font-size: 0.8rem; color: #888; margin-bottom: 0.4rem; }
+  .toolbar { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.4rem; font-size: 0.82rem; }
+  .toolbar label { color: #888; }
+  .toolbar select, .toolbar input[type=number] {
+    background: #1e1e1e; border: 1px solid #444; color: #ccc;
+    padding: 2px 6px; font-family: monospace; font-size: 0.82rem;
+  }
+  .toolbar input[type=number] { width: 70px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { background: #1e1e1e; color: #aaa; text-align: left; padding: 6px 8px; border-bottom: 1px solid #333; }
+  td { padding: 5px 8px; border-bottom: 1px solid #222; vertical-align: top; word-break: break-all; }
+  tr:hover td { background: #1a1a1a; }
+  .empty { color: #555; font-style: italic; padding: 10px 8px; }
+  .badge-ok   { color: #4caf50; }
+  .badge-fail { color: #f44; }
+  .badge-sharing { color: #ff9800; font-weight: bold; }
+  #alerts-section table th, #alerts-section table td { background: #1a0a0a; }
+  #alerts-section th { background: #2a1010; }
+  #alerts-section tr:hover td { background: #220e0e; }
+  .section-hdr { display: flex; align-items: baseline; gap: 1rem; }
+  .count-badge { font-size: 0.75rem; background: #333; color: #aaa; padding: 1px 6px; border-radius: 2px; }
+  #alerts-count-badge { background: #5a2020; color: #ffaaaa; }
+  .btn-stop {
+    background: #6e1a1a; border: none; color: #ffaaaa; cursor: pointer;
+    font-family: monospace; font-size: 0.78rem; padding: 2px 8px;
+  }
+  .btn-stop:hover { background: #9e2a2a; }
+</style>
+</head>
+<body>
+
+<h1>NervCTF Monitor Admin</h1>
+<div id="token-info">Token: (loaded from ?token= param)</div>
+
+<div class="section-hdr" id="alerts-section">
+  <h2>Flag Sharing Alerts</h2>
+  <span class="count-badge" id="alerts-count-badge">0</span>
+</div>
+<div class="status" id="alerts-status">Loading...</div>
+<div id="alerts-table"></div>
+
+<div class="section-hdr">
+  <h2>Active Instances</h2>
+  <span class="count-badge" id="instances-count">0</span>
+</div>
+<div class="status" id="instances-status">Loading...</div>
+<div id="instances-table"></div>
+
+<h2>Recent Flag Attempts</h2>
+<div class="toolbar">
+  <label for="attempts-limit">Show:</label>
+  <select id="attempts-limit" onchange="onLimitChange()">
+    <option value="5">5</option>
+    <option value="10">10</option>
+    <option value="50">50</option>
+    <option value="100">100</option>
+    <option value="200" selected>200</option>
+    <option value="custom">Custom...</option>
+  </select>
+  <input type="number" id="attempts-limit-custom" min="1" max="200" value="20"
+         style="display:none" oninput="renderAttemptsFiltered()" placeholder="N">
+  <span class="count-badge" id="attempts-count">0</span>
+</div>
+<div class="status" id="attempts-status">Loading...</div>
+<div id="attempts-table"></div>
+
+<script>
+(function () {
+  var token = '';
+  var search = window.location.search;
+  var match = search.match(/[?&]token=([^&]*)/);
+  if (match) {
+    token = decodeURIComponent(match[1]);
+    var masked = token.length > 6 ? token.slice(0, 6) + '***' : '***';
+    document.getElementById('token-info').textContent = 'Token: ' + masked;
+  } else {
+    document.getElementById('token-info').textContent = 'No token in URL (?token=...) — API calls will fail with 401';
+  }
+
+  function authHeaders() {
+    return { 'Authorization': 'Token ' + token, 'Content-Type': 'application/json' };
+  }
+
+  function escText(s) {
+    if (s === null || s === undefined) return '';
+    var d = document.createElement('span');
+    d.textContent = String(s);
+    return d.innerHTML;
+  }
+
+  function fetchJSON(url, cb) {
+    fetch(url, { headers: authHeaders() })
+      .then(function (r) { return r.json(); })
+      .then(cb)
+      .catch(function (e) { cb(null, e); });
+  }
+
+  // ── Alerts ────────────────────────────────────────────────────────────────
+
+  function renderAlerts(data) {
+    var el = document.getElementById('alerts-table');
+    var status = document.getElementById('alerts-status');
+    var badge = document.getElementById('alerts-count-badge');
+    if (!Array.isArray(data)) { status.textContent = 'Error loading alerts.'; return; }
+    badge.textContent = data.length;
+    status.textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
+    if (data.length === 0) { el.innerHTML = '<p class="empty">No sharing alerts detected.</p>'; return; }
+    var html = '<table><thead><tr>' +
+      '<th>Time</th><th>Challenge</th><th>Team (submitter)</th><th>User</th>' +
+      '<th>Owner Team</th><th>Correct?</th><th>Submitted Flag</th>' +
+      '</tr></thead><tbody>';
+    data.forEach(function (r) {
+      html += '<tr>' +
+        '<td>' + escText(r.timestamp) + '</td>' +
+        '<td>' + escText(r.challenge_name) + '</td>' +
+        '<td class="badge-sharing">' + escText(r.team_id) + '</td>' +
+        '<td>' + escText(r.user_id) + '</td>' +
+        '<td>' + escText(r.owner_team_id) + '</td>' +
+        '<td>' + (r.is_correct ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
+        '<td>' + escText(r.submitted_flag) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }
+
+  function loadAlerts() {
+    fetchJSON('/api/v1/admin/attempts?alerts_only=true', function (data, err) {
+      renderAlerts(err ? [] : data);
+    });
+  }
+
+  // ── Instances ─────────────────────────────────────────────────────────────
+
+  function renderInstances(data) {
+    var el = document.getElementById('instances-table');
+    var status = document.getElementById('instances-status');
+    var badge = document.getElementById('instances-count');
+    if (!Array.isArray(data)) { status.textContent = 'Error loading instances.'; return; }
+    var active = data.filter(function (r) { return r.status === 'running'; });
+    badge.textContent = active.length;
+    status.textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
+    if (active.length === 0) { el.innerHTML = '<p class="empty">No active instances.</p>'; return; }
+    var html = '<table><thead><tr>' +
+      '<th>Challenge</th><th>Team</th><th>User</th><th>Host:Port</th>' +
+      '<th>Type</th><th>Expires At</th><th>Created At</th><th>Action</th>' +
+      '</tr></thead><tbody>';
+    active.forEach(function (r) {
+      // Build the onclick value and HTML-encode double quotes so they survive
+      // inside a double-quoted attribute (JSON.stringify wraps strings in "…").
+      var stopCall = 'stopInstance(' + JSON.stringify(r.challenge_name) + ',' + Number(r.team_id) + ')';
+      var stopAttr = stopCall.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+      html += '<tr>' +
+        '<td>' + escText(r.challenge_name) + '</td>' +
+        '<td>' + escText(r.team_id) + '</td>' +
+        '<td>' + escText(r.user_id !== null ? r.user_id : '—') + '</td>' +
+        '<td>' + escText(r.host) + ':' + escText(r.port) + '</td>' +
+        '<td>' + escText(r.connection_type) + '</td>' +
+        '<td>' + escText(r.expires_at) + '</td>' +
+        '<td>' + escText(r.created_at) + '</td>' +
+        '<td><button class="btn-stop" onclick="' + stopAttr + '">Stop</button></td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }
+
+  function loadInstances() {
+    fetchJSON('/api/v1/admin/instances', function (data, err) {
+      renderInstances(err ? [] : data);
+    });
+  }
+
+  window.stopInstance = function(challengeName, teamId) {
+    if (!confirm('Stop instance for team ' + teamId + ' on "' + challengeName + '"?')) return;
+    fetch('/api/v1/plugin/stop', {
+      method: 'DELETE',
+      headers: authHeaders(),
+      body: JSON.stringify({ challenge_name: challengeName, team_id: teamId }),
+    }).then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d.ok) { loadInstances(); }
+        else { alert('Error: ' + (d.error || JSON.stringify(d))); }
+      })
+      .catch(function (e) { alert('Network error: ' + e.message); });
+  };
+
+  // ── Attempts ──────────────────────────────────────────────────────────────
+
+  var allAttempts = [];
+
+  window.onLimitChange = function() {
+    var sel = document.getElementById('attempts-limit');
+    var custom = document.getElementById('attempts-limit-custom');
+    custom.style.display = sel.value === 'custom' ? '' : 'none';
+    renderAttemptsFiltered();
+  };
+
+  window.renderAttemptsFiltered = function() {
+    var sel = document.getElementById('attempts-limit');
+    var custom = document.getElementById('attempts-limit-custom');
+    var limit = sel.value === 'custom'
+      ? (parseInt(custom.value) || 10)
+      : parseInt(sel.value) || 200;
+    var data = allAttempts.slice(0, limit);
+    var badge = document.getElementById('attempts-count');
+    badge.textContent = data.length + ' / ' + allAttempts.length;
+
+    var el = document.getElementById('attempts-table');
+    if (data.length === 0) { el.innerHTML = '<p class="empty">No flag attempts recorded.</p>'; return; }
+    var html = '<table><thead><tr>' +
+      '<th>Time</th><th>Challenge</th><th>Team</th><th>User</th>' +
+      '<th>Correct?</th><th>Sharing?</th><th>Owner Team</th><th>Submitted Flag</th>' +
+      '</tr></thead><tbody>';
+    data.forEach(function (r) {
+      html += '<tr>' +
+        '<td>' + escText(r.timestamp) + '</td>' +
+        '<td>' + escText(r.challenge_name) + '</td>' +
+        '<td>' + escText(r.team_id) + '</td>' +
+        '<td>' + escText(r.user_id) + '</td>' +
+        '<td>' + (r.is_correct ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
+        '<td>' + (r.is_flag_sharing ? '<span class="badge-sharing">SHARING</span>' : '') + '</td>' +
+        '<td>' + escText(r.owner_team_id !== null ? r.owner_team_id : '') + '</td>' +
+        '<td>' + escText(r.submitted_flag) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  };
+
+  function renderAttempts(data) {
+    var status = document.getElementById('attempts-status');
+    if (!Array.isArray(data)) { status.textContent = 'Error loading attempts.'; return; }
+    allAttempts = data;
+    status.textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
+    renderAttemptsFiltered();
+  }
+
+  function loadAttempts() {
+    fetchJSON('/api/v1/admin/attempts', function (data, err) {
+      renderAttempts(err ? [] : data);
+    });
+  }
+
+  // ── Initial load + polling ────────────────────────────────────────────────
+
+  loadAlerts();
+  loadInstances();
+  loadAttempts();
+
+  setInterval(loadAlerts,    15000);
+  setInterval(loadInstances, 15000);
+  setInterval(loadAttempts,  30000);
+}());
+</script>
+</body>
+</html>

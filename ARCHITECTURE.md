@@ -1,6 +1,6 @@
 # NervCTF — Architecture & Implementation Reference
 
-> Machine-readable context document for AI assistants. Covers the full system as of 2026-03-19.
+> Machine-readable context document for AI assistants. Covers the full system as of 2026-03-20.
 > Always prefer reading actual source files over trusting stale details here.
 > Workspace root: `/home/hytx/Desktop/CYBERSEC/tese/NervCTF`
 
@@ -71,6 +71,8 @@ NervCTF/
 │   │
 │   └── remote-monitor/          # HTTP server crate
 │       ├── Cargo.toml
+│       ├── assets/
+│       │   └── admin.html       # admin dashboard (embedded via include_str! at compile time)
 │       └── src/
 │           ├── main.rs          # axum 0.7 server, all routes, AppState, background expiry
 │           ├── db.rs            # SQLite via rusqlite; Db = Arc<Mutex<Connection>>
@@ -249,7 +251,6 @@ Commands:
   list                       list local challenges (table)
   validate [--fix]           lint challenge.yml files
   fix [--dry-run]            interactive YAML fixer (state/author/version)
-  fix --migrate-containers   rewrite type:container → type:instance YAML
   sync [--diff]              two-way diff + interactive apply
   setup                      Ansible-based server deployment wizard
   export --output <PATH>     dump CTFd challenges to YAML files
@@ -342,11 +343,28 @@ pub struct AppState {
 | `DB_PATH` | `/data/monitor.db` | SQLite file path |
 | `CHALLENGES_BASE_DIR` | `/opt/nervctf/challenges` | Server-side challenge files root |
 
+### Admin dashboard
+
+```
+GET /admin?token=<MONITOR_TOKEN>
+```
+Self-contained HTML page (no CDN; air-gap safe). Token can be passed as `?token=` query param
+or `Authorization: Token <x>` header. The JS reads the token from the URL, stores it in memory,
+and sends it as a header with every API call.
+
+Three auto-refreshing tables:
+- **Flag sharing alerts** (15 s) — submissions where the flag matched a different team's instance
+- **Active instances** (15 s) — all running containers with team/user/host:port/expiry
+- **Recent flag attempts** (30 s) — last 200 attempts across all teams
+
 ### Routes
 
 **No auth:**
 - `GET /health` → `{"ok": true}`
 - `GET /instance/:name` → HTML player UI page
+
+**Admin auth** (`Authorization: Token <MONITOR_TOKEN>` or `?token=` query param):
+- `GET /admin` → serves `assets/admin.html` (embedded via `include_str!`)
 
 **Admin auth** (`Authorization: Token <MONITOR_TOKEN>`):
 - `POST /api/v1/instance/build` — multipart: `challenge_name` + `context` (tar.gz);
@@ -356,14 +374,18 @@ pub struct AppState {
 - `POST /api/v1/instance/register` — body: `{challenge_name, ctfd_id, backend, config_json}`;
   upserts into `instance_configs` table
 - `GET /api/v1/instance/list` → array of registered configs
+- `GET /api/v1/admin/instances` → JSON array of all active instances
+- `GET /api/v1/admin/attempts[?alerts_only=true]` → JSON array of flag attempts (200 max) or sharing alerts only
 
 **Plugin auth** (admin token + explicit team_id in body — called by CTFd plugin):
 - `GET /api/v1/plugin/info?challenge_name=X&team_id=N`
-- `POST /api/v1/plugin/request` body: `{challenge_name, team_id}` → provisions instance
+- `POST /api/v1/plugin/request` body: `{challenge_name, team_id, user_id?}` → provisions instance
 - `POST /api/v1/plugin/renew` body: `{challenge_name, team_id}` → extends expiry
 - `DELETE /api/v1/plugin/stop` body: `{challenge_name, team_id}` → destroys instance
 - `DELETE /api/v1/plugin/stop_all` body: `{challenge_name}` → destroys all instances
-- `GET /api/v1/plugin/flag?challenge_name=X&team_id=N` → `{flag}` (for random flag mode)
+- `POST /api/v1/plugin/attempt` body: `{challenge_name, team_id, user_id, submitted_flag, is_correct}` →
+  records attempt; detects flag sharing by querying `instances.flag` for the submitted value
+  belonging to a different team; logs `warn!` and sets `is_flag_sharing=1` in DB if found
 
 **Player auth** (CTFd user token validated via `GET /api/v1/users/me` on CTFd):
 - `POST /api/v1/instance/request` body: `{challenge_name}` → provisions instance
@@ -404,33 +426,55 @@ CREATE TABLE instances (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     challenge_name  TEXT NOT NULL,
     team_id         INTEGER NOT NULL,
+    user_id         INTEGER,          -- CTFd user who requested (nullable; added via migration)
     container_id    TEXT,             -- docker ID, compose project name, or LXC name
     host            TEXT NOT NULL,
     port            INTEGER NOT NULL,
     connection_type TEXT NOT NULL,
     status          TEXT NOT NULL,    -- "running"|"stopped"|"error"
     flag            TEXT,             -- per-instance random flag (nullable for static)
+    ctfd_flag_id    INTEGER,          -- CTFd flag ID for cleanup on stop/expire
     renewals_used   INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now')),
     expires_at      TEXT NOT NULL,    -- "YYYY-MM-DD HH:MM:SS" UTC
     UNIQUE(challenge_name, team_id)
 );
+
+CREATE TABLE flag_attempts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    challenge_name  TEXT NOT NULL,
+    team_id         INTEGER NOT NULL,
+    user_id         INTEGER NOT NULL,
+    submitted_flag  TEXT NOT NULL,
+    is_correct      INTEGER NOT NULL DEFAULT 0,   -- 0|1 boolean
+    is_flag_sharing INTEGER NOT NULL DEFAULT 0,   -- 1 = flag belonged to a different team
+    owner_team_id   INTEGER,          -- team whose instance owns this flag (if sharing)
+    timestamp       TEXT DEFAULT (datetime('now'))
+);
 ```
 
 `Db = Arc<Mutex<Connection>>`. WAL mode enabled.
-Migration: `ALTER TABLE instances ADD COLUMN flag TEXT` run on every open (idempotent, ignores error).
+Migrations run on every `open()` (idempotent — errors from existing columns are ignored):
+- `ALTER TABLE instances ADD COLUMN flag TEXT`
+- `ALTER TABLE instances ADD COLUMN ctfd_flag_id INTEGER`
+- `ALTER TABLE instances ADD COLUMN user_id INTEGER`
 
 Key functions:
 - `upsert_config` — INSERT OR UPDATE instance_configs
 - `get_config(db, name) → Option<String>` — returns config_json
 - `get_image_tag / update_image_tag`
-- `insert_instance` — UPSERT (resets renewals_used=0 on conflict)
+- `insert_instance(db, challenge_name, team_id, user_id, container_id, host, port, conn_type, expires_at, flag, ctfd_flag_id)` — UPSERT (resets renewals_used=0 on conflict)
 - `get_instance(db, name, team_id) → Option<InstanceRow>`
-- `delete_instance → Option<String>` — returns container_id for cleanup
-- `delete_all_instances_for_challenge → Vec<String>` — used on challenge delete
+- `delete_instance → Option<(container_id, ctfd_flag_id)>` — returns IDs for cleanup
+- `delete_all_instances_for_challenge → Vec<(container_id, ctfd_flag_id)>` — used on challenge delete
 - `get_used_ports → HashSet<u16>` — all ports of running instances
-- `get_expired_instances → Vec<(challenge_name, container_id, team_id)>`
-- `get_instance_flag` — retrieve stored random flag
+- `get_expired_instances → Vec<(challenge_name, container_id, team_id, ctfd_flag_id)>`
+- `list_all_instances → Vec<Value>` — all instances as JSON (for admin dashboard)
+- `insert_flag_attempt(db, challenge_name, team_id, user_id, submitted_flag, is_correct, is_flag_sharing, owner_team_id)`
+- `list_flag_attempts(db, limit: i64) → Vec<Value>` — most recent N attempts
+- `list_sharing_alerts(db) → Vec<Value>` — all rows where `is_flag_sharing = 1`
+- `find_flag_owner(db, challenge_name, submitted_flag, submitting_team_id) → Option<i64>` —
+  queries `instances` table; returns `Some(owner_team_id)` if flag belongs to a different team
 
 ---
 
@@ -438,7 +482,7 @@ Key functions:
 
 ### `mod.rs` — central dispatch
 
-`provision(db, challenge_name, team_id, config: &Value, public_host) → (host, port, conn_type, expires_at)`
+`provision(db, challenge_name, team_id, user_id: Option<i64>, config: &Value, public_host) → (host, port, conn_type, expires_at)`
 
 Dispatches on `config["backend"]`. For all backends:
 - `generate_flag(config)` → `Option<String>` — returns `None` for `flag_mode != "random"`;
@@ -494,9 +538,13 @@ Key methods:
 - `read(challenge)` — returns challenge data + backend/connection/timeout/flag_mode
 - `update(challenge, request)` — updates fields, re-registers with monitor
 - `delete(challenge)` — calls `_stop_all_instances()` then cascades DB deletes
-- `attempt(challenge, request)` — for `flag_mode = "random"`: calls
-  `GET /api/v1/plugin/flag` on monitor to get correct flag, compares directly.
-  For static: delegates to `BaseChallenge.attempt()`
+- `solve(user, team, challenge, request)` — delegates to `BaseChallenge.solve()`, then calls
+  `POST /api/v1/plugin/solve` on monitor to tear down the team's instance
+- `attempt(challenge, request)` — delegates to `BaseChallenge.attempt()` for verdict
+  (returns a `ChallengeResponse` object with `.success` bool attribute, not a tuple);
+  then fire-and-forgets `POST /api/v1/plugin/attempt` to monitor (timeout=0.5s, swallowed)
+  with `{challenge_name, team_id, user_id, submitted_flag, is_correct}`.
+  Never blocks the CTFd flag submission response.
 
 ### `_register_with_monitor(challenge)`
 POSTs `{challenge_name, ctfd_id, backend, config_json}` to monitor's
@@ -506,7 +554,7 @@ POSTs `{challenge_name, ctfd_id, backend, config_json}` to monitor's
 All use `get_current_team()` to get `team_id`. Forward to monitor's `/api/v1/plugin/*`
 routes using admin token + explicit `team_id` in body/params (players never get admin token).
 - `GET /api/v1/containers/info/<challenge_id>`
-- `POST /api/v1/containers/request`
+- `POST /api/v1/containers/request` — also sends `user_id` from `get_current_user()`
 - `POST /api/v1/containers/renew`
 - `POST /api/v1/containers/stop`
 
@@ -632,15 +680,6 @@ Warning conditions:
 Scans all `challenge.yml` for missing `state`, `author`, `version` fields.
 Uses `has_field()` (top-level key detection, column-0 check) and `inject_field()`
 (inject after specific sibling key, with fallback).
-
-### `run_migrate_containers(base_dir, dry_run)`
-Finds `type: container` challenge.yml files and rewrites to `type: instance` format.
-- Changes `type: container` → `type: instance`
-- Builds `instance:` block with `backend: docker`
-- Moves `extra.connection_type` → `instance.connection`
-- Moves `INSTANCE_FIELDS` from `extra:` into `instance:`
-- Drops `DROP_FIELDS` from `extra:`
-- Removes empty `extra:` block
 
 ---
 

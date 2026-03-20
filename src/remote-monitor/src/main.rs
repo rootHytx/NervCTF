@@ -1,18 +1,22 @@
 //! Remote Monitor — CTFd API proxy + instance lifecycle manager
 //!
 //! Routes:
-//!   GET  /health                       — liveness check (no auth)
-//!   GET  /instance/:name               — HTML player page
-//!   ANY  /api/v1/diff                  — local/remote diff (monitor token)
-//!   POST /api/v1/instance/build        — build Docker image (monitor token)
-//!   POST /api/v1/instance/build-compose — upload+extract compose dir + pre-build images (monitor token)
-//!   POST /api/v1/instance/register     — register instance config (monitor token)
-//!   GET  /api/v1/instance/list         — list configs (monitor token)
-//!   POST /api/v1/instance/request      — provision instance (CTFd user token)
-//!   GET  /api/v1/instance/info         — get own instance (CTFd user token)
-//!   POST /api/v1/instance/renew        — extend timeout (CTFd user token)
-//!   DELETE /api/v1/instance/stop       — destroy instance (CTFd user token)
-//!   ANY  /api/v1/*path                 — transparent proxy to CTFd (monitor token)
+//!   GET  /health                         — liveness check (no auth)
+//!   GET  /admin                          — admin dashboard (monitor token via ?token= or header)
+//!   GET  /instance/:name                 — HTML player page
+//!   ANY  /api/v1/diff                    — local/remote diff (monitor token)
+//!   POST /api/v1/instance/build          — build Docker image (monitor token)
+//!   POST /api/v1/instance/build-compose  — upload+extract compose dir + pre-build images (monitor token)
+//!   POST /api/v1/instance/register       — register instance config (monitor token)
+//!   GET  /api/v1/instance/list           — list configs (monitor token)
+//!   GET  /api/v1/admin/instances         — list all active instances (monitor token)
+//!   GET  /api/v1/admin/attempts          — list flag attempts; ?alerts_only=true for sharing alerts (monitor token)
+//!   POST /api/v1/plugin/attempt          — record flag submission attempt (monitor token)
+//!   POST /api/v1/instance/request        — provision instance (CTFd user token)
+//!   GET  /api/v1/instance/info           — get own instance (CTFd user token)
+//!   POST /api/v1/instance/renew          — extend timeout (CTFd user token)
+//!   DELETE /api/v1/instance/stop         — destroy instance (CTFd user token)
+//!   ANY  /api/v1/*path                   — transparent proxy to CTFd (monitor token)
 //!
 //! Environment variables:
 //!   CTFD_URL       — CTFd URL reachable from within the Docker network
@@ -87,7 +91,7 @@ async fn main() -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
-    let state = AppState {
+    let state = Arc::new(AppState {
         ctfd_url: ctfd_url.trim_end_matches('/').to_string(),
         ctfd_api_key,
         monitor_token,
@@ -95,21 +99,29 @@ async fn main() -> Result<()> {
         http_client,
         db: db.clone(),
         challenges_base_dir,
-    };
+    });
 
     // Spawn background expiry task
-    let expiry_db = db.clone();
+    let expiry_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
-            match db::get_expired_instances(&expiry_db) {
+            match db::get_expired_instances(&expiry_state.db) {
                 Ok(expired) => {
-                    for (challenge_name, container_id, team_id) in expired {
+                    for (challenge_name, container_id, team_id, ctfd_flag_id) in expired {
                         info!("expiry: cleaning up {}/{}", challenge_name, team_id);
+                        let _ = db::delete_instance(&expiry_state.db, &challenge_name, team_id);
+                        if let Some(flag_id) = ctfd_flag_id {
+                            instance::delete_flag_from_ctfd(
+                                &expiry_state.http_client,
+                                &expiry_state.ctfd_url,
+                                &expiry_state.ctfd_api_key,
+                                flag_id,
+                            ).await;
+                        }
                         if let Some(cid) = container_id {
                             instance::cleanup_container(&cid).await;
                         }
-                        let _ = db::delete_instance(&expiry_db, &challenge_name, team_id);
                     }
                 }
                 Err(e) => error!("expiry: db error: {}", e),
@@ -119,11 +131,12 @@ async fn main() -> Result<()> {
 
     let addr = format!("{}:{}", bind, port);
     info!("Starting remote-monitor on {}", addr);
-    info!("CTFD_URL={}", ctfd_url);
+    info!("CTFD_URL={}", state.ctfd_url);
     info!("PUBLIC_HOST={}", state.public_host);
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/admin", get(admin_dashboard_handler))
         .route("/instance/{name}", get(instance_page_handler))
         .route("/api/v1/diff", any(diff_handler))
         // Admin routes (monitor token)
@@ -131,13 +144,16 @@ async fn main() -> Result<()> {
         .route("/api/v1/instance/build-compose", post(build_compose_handler))
         .route("/api/v1/instance/register", post(instance_register_handler))
         .route("/api/v1/instance/list", get(instance_list_handler))
+        .route("/api/v1/admin/instances", get(admin_instances_handler))
+        .route("/api/v1/admin/attempts", get(admin_attempts_handler))
         // Plugin routes (monitor token + explicit team_id) — used by CTFd plugin
         .route("/api/v1/plugin/info", get(plugin_info_handler))
         .route("/api/v1/plugin/request", post(plugin_request_handler))
         .route("/api/v1/plugin/renew", post(plugin_renew_handler))
         .route("/api/v1/plugin/stop", delete(plugin_stop_handler))
         .route("/api/v1/plugin/stop_all", delete(plugin_stop_all_handler))
-        .route("/api/v1/plugin/flag", get(plugin_flag_handler))
+        .route("/api/v1/plugin/solve", post(plugin_solve_handler))
+        .route("/api/v1/plugin/attempt", post(plugin_attempt_handler))
         // Player routes (CTFd user token) — for standalone monitor page
         .route("/api/v1/instance/request", post(instance_request_handler))
         .route("/api/v1/instance/info", get(instance_info_handler))
@@ -145,7 +161,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/instance/stop", delete(instance_stop_handler))
         // Fallthrough proxy — must be last
         .route("/api/v1/*path", any(proxy_handler))
-        .with_state(Arc::new(state));
+        .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -566,7 +582,7 @@ async fn build_compose_handler(
 
     // Pre-build all images (no --build at runtime)
     let build_out = instance::compose::compose_cmd().await
-        .args(["-f", &compose_path, "build"])
+        .args(["-f", compose_path.as_str(), "build"])
         .output()
         .await;
 
@@ -635,7 +651,10 @@ async fn instance_request_handler(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
 
-    match instance::provision(&state.db, &body.challenge_name, team_id, &config, &state.public_host).await {
+    match instance::provision(
+        &state.db, &body.challenge_name, team_id, None, &config, &state.public_host,
+        &state.http_client, &state.ctfd_url, &state.ctfd_api_key,
+    ).await {
         Ok((host, port, conn, expires_at)) => Json(json!({
             "host": host,
             "port": port,
@@ -748,8 +767,15 @@ async fn instance_stop_handler(
     };
 
     match db::delete_instance(&state.db, &body.challenge_name, team_id) {
-        Ok(Some(container_id)) => {
-            instance::cleanup_container(&container_id).await;
+        Ok(Some((container_id, ctfd_flag_id))) => {
+            if let Some(cid) = container_id {
+                instance::cleanup_container(&cid).await;
+            }
+            if let Some(flag_id) = ctfd_flag_id {
+                instance::delete_flag_from_ctfd(
+                    &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
+                ).await;
+            }
             Json(json!({"ok": true})).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "No active instance"}))).into_response(),
@@ -764,6 +790,7 @@ async fn instance_stop_handler(
 struct PluginTeamBody {
     challenge_name: String,
     team_id: i64,
+    user_id: Option<i64>,
 }
 
 
@@ -842,7 +869,10 @@ async fn plugin_request_handler(
     };
 
     info!("plugin_request: provisioning '{}' for team {}", body.challenge_name, body.team_id);
-    match instance::provision(&state.db, &body.challenge_name, body.team_id, &config, &state.public_host).await {
+    match instance::provision(
+        &state.db, &body.challenge_name, body.team_id, body.user_id, &config, &state.public_host,
+        &state.http_client, &state.ctfd_url, &state.ctfd_api_key,
+    ).await {
         Ok((host, port, conn, expires_at)) => {
             info!("plugin_request: provisioned {}:{} ({})", host, port, conn);
             Json(json!({
@@ -912,11 +942,52 @@ async fn plugin_stop_handler(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
-        Ok(Some(container_id)) => {
-            instance::cleanup_container(&container_id).await;
+        Ok(Some((container_id, ctfd_flag_id))) => {
+            // Delete CTFd flag synchronously first — fast HTTP call, must happen before response.
+            if let Some(flag_id) = ctfd_flag_id {
+                instance::delete_flag_from_ctfd(
+                    &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
+                ).await;
+            }
+            // Container teardown in background — compose down is slow.
+            if let Some(cid) = container_id {
+                tokio::spawn(async move { instance::cleanup_container(&cid).await; });
+            }
             Json(json!({"ok": true})).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "No active instance"}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+/// Called by the CTFd plugin when a team solves an instance challenge.
+/// Deletes the DB record immediately and returns 200, then tears down the
+/// container and CTFd flag in the background so the plugin doesn't time out
+/// waiting for `docker compose down`.
+async fn plugin_solve_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PluginTeamBody>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
+        Ok(Some((container_id, ctfd_flag_id))) => {
+            // Delete CTFd flag synchronously first — fast HTTP call, must happen before response.
+            if let Some(flag_id) = ctfd_flag_id {
+                instance::delete_flag_from_ctfd(
+                    &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
+                ).await;
+            }
+            // Container teardown in background — compose down is slow.
+            if let Some(cid) = container_id {
+                tokio::spawn(async move { instance::cleanup_container(&cid).await; });
+            }
+            Json(json!({"ok": true})).into_response()
+        }
+        // Instance already gone (expired or manually stopped) — not an error
+        Ok(None) => Json(json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -935,9 +1006,16 @@ async fn plugin_stop_all_handler(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::delete_all_instances_for_challenge(&state.db, &body.challenge_name) {
-        Ok(cids) => {
-            for cid in cids {
-                instance::cleanup_container(&cid).await;
+        Ok(pairs) => {
+            for (container_id, ctfd_flag_id) in pairs {
+                if let Some(cid) = container_id {
+                    instance::cleanup_container(&cid).await;
+                }
+                if let Some(flag_id) = ctfd_flag_id {
+                    instance::delete_flag_from_ctfd(
+                        &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
+                    ).await;
+                }
             }
             Json(json!({"ok": true})).into_response()
         }
@@ -945,7 +1023,92 @@ async fn plugin_stop_all_handler(
     }
 }
 
-async fn plugin_flag_handler(
+// ── Plugin: flag attempt ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PluginAttemptBody {
+    challenge_name: String,
+    team_id: i64,
+    user_id: i64,
+    submitted_flag: String,
+    is_correct: bool,
+}
+
+async fn plugin_attempt_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PluginAttemptBody>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    // Check for flag sharing: submitted flag belongs to a different team's instance
+    let owner = db::find_flag_owner(&state.db, &body.challenge_name, &body.submitted_flag, body.team_id);
+    let (is_flag_sharing, owner_team_id) = match owner {
+        Ok(Some(owner_id)) => (true, Some(owner_id)),
+        _ => (false, None),
+    };
+
+    if is_flag_sharing {
+        warn!(
+            "flag sharing detected: team {} (user {}) submitted flag belonging to team {} for challenge {}",
+            body.team_id, body.user_id, owner_team_id.unwrap_or(-1), body.challenge_name
+        );
+    }
+
+    match db::insert_flag_attempt(
+        &state.db,
+        &body.challenge_name,
+        body.team_id,
+        body.user_id,
+        &body.submitted_flag,
+        body.is_correct,
+        is_flag_sharing,
+        owner_team_id,
+    ) {
+        Ok(_) => Json(json!({"ok": true, "is_flag_sharing": is_flag_sharing})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Admin: dashboard + data endpoints ────────────────────────────────────────
+
+async fn admin_dashboard_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Accept token via ?token= query param or Authorization: Token <x> header
+    let token_from_query = params.get("token").map(|s| s.as_str()).unwrap_or("");
+    let authed = token_from_query == state.monitor_token
+        || check_monitor_auth(&headers, &state.monitor_token);
+
+    if !authed {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        include_str!("../assets/admin.html"),
+    ).into_response()
+}
+
+async fn admin_instances_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    match db::list_all_instances(&state.db) {
+        Ok(list) => Json(json!(list)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn admin_attempts_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
@@ -953,18 +1116,14 @@ async fn plugin_flag_handler(
     if !check_monitor_auth(&headers, &state.monitor_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
-    let challenge_name = match params.get("challenge_name") {
-        Some(n) => n.clone(),
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing challenge_name"}))).into_response(),
+    let alerts_only = params.get("alerts_only").map(|v| v == "true").unwrap_or(false);
+    let result = if alerts_only {
+        db::list_sharing_alerts(&state.db)
+    } else {
+        db::list_flag_attempts(&state.db, 200)
     };
-    let team_id: i64 = match params.get("team_id").and_then(|s| s.parse().ok()) {
-        Some(id) => id,
-        None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing team_id"}))).into_response(),
-    };
-    // Return the random flag stored for this team's instance
-    match db::get_instance_flag(&state.db, &challenge_name, team_id) {
-        Ok(Some(flag)) => Json(json!({"flag": flag})).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(json!({"error": "No active instance or flag not set"}))).into_response(),
+    match result {
+        Ok(list) => Json(json!(list)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

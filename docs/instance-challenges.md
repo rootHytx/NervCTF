@@ -239,18 +239,3 @@ The CTFd plugin (`nervctf_instance`) also adds a view panel within the CTFd chal
 that calls `/api/v1/containers/*` endpoints to manage the instance without leaving CTFd.
 
 ---
-
-## Migrating from `type: container`
-
-Run:
-
-```sh
-nervctf fix --migrate-containers
-nervctf fix --migrate-containers --dry-run   # preview first
-```
-
-This rewrites all `type: container` YAML files in-place:
-- `type: container` → `type: instance`
-- `extra.connection_type` → `instance.connection`
-- `extra.{image,internal_port,flag_mode,...}` → `instance.*`
-- Drops removed fields: `internal_ports`, `decay_function`, `memory_limit`, `cpu_limit`, `pids_limit`

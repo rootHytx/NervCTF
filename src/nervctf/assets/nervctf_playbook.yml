@@ -235,7 +235,7 @@
         content: |
           FROM debian:bookworm-slim
           RUN apt-get update && apt-get install -y --no-install-recommends \
-              docker.io ca-certificates && rm -rf /var/lib/apt/lists/*
+              docker.io ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
           COPY remote-monitor /usr/local/bin/remote-monitor
           CMD ["/usr/local/bin/remote-monitor"]
         dest: "{{ ctfd_path }}/remote-monitor/Dockerfile"

@@ -8,9 +8,9 @@ use nervctf::{
         CtfdClient,
     },
     directory_scanner::DirectoryScanner,
-    fix::{run_fix, run_migrate_containers},
+    fix::run_fix,
     load_config,
-    setup::run_setup,
+    setup::{run_setup, run_upgrade},
     validator::validate_challenges,
 };
 use std::collections::HashMap;
@@ -71,17 +71,17 @@ enum Commands {
     },
 
     /// Set up a remote CTFd environment (Docker, plugins, SSH access)
-    Setup,
+    Setup {
+        /// Upgrade an existing deployment: push new plugin + binary, rebuild image, restart containers
+        #[arg(long)]
+        upgrade: bool,
+    },
 
     /// Scan and fix common issues in challenge.yml files
     Fix {
         /// Preview changes without modifying any files
         #[arg(short, long)]
         dry_run: bool,
-
-        /// Migrate type:container challenges to the new type:instance format
-        #[arg(long)]
-        migrate_containers: bool,
     },
 
     /// Validate challenge YAML files and report errors/warnings
@@ -116,8 +116,11 @@ struct NextJob {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Setup has no config and no base_dir — handle it first.
-    if let Commands::Setup = cli.command {
+    // Setup/upgrade have no config and no base_dir — handle them first.
+    if let Commands::Setup { upgrade } = cli.command {
+        if upgrade {
+            return run_upgrade();
+        }
         return run_setup();
     }
 
@@ -140,10 +143,7 @@ async fn main() -> Result<()> {
     };
 
     // Commands that only need base_dir (no CTFd credentials required)
-    if let Commands::Fix { dry_run, migrate_containers } = cli.command {
-        if migrate_containers {
-            return run_migrate_containers(&effective_base_dir, dry_run);
-        }
+    if let Commands::Fix { dry_run } = cli.command {
         return run_fix(&effective_base_dir, dry_run);
     }
     if let Commands::Validate { debug } = cli.command {
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
         Commands::Scan { detailed } => {
             scan_challenges(&scanner, &effective_base_dir, detailed).await?;
         }
-        Commands::Setup | Commands::Fix { .. } | Commands::Validate { .. } => {
+        Commands::Setup { .. } | Commands::Fix { .. } | Commands::Validate { .. } => {
             unreachable!("handled before credential resolution")
         }
     }

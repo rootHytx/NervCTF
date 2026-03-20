@@ -509,7 +509,7 @@ dependencies = [
  "indexmap",
  "slab",
  "tokio",
- "tokio-util 0.7.18",
+ "tokio-util",
  "tracing",
 ]
 
@@ -528,7 +528,7 @@ dependencies = [
  "indexmap",
  "slab",
  "tokio",
- "tokio-util 0.7.18",
+ "tokio-util",
  "tracing",
 ]
 
@@ -1021,7 +1021,6 @@ dependencies = [
  "clap",
  "dialoguer",
  "dotenv",
- "hyper 0.14.32",
  "mockito",
  "reqwest",
  "serde",
@@ -1029,7 +1028,6 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tokio",
- "tokio-util 0.6.10",
  "walkdir",
 ]
 
@@ -1309,7 +1307,7 @@ dependencies = [
  "system-configuration",
  "tokio",
  "tokio-rustls",
- "tokio-util 0.7.18",
+ "tokio-util",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -1743,20 +1741,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c28327cf380ac148141087fbfb9de9d7bd4e84ab5d2c28fbc911d753de8a7081"
 dependencies = [
  "rustls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-util"
-version = "0.6.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36943ee01a6d67977dd3f84a5a1d2efeb4ada3a1ae771cadfaa535d9d9fc6507"
-dependencies = [
- "bytes",
- "futures-core",
- "futures-sink",
- "log",
- "pin-project-lite",
  "tokio",
 ]
 

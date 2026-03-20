@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["multipart"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "blocking", "stream", "rustls-tls"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
@@ -14,7 +14,12 @@ tower-http = { version = "0.4", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bytes = "1.0"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31" }
 rand = "0.8"
 shlex = "1"
 tempfile = "3"
+
+# Cross-compiled targets can't link against the host's system SQLite — compile
+# it from source instead. Only native x86_64 Linux GNU uses the system library.
+[target.'cfg(any(target_env = "musl", target_os = "windows", target_arch = "aarch64"))'.dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }

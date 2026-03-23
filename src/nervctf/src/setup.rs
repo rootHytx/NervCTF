@@ -301,6 +301,7 @@ pub fn run_setup() -> Result<()> {
             println!("\nCTFd URL:      {}", ctfd_url);
             println!("Monitor URL:   {}", monitor_url);
             println!("Monitor Token: {}", monitor_token);
+            println!("Admin Panel:   {}/admin?token={}", monitor_url, monitor_token);
             return Ok(());
         }
     } else {
@@ -357,6 +358,7 @@ pub fn run_setup() -> Result<()> {
     println!("  CTFd URL:      {}", ctfd_url);
     println!("  Monitor URL:   {}", monitor_url);
     println!("  Monitor Token: {}", monitor_token);
+    println!("  Admin Panel:   {}/admin?token={}", monitor_url, monitor_token);
     println!("  Config:        {}", config_path.display());
     if monitor_binary.is_none() {
         println!("\n[!] remember to build and deploy the Remote Monitor:");
@@ -509,8 +511,11 @@ pub fn run_upgrade() -> Result<()> {
     println!("\nRunning upgrade playbook...");
     run_ansible_playbook(UPGRADE_PLAYBOOK, &inventory, &evars)?;
 
+    let monitor_url = config.monitor_url.as_deref().unwrap_or("-");
+    let monitor_token = config.monitor_token.as_deref().unwrap_or("-");
     println!("\nUpgrade complete!");
-    println!("  Monitor URL: {}", config.monitor_url.as_deref().unwrap_or("-"));
+    println!("  Monitor URL:  {}", monitor_url);
+    println!("  Admin Panel:  {}/admin?token={}", monitor_url, monitor_token);
     Ok(())
 }
 

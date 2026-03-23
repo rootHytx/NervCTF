@@ -249,15 +249,12 @@
       become_user: "{{ docker_user }}"
       when: monitor_binary is defined
 
-    # ── Challenges directory (bind mount — must be same path on host and in container
-    #    so the host Docker daemon can resolve build contexts and volume paths during
-    #    compose builds and runtime. The named volume at /data holds the SQLite DB;
-    #    the bind mount at /data/challenges shadows that subdirectory so challenge
-    #    files written by the monitor are visible to the host Docker daemon at the
-    #    same absolute path referenced in challenge docker-compose.yml files.)
-    - name: Create challenges base directory on host
+    # ── Monitor data directory (bind mount — host path must equal container path
+    #    so the host Docker daemon can resolve challenge compose build contexts and
+    #    volume paths at the same absolute path the monitor writes them with.)
+    - name: Create monitor data directory on host
       file:
-        path: /data/challenges
+        path: "{{ ctfd_path }}/remote-monitor/data/challenges"
         state: directory
         owner: "{{ docker_user }}"
         group: docker
@@ -283,18 +280,14 @@
                 - MONITOR_TOKEN={{ monitor_token }}
                 - PUBLIC_HOST={{ ansible_host }}
                 - MONITOR_PORT={{ monitor_port }}
-                - DB_PATH=/data/monitor.db
-                - CHALLENGES_BASE_DIR=/data/challenges
+                - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
+                - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
-                - remote_monitor_data:/data
-                - /data/challenges:/data/challenges
+                - {{ ctfd_path }}/remote-monitor/data:{{ ctfd_path }}/remote-monitor/data
               ports:
                 - "{{ monitor_port }}:{{ monitor_port }}"
-
-          volumes:
-            remote_monitor_data:
         dest: "{{ ctfd_path }}/docker-compose.override.yml"
         owner: "{{ docker_user }}"
         group: docker

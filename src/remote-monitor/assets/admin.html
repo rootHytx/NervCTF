@@ -43,20 +43,25 @@
 
 <h1>NervCTF Monitor Admin</h1>
 <div id="token-info">Token: (loaded from ?token= param)</div>
+<div class="status" id="last-refresh">Loading...</div>
 
 <div class="section-hdr" id="alerts-section">
   <h2>Flag Sharing Alerts</h2>
   <span class="count-badge" id="alerts-count-badge">0</span>
 </div>
-<div class="status" id="alerts-status">Loading...</div>
 <div id="alerts-table"></div>
 
 <div class="section-hdr">
   <h2>Active Instances</h2>
   <span class="count-badge" id="instances-count">0</span>
 </div>
-<div class="status" id="instances-status">Loading...</div>
 <div id="instances-table"></div>
+
+<div class="section-hdr">
+  <h2>Correct Solves</h2>
+  <span class="count-badge" id="solves-count">0</span>
+</div>
+<div id="solves-table"></div>
 
 <h2>Recent Flag Attempts</h2>
 <div class="toolbar">
@@ -73,7 +78,6 @@
          style="display:none" oninput="renderAttemptsFiltered()" placeholder="N">
   <span class="count-badge" id="attempts-count">0</span>
 </div>
-<div class="status" id="attempts-status">Loading...</div>
 <div id="attempts-table"></div>
 
 <script>
@@ -100,6 +104,10 @@
     return d.innerHTML;
   }
 
+  function updateRefreshTime() {
+    document.getElementById('last-refresh').textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
+  }
+
   function fetchJSON(url, cb) {
     fetch(url, { headers: authHeaders() })
       .then(function (r) { return r.json(); })
@@ -111,11 +119,10 @@
 
   function renderAlerts(data) {
     var el = document.getElementById('alerts-table');
-    var status = document.getElementById('alerts-status');
     var badge = document.getElementById('alerts-count-badge');
-    if (!Array.isArray(data)) { status.textContent = 'Error loading alerts.'; return; }
+    if (!Array.isArray(data)) { return; }
     badge.textContent = data.length;
-    status.textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
+    updateRefreshTime();
     if (data.length === 0) { el.innerHTML = '<p class="empty">No sharing alerts detected.</p>'; return; }
     var html = '<table><thead><tr>' +
       '<th>Time</th><th>Challenge</th><th>Team (submitter)</th><th>User</th>' +
@@ -146,12 +153,10 @@
 
   function renderInstances(data) {
     var el = document.getElementById('instances-table');
-    var status = document.getElementById('instances-status');
     var badge = document.getElementById('instances-count');
-    if (!Array.isArray(data)) { status.textContent = 'Error loading instances.'; return; }
+    if (!Array.isArray(data)) { return; }
     var active = data.filter(function (r) { return r.status === 'running'; });
     badge.textContent = active.length;
-    status.textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
     if (active.length === 0) { el.innerHTML = '<p class="empty">No active instances.</p>'; return; }
     var html = '<table><thead><tr>' +
       '<th>Challenge</th><th>Team</th><th>User</th><th>Host:Port</th>' +
@@ -177,9 +182,14 @@
     el.innerHTML = html;
   }
 
+  var allInstances = [];
+
   function loadInstances() {
     fetchJSON('/api/v1/admin/instances', function (data, err) {
-      renderInstances(err ? [] : data);
+      allInstances = Array.isArray(data) ? data : [];
+      renderInstances(allInstances);
+      // Re-render attempts: their visibility depends on which instances are alive.
+      renderAttemptsFiltered();
     });
   }
 
@@ -197,6 +207,36 @@
       .catch(function (e) { alert('Network error: ' + e.message); });
   };
 
+  // ── Solves ────────────────────────────────────────────────────────────────
+
+  function renderSolves(data) {
+    var el = document.getElementById('solves-table');
+    var badge = document.getElementById('solves-count');
+    if (!Array.isArray(data)) { return; }
+    badge.textContent = data.length;
+    if (data.length === 0) { el.innerHTML = '<p class="empty">No solves yet.</p>'; return; }
+    var html = '<table><thead><tr>' +
+      '<th>Time</th><th>Challenge</th><th>Team</th><th>User</th><th>Flag</th>' +
+      '</tr></thead><tbody>';
+    data.forEach(function (r) {
+      html += '<tr>' +
+        '<td>' + escText(r.timestamp) + '</td>' +
+        '<td>' + escText(r.challenge_name) + '</td>' +
+        '<td class="badge-ok">' + escText(r.team_id) + '</td>' +
+        '<td>' + escText(r.user_id) + '</td>' +
+        '<td>' + escText(r.submitted_flag) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }
+
+  function loadSolves() {
+    fetchJSON('/api/v1/admin/solves', function (data, err) {
+      renderSolves(err ? [] : data);
+    });
+  }
+
   // ── Attempts ──────────────────────────────────────────────────────────────
 
   var allAttempts = [];
@@ -209,14 +249,31 @@
   };
 
   window.renderAttemptsFiltered = function() {
+    // Build a set of "challenge|team" keys for teams with a running instance.
+    var alive = new Set(
+      allInstances
+        .filter(function (i) { return i.status === 'running'; })
+        .map(function (i) { return i.challenge_name + '|' + String(i.team_id); })
+    );
+
+    // Only show an attempt if it is noteworthy past instance death:
+    //   - correct submission (solve event)
+    //   - flag sharing alert
+    //   - team still has a live instance (in-progress noise)
+    var visible = allAttempts.filter(function (r) {
+      return r.is_correct
+        || r.is_flag_sharing
+        || alive.has(r.challenge_name + '|' + String(r.team_id));
+    });
+
     var sel = document.getElementById('attempts-limit');
     var custom = document.getElementById('attempts-limit-custom');
     var limit = sel.value === 'custom'
       ? (parseInt(custom.value) || 10)
       : parseInt(sel.value) || 200;
-    var data = allAttempts.slice(0, limit);
+    var data = visible.slice(0, limit);
     var badge = document.getElementById('attempts-count');
-    badge.textContent = data.length + ' / ' + allAttempts.length;
+    badge.textContent = data.length + ' / ' + visible.length;
 
     var el = document.getElementById('attempts-table');
     if (data.length === 0) { el.innerHTML = '<p class="empty">No flag attempts recorded.</p>'; return; }
@@ -241,10 +298,8 @@
   };
 
   function renderAttempts(data) {
-    var status = document.getElementById('attempts-status');
-    if (!Array.isArray(data)) { status.textContent = 'Error loading attempts.'; return; }
+    if (!Array.isArray(data)) { return; }
     allAttempts = data;
-    status.textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
     renderAttemptsFiltered();
   }
 
@@ -258,10 +313,12 @@
 
   loadAlerts();
   loadInstances();
+  loadSolves();
   loadAttempts();
 
   setInterval(loadAlerts,    15000);
   setInterval(loadInstances, 15000);
+  setInterval(loadSolves,    30000);
   setInterval(loadAttempts,  30000);
 }());
 </script>

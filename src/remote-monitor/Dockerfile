@@ -1,5 +1,5 @@
 # Use official Rust image for build
-FROM rust:1.72 as builder
+FROM rust:1.72 AS builder
 
 WORKDIR /app
 COPY . .

@@ -250,8 +250,8 @@ class InstanceChallengeType(BaseChallenge):
             is_correct = bool(result[0])
         except TypeError:
             is_correct = bool(getattr(result, "success", False))
-        data = request.form or request.get_json() or {}
-        submitted = data.get("submission", "").strip()
+        json_data = request.get_json(silent=True) or {}
+        submitted = (json_data.get("submission") or request.form.get("submission") or "").strip()
         team_id = _team_id()
         from CTFd.utils.user import get_current_user
         user = get_current_user()
@@ -260,7 +260,7 @@ class InstanceChallengeType(BaseChallenge):
             m = _monitor()
             if m:
                 try:
-                    req_lib.post(
+                    resp = req_lib.post(
                         f"{m['url']}/api/v1/plugin/attempt",
                         headers=_monitor_headers(m),
                         json={
@@ -270,10 +270,12 @@ class InstanceChallengeType(BaseChallenge):
                             "submitted_flag": submitted,
                             "is_correct": is_correct,
                         },
-                        timeout=0.5,  # fire-and-forget; never block flag submission
+                        timeout=2,
                     )
-                except Exception:
-                    pass  # monitor down — still return verdict
+                    if not resp.ok:
+                        logger.warning("Monitor attempt POST failed: %s %s", resp.status_code, resp.text[:200])
+                except Exception as e:
+                    logger.warning("Monitor attempt POST error: %s", e)
         return result
 
     @classmethod
@@ -284,11 +286,18 @@ class InstanceChallengeType(BaseChallenge):
         if team_id:
             m = _monitor()
             if m:
+                json_data = request.get_json(silent=True) or {}
+                submitted = (json_data.get("submission") or request.form.get("submission") or "").strip()
                 try:
                     req_lib.post(
                         f"{m['url']}/api/v1/plugin/solve",
                         headers=_monitor_headers(m),
-                        json={"challenge_name": challenge.name, "team_id": team_id},
+                        json={
+                            "challenge_name": challenge.name,
+                            "team_id": team_id,
+                            "user_id": user.id if user else None,
+                            "submitted_flag": submitted,
+                        },
                         timeout=10,
                     )
                 except Exception as e:
@@ -374,6 +383,11 @@ def get_instance_info(challenge_id):
     team_id = _team_id()
     if not team_id:
         return {"error": "Not in a team"}, 403
+
+    # If the team already solved this challenge, no instance is needed.
+    from CTFd.models import Solves
+    if Solves.query.filter_by(challenge_id=challenge.id, team_id=team_id).first():
+        return {"status": "solved"}, 200
 
     m = _monitor()
     if not m:

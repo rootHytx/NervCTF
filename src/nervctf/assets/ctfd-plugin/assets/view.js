@@ -202,7 +202,12 @@ function view_container_info(challenge_id) {
     .then(function (data) {
       while (alert.firstChild) alert.removeChild(alert.firstChild);
 
-      if (
+      if (data.status === "solved") {
+        alert.textContent = "Challenge solved. No instance needed.";
+        alert.classList.add("alert-success");
+        hideUpdateBtns();
+        hideCreateBtn();
+      } else if (
         data.status === "not_found" ||
         data.status === "none" ||
         !data.status
@@ -256,7 +261,12 @@ function container_request(challenge_id) {
     })
     .then(function (data) {
       while (alert.firstChild) alert.removeChild(alert.firstChild);
-      if (data.error) {
+      if (data.solved) {
+        alert.textContent = "Challenge already solved.";
+        alert.classList.add("alert-success");
+        hideUpdateBtns();
+        hideCreateBtn();
+      } else if (data.error) {
         alert.textContent = data.error;
         alert.classList.add("alert-danger");
         showCreateBtn();

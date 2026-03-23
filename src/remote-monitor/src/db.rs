@@ -270,6 +270,12 @@ pub fn delete_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Op
                 "DELETE FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
                 params![challenge_name, team_id],
             )?;
+            // Purge incorrect, non-sharing attempts for this team+challenge.
+            // Correct solves and sharing alerts are kept permanently.
+            conn.execute(
+                "DELETE FROM flag_attempts WHERE challenge_name = ?1 AND team_id = ?2 AND is_correct = 0 AND is_flag_sharing = 0",
+                params![challenge_name, team_id],
+            )?;
             Ok(Some((container_id, ctfd_flag_id)))
         }
     }
@@ -411,6 +417,42 @@ pub fn list_sharing_alerts(db: &Db) -> Result<Vec<Value>> {
     Ok(result)
 }
 
+/// Returns true if the team already has a correct solve recorded for this challenge.
+pub fn has_correct_solve(db: &Db, challenge_name: &str, team_id: i64) -> Result<bool> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM flag_attempts WHERE challenge_name = ?1 AND team_id = ?2 AND is_correct = 1",
+        params![challenge_name, team_id],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+/// Returns one row per team+challenge that has a correct solve (earliest solve wins).
+pub fn list_correct_solves(db: &Db) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_name, team_id, user_id, submitted_flag, MIN(timestamp) as timestamp
+         FROM flag_attempts WHERE is_correct = 1
+         GROUP BY challenge_name, team_id
+         ORDER BY timestamp DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "challenge_name": row.get::<_, String>(0)?,
+            "team_id": row.get::<_, i64>(1)?,
+            "user_id": row.get::<_, i64>(2)?,
+            "submitted_flag": row.get::<_, String>(3)?,
+            "timestamp": row.get::<_, String>(4)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
+}
+
 /// Finds if a flag value belongs to a different team's instance (flag sharing detection).
 /// Returns Some(owner_team_id) if sharing is detected, None otherwise.
 /// Returns Some(owner_team_id) if the submitted flag was generated for a different team,
@@ -444,6 +486,11 @@ pub fn delete_all_instances_for_challenge(db: &Db, challenge_name: &str) -> Resu
         .collect();
     conn.execute(
         "DELETE FROM instances WHERE challenge_name = ?1",
+        params![challenge_name],
+    )?;
+    // Purge incorrect, non-sharing attempts for all teams on this challenge.
+    conn.execute(
+        "DELETE FROM flag_attempts WHERE challenge_name = ?1 AND is_correct = 0 AND is_flag_sharing = 0",
         params![challenge_name],
     )?;
     Ok(pairs)

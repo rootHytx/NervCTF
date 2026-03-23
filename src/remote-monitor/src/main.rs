@@ -11,6 +11,7 @@
 //!   GET  /api/v1/instance/list           — list configs (monitor token)
 //!   GET  /api/v1/admin/instances         — list all active instances (monitor token)
 //!   GET  /api/v1/admin/attempts          — list flag attempts; ?alerts_only=true for sharing alerts (monitor token)
+//!   GET  /api/v1/admin/solves            — list correct solves (one per team+challenge) (monitor token)
 //!   POST /api/v1/plugin/attempt          — record flag submission attempt (monitor token)
 //!   POST /api/v1/instance/request        — provision instance (CTFd user token)
 //!   GET  /api/v1/instance/info           — get own instance (CTFd user token)
@@ -146,6 +147,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/instance/list", get(instance_list_handler))
         .route("/api/v1/admin/instances", get(admin_instances_handler))
         .route("/api/v1/admin/attempts", get(admin_attempts_handler))
+        .route("/api/v1/admin/solves", get(admin_solves_handler))
         // Plugin routes (monitor token + explicit team_id) — used by CTFd plugin
         .route("/api/v1/plugin/info", get(plugin_info_handler))
         .route("/api/v1/plugin/request", post(plugin_request_handler))
@@ -836,6 +838,12 @@ async fn plugin_request_handler(
 
     info!("plugin_request: challenge={} team_id={}", body.challenge_name, body.team_id);
 
+    // Reject if the team already solved this challenge
+    if db::has_correct_solve(&state.db, &body.challenge_name, body.team_id).unwrap_or(false) {
+        info!("plugin_request: team {} already solved '{}', rejecting provision", body.team_id, body.challenge_name);
+        return (StatusCode::CONFLICT, Json(json!({"error": "Challenge already solved", "solved": true}))).into_response();
+    }
+
     // Return existing running instance
     if let Ok(Some(inst)) = db::get_instance(&state.db, &body.challenge_name, body.team_id) {
         if inst.status == "running" {
@@ -960,14 +968,24 @@ async fn plugin_stop_handler(
     }
 }
 
+#[derive(Deserialize)]
+struct PluginSolveBody {
+    challenge_name: String,
+    team_id: i64,
+    user_id: Option<i64>,
+    submitted_flag: Option<String>,
+}
+
 /// Called by the CTFd plugin when a team solves an instance challenge.
 /// Deletes the DB record immediately and returns 200, then tears down the
 /// container and CTFd flag in the background so the plugin doesn't time out
 /// waiting for `docker compose down`.
+/// Also records the correct solve in flag_attempts — this is the authoritative
+/// source since solve() is only called by CTFd for genuine correct submissions.
 async fn plugin_solve_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<PluginTeamBody>,
+    Json(body): Json<PluginSolveBody>,
 ) -> impl IntoResponse {
     if !check_monitor_auth(&headers, &state.monitor_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
@@ -979,6 +997,15 @@ async fn plugin_solve_handler(
                 instance::delete_flag_from_ctfd(
                     &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
                 ).await;
+            }
+            // Record the correct solve. This happens after delete_instance() purges
+            // incorrect attempts, so the correct row is always persisted.
+            if let (Some(flag), Some(uid)) = (&body.submitted_flag, body.user_id) {
+                if !flag.is_empty() {
+                    let _ = db::insert_flag_attempt(
+                        &state.db, &body.challenge_name, body.team_id, uid, flag, true, false, None,
+                    );
+                }
             }
             // Container teardown in background — compose down is slow.
             if let Some(cid) = container_id {
@@ -1123,6 +1150,19 @@ async fn admin_attempts_handler(
         db::list_flag_attempts(&state.db, 200)
     };
     match result {
+        Ok(list) => Json(json!(list)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn admin_solves_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    match db::list_correct_solves(&state.db) {
         Ok(list) => Json(json!(list)).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }

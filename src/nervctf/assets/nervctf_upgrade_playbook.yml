@@ -68,7 +68,7 @@
       when: monitor_binary is defined
 
     # ── Restart services ───────────────────────────────────────────────────────
-    # Restart remote-monitor first (new image, no state loss — DB is on a named volume).
+    # Restart remote-monitor first (new image, no state loss — DB is a bind-mounted file).
     - name: Restart remote-monitor container
       command:
         cmd: docker compose up -d --force-recreate remote-monitor

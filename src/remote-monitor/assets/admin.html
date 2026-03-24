@@ -37,6 +37,8 @@
     font-family: monospace; font-size: 0.78rem; padding: 2px 8px;
   }
   .btn-stop:hover { background: #9e2a2a; }
+  .row-solved { opacity: 0.55; }
+  .badge-solved { color: #888; font-size: 0.78rem; }
 </style>
 </head>
 <body>
@@ -104,6 +106,12 @@
     return d.innerHTML;
   }
 
+  // Renders "Name (id)" if name is known, otherwise just the id.
+  function nameId(name, id) {
+    if (name) return escText(name) + ' <span style="color:#666">(' + escText(id) + ')</span>';
+    return escText(id);
+  }
+
   function updateRefreshTime() {
     document.getElementById('last-refresh').textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
   }
@@ -132,9 +140,9 @@
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
         '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td class="badge-sharing">' + escText(r.team_id) + '</td>' +
-        '<td>' + escText(r.user_id) + '</td>' +
-        '<td>' + escText(r.owner_team_id) + '</td>' +
+        '<td class="badge-sharing">' + nameId(r.team_name, r.team_id) + '</td>' +
+        '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
+        '<td>' + (r.owner_team_id !== null ? nameId(r.owner_team_name, r.owner_team_id) : '') + '</td>' +
         '<td>' + (r.is_correct ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
         '<td>' + escText(r.submitted_flag) + '</td>' +
         '</tr>';
@@ -155,27 +163,34 @@
     var el = document.getElementById('instances-table');
     var badge = document.getElementById('instances-count');
     if (!Array.isArray(data)) { return; }
-    var active = data.filter(function (r) { return r.status === 'running'; });
-    badge.textContent = active.length;
-    if (active.length === 0) { el.innerHTML = '<p class="empty">No active instances.</p>'; return; }
+    var running = data.filter(function (r) { return r.status === 'running'; });
+    var visible = data.filter(function (r) { return r.status === 'running' || r.status === 'solved'; });
+    badge.textContent = running.length;
+    if (visible.length === 0) { el.innerHTML = '<p class="empty">No active instances.</p>'; return; }
     var html = '<table><thead><tr>' +
       '<th>Challenge</th><th>Team</th><th>User</th><th>Host:Port</th>' +
-      '<th>Type</th><th>Expires At</th><th>Created At</th><th>Action</th>' +
+      '<th>Type</th><th>Status</th><th>Expires At</th><th>Created At</th><th>Action</th>' +
       '</tr></thead><tbody>';
-    active.forEach(function (r) {
+    visible.forEach(function (r) {
+      var isSolved = r.status === 'solved';
+      var rowClass = isSolved ? ' class="row-solved"' : '';
       // Build the onclick value and HTML-encode double quotes so they survive
       // inside a double-quoted attribute (JSON.stringify wraps strings in "…").
       var stopCall = 'stopInstance(' + JSON.stringify(r.challenge_name) + ',' + Number(r.team_id) + ')';
       var stopAttr = stopCall.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-      html += '<tr>' +
+      var actionCell = isSolved
+        ? '<span class="badge-solved">Solved</span>'
+        : '<button class="btn-stop" onclick="' + stopAttr + '">Stop</button>';
+      html += '<tr' + rowClass + '>' +
         '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td>' + escText(r.team_id) + '</td>' +
-        '<td>' + escText(r.user_id !== null ? r.user_id : '—') + '</td>' +
+        '<td>' + nameId(r.team_name, r.team_id) + '</td>' +
+        '<td>' + (r.user_id !== null ? nameId(r.user_name, r.user_id) : '—') + '</td>' +
         '<td>' + escText(r.host) + ':' + escText(r.port) + '</td>' +
         '<td>' + escText(r.connection_type) + '</td>' +
+        '<td>' + escText(r.status) + '</td>' +
         '<td>' + escText(r.expires_at) + '</td>' +
         '<td>' + escText(r.created_at) + '</td>' +
-        '<td><button class="btn-stop" onclick="' + stopAttr + '">Stop</button></td>' +
+        '<td>' + actionCell + '</td>' +
         '</tr>';
     });
     html += '</tbody></table>';
@@ -222,8 +237,8 @@
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
         '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td class="badge-ok">' + escText(r.team_id) + '</td>' +
-        '<td>' + escText(r.user_id) + '</td>' +
+        '<td class="badge-ok">' + nameId(r.team_name, r.team_id) + '</td>' +
+        '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
         '<td>' + escText(r.submitted_flag) + '</td>' +
         '</tr>';
     });
@@ -285,11 +300,11 @@
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
         '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td>' + escText(r.team_id) + '</td>' +
-        '<td>' + escText(r.user_id) + '</td>' +
+        '<td>' + nameId(r.team_name, r.team_id) + '</td>' +
+        '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
         '<td>' + (r.is_correct ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
         '<td>' + (r.is_flag_sharing ? '<span class="badge-sharing">SHARING</span>' : '') + '</td>' +
-        '<td>' + escText(r.owner_team_id !== null ? r.owner_team_id : '') + '</td>' +
+        '<td>' + (r.owner_team_id !== null ? nameId(r.owner_team_name, r.owner_team_id) : '') + '</td>' +
         '<td>' + escText(r.submitted_flag) + '</td>' +
         '</tr>';
     });

@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use mysql_async::{prelude::*, Pool};
+use crate::db::Db;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
@@ -657,3 +658,54 @@ pub async fn create_topic(pool: &Pool, body: &Value) -> Result<Value> {
 
     Ok(json!({"id": topic_id, "challenge_id": challenge_id, "value": value}))
 }
+
+// ── Read-only sync from CTFd submissions ──────────────────────────────────────
+
+/// Sync correct solves from CTFd's `submissions` table into the monitor's local
+/// `ctfd_solves` SQLite cache.  Performs a full replace so deleted submissions
+/// are also removed from the cache.  Read-only against MariaDB.
+///
+/// Called by the background sync task every `CTFD_DB_SYNC_INTERVAL` seconds.
+pub async fn sync_solves(pool: &Pool, db: &Db) -> Result<()> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: sync_solves: get_conn: {}", e))?;
+
+    let rows: Vec<(i64, Option<i64>, String, String)> = conn.exec(
+        "SELECT s.team_id, s.user_id, c.name, DATE_FORMAT(s.date, '%Y-%m-%d %H:%i:%S') \
+         FROM submissions s \
+         JOIN challenges c ON c.id = s.challenge_id \
+         WHERE s.type = 'correct' AND s.team_id IS NOT NULL",
+        (),
+    ).await.map_err(|e| anyhow!("ctfd_db: sync_solves: query: {}", e))?;
+
+    let n = rows.len();
+    crate::db::replace_ctfd_solves(db, &rows)
+        .map_err(|e| anyhow!("ctfd_db: sync_solves: sqlite: {}", e))?;
+    tracing::debug!("ctfd_db: sync_solves: replaced with {} rows", n);
+    Ok(())
+}
+
+/// Sync teams and users from CTFd's MariaDB into the local name cache.
+/// Performs a full replace so renames and deletions are picked up.
+/// Read-only against MariaDB.
+pub async fn sync_users_and_teams(pool: &Pool, db: &Db) -> Result<()> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: sync_users_and_teams: get_conn: {}", e))?;
+
+    let teams: Vec<(i64, String)> = conn.exec(
+        "SELECT id, name FROM teams",
+        (),
+    ).await.map_err(|e| anyhow!("ctfd_db: sync_users_and_teams: teams query: {}", e))?;
+
+    let users: Vec<(i64, String, Option<i64>)> = conn.exec(
+        "SELECT id, name, team_id FROM users",
+        (),
+    ).await.map_err(|e| anyhow!("ctfd_db: sync_users_and_teams: users query: {}", e))?;
+
+    let (nt, nu) = (teams.len(), users.len());
+    crate::db::replace_ctfd_teams_and_users(db, &teams, &users)
+        .map_err(|e| anyhow!("ctfd_db: sync_users_and_teams: sqlite: {}", e))?;
+    tracing::debug!("ctfd_db: sync_users_and_teams: {} teams, {} users", nt, nu);
+    Ok(())
+}
+

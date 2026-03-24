@@ -65,12 +65,53 @@ fn init_schema(conn: &Connection) -> Result<()> {
             created_at      TEXT DEFAULT (datetime('now')),
             PRIMARY KEY (challenge_name, team_id, flag)
         );
+
+        -- Read-only cache of correct solves synced from CTFd MariaDB submissions table.
+        -- Written only by the background sync task; never modified by game logic.
+        CREATE TABLE IF NOT EXISTS ctfd_solves (
+            challenge_name  TEXT NOT NULL,
+            team_id         INTEGER NOT NULL,
+            user_id         INTEGER,
+            solved_at       TEXT,
+            PRIMARY KEY (challenge_name, team_id)
+        );
+
+        -- Cached CTFd teams and users (id→name) for display purposes.
+        CREATE TABLE IF NOT EXISTS ctfd_teams (
+            id   INTEGER PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ctfd_users (
+            id      INTEGER PRIMARY KEY,
+            name    TEXT NOT NULL,
+            team_id INTEGER
+        );
         "#,
     )?;
     // Migrations for existing databases.
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN flag TEXT", []);
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN ctfd_flag_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN user_id INTEGER", []);
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS ctfd_solves (
+            challenge_name TEXT NOT NULL,
+            team_id        INTEGER NOT NULL,
+            user_id        INTEGER,
+            solved_at      TEXT,
+            PRIMARY KEY (challenge_name, team_id)
+        )",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE ctfd_solves ADD COLUMN user_id INTEGER", []);
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS ctfd_teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS ctfd_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, team_id INTEGER)",
+        [],
+    );
     // Backfill team_flags from any instances that already have a flag recorded.
     let _ = conn.execute(
         "INSERT OR IGNORE INTO team_flags (challenge_name, team_id, flag)
@@ -281,6 +322,33 @@ pub fn delete_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Op
     }
 }
 
+/// Mark an instance as solved (keeps the row visible in admin panel) and return
+/// `(container_id, ctfd_flag_id)` for cleanup. Returns `Ok(None)` if no row existed.
+pub fn mark_instance_solved(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<(Option<String>, Option<i64>)>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let row = conn.query_row(
+        "SELECT container_id, ctfd_flag_id FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
+        params![challenge_name, team_id],
+        |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+    );
+    match row {
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+        Ok((container_id, ctfd_flag_id)) => {
+            conn.execute(
+                "UPDATE instances SET status='solved' WHERE challenge_name = ?1 AND team_id = ?2",
+                params![challenge_name, team_id],
+            )?;
+            // Purge noise attempts — keep correct solves and sharing alerts.
+            conn.execute(
+                "DELETE FROM flag_attempts WHERE challenge_name = ?1 AND team_id = ?2 AND is_correct = 0 AND is_flag_sharing = 0",
+                params![challenge_name, team_id],
+            )?;
+            Ok(Some((container_id, ctfd_flag_id)))
+        }
+    }
+}
+
 /// Returns all host ports currently in use by running instances.
 pub fn get_used_ports(db: &Db) -> Result<std::collections::HashSet<u16>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
@@ -316,23 +384,40 @@ pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64
     Ok(result)
 }
 
+/// Returns all tracked container_ids (non-null) as a HashSet, for orphan detection.
+pub fn get_all_container_ids(db: &Db) -> Result<std::collections::HashSet<String>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare("SELECT container_id FROM instances WHERE container_id IS NOT NULL")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for r in rows { set.insert(r?); }
+    Ok(set)
+}
+
 /// Returns all active instances as JSON values for the admin dashboard.
 pub fn list_all_instances(db: &Db) -> Result<Vec<Value>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT challenge_name, team_id, user_id, host, port, connection_type, status, expires_at, created_at FROM instances ORDER BY created_at DESC",
+        "SELECT i.challenge_name, i.team_id, ct.name, i.user_id, cu.name,
+                i.host, i.port, i.connection_type, i.status, i.expires_at, i.created_at
+         FROM instances i
+         LEFT JOIN ctfd_teams ct ON ct.id = i.team_id
+         LEFT JOIN ctfd_users cu ON cu.id = i.user_id
+         ORDER BY i.created_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "challenge_name": row.get::<_, String>(0)?,
             "team_id": row.get::<_, i64>(1)?,
-            "user_id": row.get::<_, Option<i64>>(2)?,
-            "host": row.get::<_, String>(3)?,
-            "port": row.get::<_, i64>(4)?,
-            "connection_type": row.get::<_, String>(5)?,
-            "status": row.get::<_, String>(6)?,
-            "expires_at": row.get::<_, String>(7)?,
-            "created_at": row.get::<_, String>(8)?,
+            "team_name": row.get::<_, Option<String>>(2)?,
+            "user_id": row.get::<_, Option<i64>>(3)?,
+            "user_name": row.get::<_, Option<String>>(4)?,
+            "host": row.get::<_, String>(5)?,
+            "port": row.get::<_, i64>(6)?,
+            "connection_type": row.get::<_, String>(7)?,
+            "status": row.get::<_, String>(8)?,
+            "expires_at": row.get::<_, String>(9)?,
+            "created_at": row.get::<_, String>(10)?,
         }))
     })?;
     let mut result = Vec::new();
@@ -369,20 +454,32 @@ pub fn insert_flag_attempt(
 pub fn list_flag_attempts(db: &Db, limit: i64) -> Result<Vec<Value>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT id, challenge_name, team_id, user_id, submitted_flag, is_correct, is_flag_sharing, owner_team_id, timestamp
-         FROM flag_attempts ORDER BY timestamp DESC LIMIT ?1",
+        "SELECT fa.id, fa.challenge_name,
+                fa.team_id, ct.name,
+                fa.user_id, cu.name,
+                fa.submitted_flag, fa.is_correct, fa.is_flag_sharing,
+                fa.owner_team_id, ct2.name,
+                fa.timestamp
+         FROM flag_attempts fa
+         LEFT JOIN ctfd_teams ct  ON ct.id  = fa.team_id
+         LEFT JOIN ctfd_users cu  ON cu.id  = fa.user_id
+         LEFT JOIN ctfd_teams ct2 ON ct2.id = fa.owner_team_id
+         ORDER BY fa.timestamp DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit], |row| {
         Ok(serde_json::json!({
             "id": row.get::<_, i64>(0)?,
             "challenge_name": row.get::<_, String>(1)?,
             "team_id": row.get::<_, i64>(2)?,
-            "user_id": row.get::<_, i64>(3)?,
-            "submitted_flag": row.get::<_, String>(4)?,
-            "is_correct": row.get::<_, i64>(5)? != 0,
-            "is_flag_sharing": row.get::<_, i64>(6)? != 0,
-            "owner_team_id": row.get::<_, Option<i64>>(7)?,
-            "timestamp": row.get::<_, String>(8)?,
+            "team_name": row.get::<_, Option<String>>(3)?,
+            "user_id": row.get::<_, i64>(4)?,
+            "user_name": row.get::<_, Option<String>>(5)?,
+            "submitted_flag": row.get::<_, String>(6)?,
+            "is_correct": row.get::<_, i64>(7)? != 0,
+            "is_flag_sharing": row.get::<_, i64>(8)? != 0,
+            "owner_team_id": row.get::<_, Option<i64>>(9)?,
+            "owner_team_name": row.get::<_, Option<String>>(10)?,
+            "timestamp": row.get::<_, String>(11)?,
         }))
     })?;
     let mut result = Vec::new();
@@ -395,19 +492,32 @@ pub fn list_flag_attempts(db: &Db, limit: i64) -> Result<Vec<Value>> {
 pub fn list_sharing_alerts(db: &Db) -> Result<Vec<Value>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT id, challenge_name, team_id, user_id, submitted_flag, is_correct, owner_team_id, timestamp
-         FROM flag_attempts WHERE is_flag_sharing = 1 ORDER BY timestamp DESC",
+        "SELECT fa.id, fa.challenge_name,
+                fa.team_id, ct.name,
+                fa.user_id, cu.name,
+                fa.submitted_flag, fa.is_correct,
+                fa.owner_team_id, ct2.name,
+                fa.timestamp
+         FROM flag_attempts fa
+         LEFT JOIN ctfd_teams ct  ON ct.id  = fa.team_id
+         LEFT JOIN ctfd_users cu  ON cu.id  = fa.user_id
+         LEFT JOIN ctfd_teams ct2 ON ct2.id = fa.owner_team_id
+         WHERE fa.is_flag_sharing = 1
+         ORDER BY fa.timestamp DESC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "id": row.get::<_, i64>(0)?,
             "challenge_name": row.get::<_, String>(1)?,
             "team_id": row.get::<_, i64>(2)?,
-            "user_id": row.get::<_, i64>(3)?,
-            "submitted_flag": row.get::<_, String>(4)?,
-            "is_correct": row.get::<_, i64>(5)? != 0,
-            "owner_team_id": row.get::<_, Option<i64>>(6)?,
-            "timestamp": row.get::<_, String>(7)?,
+            "team_name": row.get::<_, Option<String>>(3)?,
+            "user_id": row.get::<_, i64>(4)?,
+            "user_name": row.get::<_, Option<String>>(5)?,
+            "submitted_flag": row.get::<_, String>(6)?,
+            "is_correct": row.get::<_, i64>(7)? != 0,
+            "owner_team_id": row.get::<_, Option<i64>>(8)?,
+            "owner_team_name": row.get::<_, Option<String>>(9)?,
+            "timestamp": row.get::<_, String>(10)?,
         }))
     })?;
     let mut result = Vec::new();
@@ -418,32 +528,90 @@ pub fn list_sharing_alerts(db: &Db) -> Result<Vec<Value>> {
 }
 
 /// Returns true if the team already has a correct solve recorded for this challenge.
+/// Full-replace the ctfd_solves cache with the current snapshot from MariaDB.
+/// Any rows not in `rows` (i.e. deleted submissions) are removed.
+pub fn replace_ctfd_solves(db: &Db, rows: &[(i64, Option<i64>, String, String)]) -> Result<()> {
+    let mut conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM ctfd_solves", [])?;
+    for (team_id, user_id, challenge_name, solved_at) in rows {
+        if challenge_name.is_empty() { continue; }
+        tx.execute(
+            "INSERT INTO ctfd_solves (challenge_name, team_id, user_id, solved_at) VALUES (?1, ?2, ?3, ?4)",
+            params![challenge_name, team_id, user_id, solved_at],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Full-replace the ctfd_teams and ctfd_users caches.
+pub fn replace_ctfd_teams_and_users(
+    db: &Db,
+    teams: &[(i64, String)],
+    users: &[(i64, String, Option<i64>)],
+) -> Result<()> {
+    let mut conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM ctfd_teams", [])?;
+    for (id, name) in teams {
+        tx.execute("INSERT INTO ctfd_teams (id, name) VALUES (?1, ?2)", params![id, name])?;
+    }
+    tx.execute("DELETE FROM ctfd_users", [])?;
+    for (id, name, team_id) in users {
+        tx.execute(
+            "INSERT INTO ctfd_users (id, name, team_id) VALUES (?1, ?2, ?3)",
+            params![id, name, team_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Returns true if the team has a correct solve for the challenge, checking both
+/// the local flag_attempts log and the CTFd solve cache synced from MariaDB.
 pub fn has_correct_solve(db: &Db, challenge_name: &str, team_id: i64) -> Result<bool> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-    let count: i64 = conn.query_row(
+    let in_attempts: i64 = conn.query_row(
         "SELECT COUNT(*) FROM flag_attempts WHERE challenge_name = ?1 AND team_id = ?2 AND is_correct = 1",
         params![challenge_name, team_id],
         |row| row.get(0),
     )?;
-    Ok(count > 0)
+    if in_attempts > 0 {
+        return Ok(true);
+    }
+    let in_ctfd: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ctfd_solves WHERE challenge_name = ?1 AND team_id = ?2",
+        params![challenge_name, team_id],
+        |row| row.get(0),
+    )?;
+    Ok(in_ctfd > 0)
 }
 
-/// Returns one row per team+challenge that has a correct solve (earliest solve wins).
+/// Returns one row per team+challenge that has a correct solve, sourced from
+/// the ctfd_solves sync cache (so CTFd submission deletions are reflected).
+/// Filtered to only instance challenges tracked by the monitor.
 pub fn list_correct_solves(db: &Db) -> Result<Vec<Value>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT challenge_name, team_id, user_id, submitted_flag, MIN(timestamp) as timestamp
-         FROM flag_attempts WHERE is_correct = 1
-         GROUP BY challenge_name, team_id
-         ORDER BY timestamp DESC",
+        "SELECT s.challenge_name,
+                s.team_id, ct.name,
+                s.user_id, cu.name,
+                s.solved_at
+         FROM ctfd_solves s
+         JOIN instance_configs ic ON ic.challenge_name = s.challenge_name
+         LEFT JOIN ctfd_teams ct ON ct.id = s.team_id
+         LEFT JOIN ctfd_users cu ON cu.id = s.user_id
+         ORDER BY s.solved_at DESC",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(serde_json::json!({
             "challenge_name": row.get::<_, String>(0)?,
             "team_id": row.get::<_, i64>(1)?,
-            "user_id": row.get::<_, i64>(2)?,
-            "submitted_flag": row.get::<_, String>(3)?,
-            "timestamp": row.get::<_, String>(4)?,
+            "team_name": row.get::<_, Option<String>>(2)?,
+            "user_id": row.get::<_, Option<i64>>(3)?,
+            "user_name": row.get::<_, Option<String>>(4)?,
+            "timestamp": row.get::<_, Option<String>>(5)?,
         }))
     })?;
     let mut result = Vec::new();

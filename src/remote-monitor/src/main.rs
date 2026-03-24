@@ -105,11 +105,30 @@ async fn main() -> Result<()> {
         ctfd_uploads_dir,
     });
 
+    // Spawn background CTFd solve sync task (read-only from MariaDB → SQLite cache)
+    let sync_interval: u64 = env::var("CTFD_DB_SYNC_INTERVAL")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let sync_db = db.clone();
+    let sync_pool = state.ctfd_pool.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(sync_interval)).await;
+            if let Err(e) = ctfd_db::sync_solves(&sync_pool, &sync_db).await {
+                warn!("ctfd sync solves: {}", e);
+            }
+            if let Err(e) = ctfd_db::sync_users_and_teams(&sync_pool, &sync_db).await {
+                warn!("ctfd sync users/teams: {}", e);
+            }
+        }
+    });
+
     // Spawn background expiry task
     let expiry_state = Arc::clone(&state);
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+
+            // ── Expire tracked instances ──────────────────────────────────────
             match db::get_expired_instances(&expiry_state.db) {
                 Ok(expired) => {
                     for (challenge_name, container_id, team_id, ctfd_flag_id) in expired {
@@ -124,6 +143,16 @@ async fn main() -> Result<()> {
                     }
                 }
                 Err(e) => error!("expiry: db error: {}", e),
+            }
+
+            // ── Orphan cleanup: stop ctf-* compose projects not in DB ─────────
+            let tracked = db::get_all_container_ids(&expiry_state.db).unwrap_or_default();
+            let projects = instance::compose::list_ctf_projects().await;
+            for project in projects {
+                if !tracked.contains(&project) {
+                    info!("orphan: stopping untracked compose project {}", project);
+                    let _ = instance::compose::down(&project).await;
+                }
             }
         }
     });
@@ -819,6 +848,7 @@ async fn plugin_info_handler(
             "connection_type": inst.connection_type,
             "expires_at": inst.expires_at,
             "renewals_used": inst.renewals_used,
+            "container_id": inst.container_id,
         })).into_response(),
         Ok(None) => Json(json!({"status": "none"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -986,12 +1016,12 @@ async fn plugin_solve_handler(
     if !check_monitor_auth(&headers, &state.monitor_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
-    match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
+    match db::mark_instance_solved(&state.db, &body.challenge_name, body.team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
             if let Some(flag_id) = ctfd_flag_id {
                 ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
             }
-            // Record the correct solve. This happens after delete_instance() purges
+            // Record the correct solve. This happens after mark_instance_solved() purges
             // incorrect attempts, so the correct row is always persisted.
             if let (Some(flag), Some(uid)) = (&body.submitted_flag, body.user_id) {
                 if !flag.is_empty() {
@@ -1120,8 +1150,10 @@ async fn admin_instances_handler(
     if !check_monitor_auth(&headers, &state.monitor_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
-    match db::list_all_instances(&state.db) {
-        Ok(list) => Json(json!(list)).into_response(),
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db::list_all_instances(&db)).await {
+        Ok(Ok(list)) => Json(json!(list)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -1135,13 +1167,13 @@ async fn admin_attempts_handler(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     let alerts_only = params.get("alerts_only").map(|v| v == "true").unwrap_or(false);
-    let result = if alerts_only {
-        db::list_sharing_alerts(&state.db)
-    } else {
-        db::list_flag_attempts(&state.db, 200)
-    };
+    let db = Arc::clone(&state.db);
+    let result = tokio::task::spawn_blocking(move || {
+        if alerts_only { db::list_sharing_alerts(&db) } else { db::list_flag_attempts(&db, 200) }
+    }).await;
     match result {
-        Ok(list) => Json(json!(list)).into_response(),
+        Ok(Ok(list)) => Json(json!(list)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
@@ -1153,8 +1185,10 @@ async fn admin_solves_handler(
     if !check_monitor_auth(&headers, &state.monitor_token) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
-    match db::list_correct_solves(&state.db) {
-        Ok(list) => Json(json!(list)).into_response(),
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db::list_correct_solves(&db)).await {
+        Ok(Ok(list)) => Json(json!(list)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }

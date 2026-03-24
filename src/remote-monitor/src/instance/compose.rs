@@ -133,6 +133,30 @@ pub async fn up(
     Ok((host_port, project_name.to_string()))
 }
 
+/// List all running compose project names that start with `ctf-`.
+/// Used by the background expiry task to detect orphaned projects.
+pub async fn list_ctf_projects() -> Vec<String> {
+    let out = tokio::process::Command::new("docker")
+        .args(["compose", "ls", "--all", "--format", "json"])
+        .output()
+        .await;
+    let bytes = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return vec![],
+    };
+    // Output is a JSON array: [{"Name":"...","Status":"...","ConfigFiles":"..."}]
+    let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    parsed.as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|entry| entry["Name"].as_str().map(String::from))
+        .filter(|name| name.starts_with("ctf-"))
+        .collect()
+}
+
 /// Tear down a compose project.
 pub async fn down(project_name: &str) -> Result<()> {
     let status = compose_cmd().await

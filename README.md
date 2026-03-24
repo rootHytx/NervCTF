@@ -82,9 +82,7 @@ Priority (highest wins): CLI flags → env vars → `.nervctf.yml`
 
 | Variable | Description |
 |----------|-------------|
-| `CTFD_URL` | CTFd base URL |
-| `CTFD_API_KEY` | CTFd admin API key |
-| `MONITOR_URL` | Remote monitor URL (replaces direct CTFd access) |
+| `MONITOR_URL` | Remote monitor URL |
 | `MONITOR_TOKEN` | Monitor authentication token |
 
 ### `.nervctf.yml`
@@ -92,8 +90,6 @@ Priority (highest wins): CLI flags → env vars → `.nervctf.yml`
 Searched upward from `--base-dir`. Created by `nervctf setup`.
 
 ```yaml
-ctfd_url: https://ctfd.example.com
-ctfd_api_key: ctfd_...
 monitor_url: http://server:33133
 monitor_token: mysecret
 base_dir: ./challenges
@@ -279,10 +275,10 @@ instance:
 
 ## Remote Monitor
 
-The `remote-monitor` runs on the CTFd host. It keeps the CTFd admin key server-side, proxies API calls from the CLI, and manages instance lifecycle.
+The `remote-monitor` runs on the CTFd host. It is the sole point of contact with CTFd — writing directly to the MariaDB database — and manages instance lifecycle.
 
 ```
-CLI  ──Token<monitor>──▶  remote-monitor:33133  ──Token<ctfd>──▶  CTFd:8000
+CLI  ──Token<monitor>──▶  remote-monitor:33133  ──SQL──▶  CTFd MariaDB
                                 │
                           instance manager
                        (docker/compose/lxc/vagrant)
@@ -315,20 +311,24 @@ The dashboard shows three auto-refreshing tables:
 | Admin | `POST /api/v1/instance/build` | Upload Docker build context |
 | Admin | `POST /api/v1/instance/build-compose` | Upload Compose challenge context |
 | Admin | `POST /api/v1/instance/register` | Register challenge config |
+| Admin | `GET/POST/PATCH/DELETE /api/v1/challenges[/{id}]` | Challenge CRUD via SQL |
+| Admin | `GET/POST/DELETE /api/v1/flags[/{id}]` | Flag CRUD via SQL |
+| Admin | `GET/POST/DELETE /api/v1/hints[/{id}]` | Hint CRUD via SQL |
+| Admin | `GET/POST/DELETE /api/v1/tags[/{id}]` | Tag CRUD via SQL |
+| Admin | `GET/POST/DELETE /api/v1/files[/{id}]` | File CRUD via SQL + disk |
+| Admin | `POST /api/v1/topics` | Topic upsert via SQL |
 | Admin | `GET /api/v1/admin/instances` | JSON list of all active instances |
 | Admin | `GET /api/v1/admin/attempts` | JSON flag attempt log (`?alerts_only=true` for sharing only) |
 | Plugin | `POST /api/v1/plugin/attempt` | Record a flag submission + detect sharing |
 | Player | `POST /api/v1/instance/request` | Provision instance |
 | Player | `POST /api/v1/instance/renew` | Extend expiry |
 | Player | `DELETE /api/v1/instance/stop` | Destroy instance |
-| Proxy | `ANY /api/v1/*` | Transparent CTFd proxy |
 
 ---
 
 ## Troubleshooting
 
 - **No challenges found** — challenges must be at `challenges/<category>/<name>/challenge.yml`
-- **302 redirect to /login** — invalid API key, or CTFd Visibility is set to *Private* (Admin → Config → Visibility → set to *Public*)
 - **File upload 500** — fix with `chown -R 1001:1001 /path/to/CTFd/.data/CTFd/uploads`
 - **`state: Field may not be null`** — run `nervctf fix` to add missing `state` fields
 - **Monitor 401** — `MONITOR_TOKEN` mismatch between CLI and server

@@ -11,10 +11,9 @@
 NervCTF is a two-binary Rust + Python toolchain for managing CTF competitions on top of CTFd:
 
 1. **`nervctf`** (CLI) — reads `challenge.yml` files from a local directory tree, deploys/syncs
-   them to a CTFd instance via its REST API, and registers per-challenge instance configs with
-   the remote-monitor.
-2. **`remote-monitor`** (HTTP server) — runs on the CTFd host, manages ephemeral challenge
-   containers/VMs per team, and keeps the CTFd API key server-side so players never see it.
+   them to a CTFd instance via the remote-monitor, and registers per-challenge instance configs.
+2. **`remote-monitor`** (HTTP server) — runs on the CTFd host, writes all CTFd data directly
+   via MariaDB SQL, manages ephemeral challenge containers/VMs per team.
 3. **CTFd plugin** (`nervctf_instance`, Python) — installed inside CTFd; adds the `instance`
    challenge type and proxies player lifecycle requests to the remote-monitor.
 
@@ -115,14 +114,12 @@ the last cross-compiler from poisoning native builds.
 
 Priority (highest wins):
 1. CLI flags: `--monitor-url`, `--monitor-token`
-2. Env vars: `CTFD_URL`, `CTFD_API_KEY`, `MONITOR_URL`, `MONITOR_TOKEN`
+2. Env vars: `MONITOR_URL`, `MONITOR_TOKEN`
 3. `.nervctf.yml` / `.nervctf.yaml` (walked up from base_dir)
 
 **`Config` struct** (`utils.rs`):
 ```rust
 pub struct Config {
-    pub ctfd_url:         Option<String>,
-    pub ctfd_api_key:     Option<String>,
     pub monitor_url:      Option<String>,
     pub monitor_token:    Option<String>,
     pub base_dir:         Option<String>,
@@ -260,11 +257,13 @@ Commands:
 
 ### Deploy flow (key logic in `deploy_challenges`):
 
+All API calls go to `remote-monitor`, which executes them against CTFd MariaDB directly.
+
 1. Scan local `challenges/` tree → `Vec<Challenge>`
 2. `GET /api/v1/challenges` (paginated) → remote list
 3. For each local challenge:
-   - Not on remote → `create_challenge_phase1()` (POST to CTFd)
-   - On remote + `needs_update()` → `update_challenge_phase1()` (PATCH to CTFd)
+   - Not on remote → `create_challenge_phase1()` (POST /challenges → monitor → SQL INSERT)
+   - On remote + `needs_update()` → `update_challenge_phase1()` (PATCH /challenges/{id} → monitor → SQL UPDATE)
 4. After all base creates/updates: flags, tags, files, hints, requirements, state patches
 5. For `type: instance`:
    - Deploy to CTFd as `standard` or `dynamic` (based on `extra.initial` presence)
@@ -298,10 +297,13 @@ One request per file → CTFd returns 500. Matches ctfcli's `_create_all_files()
 ```rust
 pub struct CtfdClient {
     client: reqwest::Client,
-    base_url: String,
-    api_key: String,
+    base_url: String,   // {monitor_url}/api/v1
+    api_key: String,    // monitor_token (used as Authorization: Token <monitor_token>)
 }
 ```
+
+All API calls go to `remote-monitor`, which handles them via direct MariaDB SQL.
+The response shape is CTFd-compatible (`{"success": true, "data": ...}`).
 
 - `execute(method, path, body) → Result<Option<Value>>`
 - `get_challenges()` — paginated via `meta.pagination.next`; loops until no next page
@@ -323,11 +325,12 @@ Bridge via string conversion (`.as_str()` / `.as_bytes()`). Do not mix HeaderMap
 ### AppState
 ```rust
 pub struct AppState {
-    pub db: Db,                    // Arc<Mutex<Connection>>
+    pub db: Db,                    // Arc<Mutex<Connection>> (SQLite)
+    pub mysql_pool: Pool,          // mysql_async pool → CTFd MariaDB
     pub monitor_token: String,     // from MONITOR_TOKEN env var
-    pub ctfd_url: String,          // from CTFD_URL env var
-    pub ctfd_api_key: String,      // from CTFD_API_KEY env var
+    pub ctfd_url: String,          // from CTFD_URL env var (player token validation only)
     pub public_host: String,       // from PUBLIC_HOST env var
+    pub ctfd_uploads_dir: String,  // from CTFD_UPLOADS_DIR env var
     pub http_client: reqwest::Client,
 }
 ```
@@ -335,8 +338,9 @@ pub struct AppState {
 ### Environment variables consumed by remote-monitor
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `CTFD_URL` | `http://localhost:8000` | CTFd base URL (for proxy + token validation) |
-| `CTFD_API_KEY` | `""` | CTFd admin API key |
+| `CTFD_DB_URL` | `""` | MariaDB URL (`mysql://user:pass@host/db`) |
+| `CTFD_UPLOADS_DIR` | `""` | Absolute path to CTFd uploads dir (file writes) |
+| `CTFD_URL` | `http://localhost:8000` | CTFd base URL (player token validation only) |
 | `MONITOR_TOKEN` | `""` | Admin auth token for admin routes |
 | `PUBLIC_HOST` | `127.0.0.1` | Hostname returned to players in connection strings |
 | `MONITOR_PORT` | `33133` | TCP port to bind |
@@ -393,9 +397,18 @@ Three auto-refreshing tables:
 - `POST /api/v1/instance/renew` body: `{challenge_name}`
 - `DELETE /api/v1/instance/stop` body: `{challenge_name}`
 
-**Transparent CTFd proxy** (admin token):
-- `ANY /api/v1/diff`
-- `ANY /api/v1/*path` → forwards to CTFd with admin API key injected
+**CTFd data routes** (admin token — all via MariaDB SQL):
+- `GET/POST /api/v1/challenges` — list/create challenges
+- `GET/PATCH/DELETE /api/v1/challenges/{id}` — get/update/delete challenge
+- `GET/POST /api/v1/flags` — list/create flags
+- `DELETE /api/v1/flags/{id}`
+- `GET/POST /api/v1/hints` — list/create hints
+- `DELETE /api/v1/hints/{id}`
+- `GET/POST /api/v1/tags` — list/create tags
+- `DELETE /api/v1/tags/{id}`
+- `GET/POST /api/v1/files` — list/upload files (multipart; writes to `CTFD_UPLOADS_DIR`)
+- `DELETE /api/v1/files/{id}` — deletes file from DB + disk
+- `POST /api/v1/topics` — upsert topic
 
 ### Background expiry task
 Spawned at startup. Every 30 seconds: `get_expired_instances()` → for each, calls
@@ -603,9 +616,13 @@ services:
   remote-monitor:
     image: nervctf-monitor:latest
     restart: unless-stopped
+    networks:
+      - default
+      - internal        # joins CTFd's internal network to reach MariaDB
     environment:
+      - CTFD_DB_URL=mysql://ctfd:<db_password>@db/ctfd
+      - CTFD_UPLOADS_DIR=<ctfd_path>/.data/CTFd/uploads
       - CTFD_URL=http://ctfd:8000
-      - CTFD_API_KEY=<key>
       - MONITOR_TOKEN=<token>
       - PUBLIC_HOST=<ansible_host>
       - MONITOR_PORT=33133
@@ -615,12 +632,18 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
       - remote_monitor_data:/data
-      - /data/challenges:/data/challenges   # bind mount shadows named volume subdir
+      - /data/challenges:/data/challenges
+      - <ctfd_path>/.data/CTFd/uploads:<ctfd_path>/.data/CTFd/uploads
     ports:
       - "33133:33133"
+networks:
+  internal: {}
 volumes:
   remote_monitor_data:
 ```
+
+**Network note**: CTFd's `db` service is on an `internal: true` network. The override
+adds `remote-monitor` to that network so it can reach MariaDB at hostname `db`.
 
 **Critical path constraint**: `/data/challenges` must use identical absolute paths on the host
 and inside the monitor container. Challenge docker-compose.yml files reference files like
@@ -643,7 +666,6 @@ Interactive wizard:
 7. Locates `ctfd-plugin` dir (next to exe, or in workspace `src/nervctf/assets/ctfd-plugin/`)
 8. Writes playbook + inventory to tmpdir, runs `ansible-playbook`
 9. If `ansible-playbook` not in PATH: falls back to `nix develop <flake_dir> --command ansible-playbook`
-10. Prompts for CTFd API key; saves to config
 
 ---
 

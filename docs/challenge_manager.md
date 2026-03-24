@@ -28,7 +28,7 @@ src/challenge_manager/
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `client` | `CtfdClient` | Async API client for CTFd |
+| `client` | `CtfdClient` | Async API client (targets remote-monitor, which proxies to CTFd MariaDB) |
 | `base_path` | `PathBuf` | Root directory for local challenge files |
 | `requirements_queue` | `RequirementsQueue` | Dependency tracking for sync order |
 

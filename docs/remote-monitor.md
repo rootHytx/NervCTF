@@ -2,7 +2,7 @@
 
 The `remote-monitor` is an HTTP server that runs on the CTFd host. It:
 
-1. **Proxies** CLI requests to CTFd, keeping the CTFd admin key server-side
+1. **Manages** all CTFd data directly via MariaDB SQL (no HTTP proxy)
 2. **Manages** ephemeral challenge instances (containers/VMs) per team
 3. **Serves** a player-facing HTML UI for instance lifecycle
 
@@ -13,8 +13,8 @@ Deployed automatically by `nervctf setup`.
 ## Architecture
 
 ```
-CLI  ──Token<monitor>──▶  remote-monitor:33133  ──Token<ctfd>──▶  CTFd:8000
-                                │
+CLI  ──Token<monitor>──▶  remote-monitor:33133  ──SQL──▶  CTFd MariaDB
+                                │                    └──▶  CTFd uploads dir (files)
                      instance manager
                   ┌─────────────┴──────────────┐
                Docker          Compose         LXC
@@ -40,9 +40,10 @@ services:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CTFD_URL` | `http://localhost:8000` | CTFd instance URL |
-| `CTFD_API_KEY` | `""` | CTFd admin API key (injected into proxied requests) |
-| `MONITOR_TOKEN` | `""` | Token required on all admin/proxy routes |
+| `CTFD_DB_URL` | `""` | MariaDB connection URL (e.g. `mysql://user:pass@db/ctfd`) |
+| `CTFD_UPLOADS_DIR` | `""` | Absolute path to CTFd uploads dir (for file writes) |
+| `CTFD_URL` | `http://localhost:8000` | CTFd base URL (for player token validation only) |
+| `MONITOR_TOKEN` | `""` | Token required on all admin routes |
 | `PUBLIC_HOST` | `127.0.0.1` | Hostname returned to players in connection strings |
 | `MONITOR_PORT` | `33133` | TCP port to bind |
 | `DB_PATH` | `/data/monitor.db` | SQLite file path |
@@ -67,8 +68,17 @@ services:
 | `POST` | `/api/v1/instance/build-compose` | Upload Compose context (tar.gz); builds images |
 | `POST` | `/api/v1/instance/register` | Register challenge config |
 | `GET` | `/api/v1/instance/list` | List registered challenge configs |
-| `ANY` | `/api/v1/diff` | Diff helper |
-| `ANY` | `/api/v1/*` | Transparent CTFd proxy (injects CTFd API key) |
+| `GET/POST` | `/api/v1/challenges` | List or create challenges (SQL) |
+| `GET/PATCH/DELETE` | `/api/v1/challenges/{id}` | Get, update, or delete challenge (SQL) |
+| `GET/POST` | `/api/v1/flags` | List or create flags (SQL) |
+| `DELETE` | `/api/v1/flags/{id}` | Delete flag (SQL) |
+| `GET/POST` | `/api/v1/hints` | List or create hints (SQL) |
+| `DELETE` | `/api/v1/hints/{id}` | Delete hint (SQL) |
+| `GET/POST` | `/api/v1/tags` | List or create tags (SQL) |
+| `DELETE` | `/api/v1/tags/{id}` | Delete tag (SQL) |
+| `GET/POST` | `/api/v1/files` | List or upload files (SQL + disk) |
+| `DELETE` | `/api/v1/files/{id}` | Delete file record + disk (SQL) |
+| `POST` | `/api/v1/topics` | Upsert topic (SQL) |
 
 ### Plugin auth (admin token + explicit `team_id` — called by CTFd plugin)
 

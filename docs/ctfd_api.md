@@ -30,21 +30,19 @@ src/ctfd_api/
 |-------|------|-------------|
 | `client` | `reqwest::Client` | Async HTTP client |
 | `blocking_client` | `reqwest::blocking::Client` | Used by `post_file()` legacy callers |
-| `base_url` | `String` | CTFd base URL (trailing slash stripped) |
-| `api_key` | `String` | Stored for reference |
+| `base_url` | `String` | Monitor URL + `/api/v1` (trailing slash stripped) |
+| `api_key` | `String` | Monitor token (used as `Authorization: Token <monitor_token>`) |
 
 ### Construction
 
 ```rust
-pub fn new(base_url: &str, api_key: &str) -> Result<Self>
+pub fn new(monitor_url: &str, monitor_token: &str) -> Result<Self>
 ```
 
-- Sets `Authorization: Token <api_key>` as the only default header. `Content-Type` is intentionally
-  omitted at client level — JSON requests set it via `.json(body)`, multipart via `.multipart(form)`.
-  A global `Content-Type: application/json` causes 500 errors on CTFd's file upload endpoint.
+- `base_url = format!("{}/api/v1", monitor_url.trim_end_matches('/'))`
+- Sets `Authorization: Token <monitor_token>` as the only default header.
 - 10-second default timeout on both clients.
-- Redirect following disabled (`Policy::none()`). Authentication failures (CTFd 302 → `/login`)
-  surface as explicit errors instead of silently landing on an HTML page.
+- Redirect following disabled (`Policy::none()`).
 
 ### `request`
 
@@ -237,10 +235,10 @@ Kahn's topological sort over named dependency nodes. Used in `resolve_dependenci
 
 | Error message | Likely cause |
 |---------------|--------------|
-| `Empty response body from .../challenges` | CTFd not set up, or Visibility = Private |
-| `JSON parse error ... Body: <!DOCTYPE html>` | Redirect to login; invalid or expired API key |
-| `File upload failed (500)` | CTFd uploads directory not writable by UID 1001 |
-| `API error (POST /challenges): ...` | Malformed payload or unsupported challenge type |
+| `Empty response body from .../challenges` | Monitor not reachable or CTFD_DB_URL not set |
+| `API error 401` | Monitor token mismatch |
+| `File upload failed` | `CTFD_UPLOADS_DIR` not set or not writable by monitor process |
+| `API error (POST /challenges): ...` | Malformed payload or DB constraint violation |
 
 ---
 
@@ -257,4 +255,4 @@ Kahn's topological sort over named dependency nodes. Used in `resolve_dependenci
 
 - `src/nervctf/src/ctfd_api/client.rs`
 - `src/nervctf/src/ctfd_api/models/mod.rs`
-- [CTFd API Reference](https://docs.ctfd.io/docs/api/redoc/)
+- `src/remote-monitor/src/ctfd_db.rs` — SQL implementation of all API endpoints

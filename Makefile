@@ -1,22 +1,23 @@
 # NervCTF — Build & Release Targets
 #
-# Targets using `nix develop` (release-nix, release-musl, release-arm64,
-# release-windows, fmt, check, test) are fully self-contained — the flake
-# provides Rust, C cross-compilers, pkg-config, and OpenSSL automatically.
+# remote-monitor only runs on Linux servers — it is NOT built for ARM,
+# Windows, or macOS targets.  nervctf (the CLI) is built for every platform.
 #
-# macOS targets (release-macos, release-macos-arm) require a local toolchain
-# on an actual macOS machine — Apple's SDK is not redistributable and cannot
-# be cross-compiled from Linux:
+# All targets below use `nix develop` and are fully self-contained on NixOS —
+# the flake provides Rust, C cross-compilers (musl64, aarch64, mingw64),
+# pkg-config, and OpenSSL automatically.
+#
+# Exception: macOS targets require a local toolchain on an actual macOS machine
+# (Apple's SDK is not redistributable and cannot be cross-compiled from Linux):
 #   rustup target add x86_64-apple-darwin    (macOS only)
 #   rustup target add aarch64-apple-darwin   (macOS only)
-#
-# Linux and Windows cross-compilation (release-linux, release-musl,
-# release-arm64, release-windows) is fully handled by nix develop.
 
 .DEFAULT_GOAL := help
 
 BINARY_A  := nervctf
 BINARY_B  := remote-monitor
+
+NIX := nix develop .\# --command
 
 # ── Targets ───────────────────────────────────────────────────────────────────
 
@@ -35,74 +36,71 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "  Cross-compilation uses 'cross' when available (requires Docker)."
-	@echo "  Without cross, the Rust target must already be installed via rustup."
+	@echo "  Use 'make all' to build everything cross-compilable from NixOS."
 
-# ── Nix (recommended) ─────────────────────────────────────────────────────────
+# ── Nix (dev build) ───────────────────────────────────────────────────────────
 
-release-nix: ## [Nix] Release build inside nix dev shell — all deps bundled
-	nix develop .# --command cargo build --release
+release-nix: ## [Nix] Native release build — both binaries, no cross
+	$(NIX) cargo build --release
 	cp target/release/$(BINARY_A) .
 	cp target/release/$(BINARY_B) .
 
-# ── Linux ─────────────────────────────────────────────────────────────────────
+# ── Linux (both binaries) ─────────────────────────────────────────────────────
 
-release-linux: ## [Debian/Ubuntu/Fedora/Arch/RHEL] x86_64 Linux GNU binary
-	cargo build --release --target x86_64-unknown-linux-gnu
+release-linux: ## x86_64 Linux GNU — both binaries
+	$(NIX) cargo build --release --target x86_64-unknown-linux-gnu
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64
 	@upx --best dist/$(BINARY_A)-linux-x86_64 dist/$(BINARY_B)-linux-x86_64 2>/dev/null || true
-	@echo "→ dist/$(BINARY_A)-linux-x86_64"
+	@echo "→ dist/$(BINARY_A)-linux-x86_64  dist/$(BINARY_B)-linux-x86_64"
 
-release-musl: ## [Alpine/containers/any Linux] Static x86_64 binary — via nix develop
-	nix develop .# --command cargo build --release --target x86_64-unknown-linux-musl
+release-musl: ## x86_64 Linux musl static — both binaries
+	$(NIX) cargo build --release --target x86_64-unknown-linux-musl
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64-static
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64-static
 	@upx --best dist/$(BINARY_A)-linux-x86_64-static dist/$(BINARY_B)-linux-x86_64-static 2>/dev/null || true
-	@echo "→ dist/$(BINARY_A)-linux-x86_64-static"
+	@echo "→ dist/$(BINARY_A)-linux-x86_64-static  dist/$(BINARY_B)-linux-x86_64-static"
 
-release-arm64: ## [Raspberry Pi 4/5, AWS Graviton, Oracle ARM] aarch64 GNU — via nix develop
-	nix develop .# --command cargo build --release --target aarch64-unknown-linux-gnu
+# ── ARM (nervctf CLI only — remote-monitor is x86_64 Linux only) ──────────────
+
+release-arm64: ## aarch64 Linux GNU — nervctf CLI only
+	$(NIX) cargo build --release --target aarch64-unknown-linux-gnu -p nervctf
 	@mkdir -p dist
 	cp target/aarch64-unknown-linux-gnu/release/$(BINARY_A) dist/$(BINARY_A)-linux-aarch64
-	cp target/aarch64-unknown-linux-gnu/release/$(BINARY_B) dist/$(BINARY_B)-linux-aarch64
 	@echo "→ dist/$(BINARY_A)-linux-aarch64"
 
-all-linux: release-linux release-musl release-arm64 ## Build all Linux release targets
+# ── Windows (nervctf CLI only) ────────────────────────────────────────────────
 
-# ── macOS ─────────────────────────────────────────────────────────────────────
-
-release-macos: ## [macOS Intel] x86_64 Apple Darwin binary
-	cargo build --release --target x86_64-apple-darwin
-	@mkdir -p dist
-	cp target/x86_64-apple-darwin/release/$(BINARY_A) dist/$(BINARY_A)-macos-x86_64
-	cp target/x86_64-apple-darwin/release/$(BINARY_B) dist/$(BINARY_B)-macos-x86_64
-	@echo "→ dist/$(BINARY_A)-macos-x86_64"
-
-release-macos-arm: ## [macOS Apple Silicon] aarch64 Apple Darwin binary
-	cargo build --release --target aarch64-apple-darwin
-	@mkdir -p dist
-	cp target/aarch64-apple-darwin/release/$(BINARY_A) dist/$(BINARY_A)-macos-aarch64
-	cp target/aarch64-apple-darwin/release/$(BINARY_B) dist/$(BINARY_B)-macos-aarch64
-	@echo "→ dist/$(BINARY_A)-macos-aarch64"
-
-# ── Windows ───────────────────────────────────────────────────────────────────
-
-release-windows: ## [Windows] x86_64 GNU Windows binary — via nix develop (MinGW)
-	nix develop .# --command cargo build --release --target x86_64-pc-windows-gnu
+release-windows: ## x86_64 Windows GNU — nervctf CLI only (MinGW via nix develop)
+	$(NIX) cargo build --release --target x86_64-pc-windows-gnu -p nervctf
 	@mkdir -p dist
 	cp target/x86_64-pc-windows-gnu/release/$(BINARY_A).exe dist/$(BINARY_A)-windows-x86_64.exe
-	cp target/x86_64-pc-windows-gnu/release/$(BINARY_B).exe dist/$(BINARY_B)-windows-x86_64.exe
-	@upx --best dist/$(BINARY_A)-windows-x86_64.exe dist/$(BINARY_B)-windows-x86_64.exe 2>/dev/null || true
+	@upx --best dist/$(BINARY_A)-windows-x86_64.exe 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-windows-x86_64.exe"
 
-# ── All platforms ─────────────────────────────────────────────────────────────
+# ── macOS (nervctf CLI only — requires macOS machine) ────────────────────────
 
-all: all-linux release-windows ## Build all Linux + Windows targets (cross-compilable from Linux via nix develop)
+release-macos: ## x86_64 macOS — nervctf CLI only (must run on macOS)
+	cargo build --release --target x86_64-apple-darwin -p nervctf
+	@mkdir -p dist
+	cp target/x86_64-apple-darwin/release/$(BINARY_A) dist/$(BINARY_A)-macos-x86_64
+	@echo "→ dist/$(BINARY_A)-macos-x86_64"
 
-all-platforms: all release-macos release-macos-arm ## Build every target — macOS targets require running on macOS (Apple SDK not redistributable)
+release-macos-arm: ## aarch64 macOS — nervctf CLI only (must run on macOS)
+	cargo build --release --target aarch64-apple-darwin -p nervctf
+	@mkdir -p dist
+	cp target/aarch64-apple-darwin/release/$(BINARY_A) dist/$(BINARY_A)-macos-aarch64
+	@echo "→ dist/$(BINARY_A)-macos-aarch64"
+
+# ── Aggregate ─────────────────────────────────────────────────────────────────
+
+all-linux: release-linux release-musl ## Linux x86_64: GNU + musl static (both binaries)
+
+all: all-linux release-arm64 release-windows ## Everything buildable from NixOS (Linux + ARM + Windows CLI)
+
+all-platforms: all release-macos release-macos-arm ## All targets — macOS requires running on macOS
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
@@ -120,13 +118,13 @@ install-user: release-nix ## Install both binaries to ~/.local/bin (no sudo requ
 # ── Dev helpers ───────────────────────────────────────────────────────────────
 
 fmt: ## Format all crates with rustfmt
-	nix develop .# --command cargo fmt --all
+	$(NIX) cargo fmt --all
 
 check: ## Run cargo check on all workspace crates
-	nix develop .# --command cargo check --all
+	$(NIX) cargo check --all
 
 test: ## Run nervctf unit tests
-	nix develop .# --command cargo test -p nervctf
+	$(NIX) cargo test -p nervctf
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 

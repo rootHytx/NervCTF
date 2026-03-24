@@ -260,6 +260,24 @@
         group: docker
         mode: "0755"
 
+    # ── Read CTFd DB credentials for remote-monitor ────────────────────────────
+    - name: Read CTFd .env for database URL
+      slurp:
+        src: "{{ ctfd_path }}/.env"
+      register: ctfd_env_raw
+      failed_when: false
+
+    - name: Extract CTFD_DB_URL from CTFd .env
+      set_fact:
+        ctfd_db_url: >-
+          {{
+            (ctfd_env_raw.content | default('') | b64decode)
+            | regex_search('DATABASE_URL=([^\n\r]+)')
+            | regex_replace('^DATABASE_URL=', '')
+            | regex_replace('\+pymysql', '')
+            | default('mysql://ctfd:ctfd@db/ctfd', true)
+          }}
+
     # ── docker-compose override (monitor service + CTFd env) ───────────────────
     - name: Write docker-compose override
       when: monitor_token is defined
@@ -275,17 +293,21 @@
               image: nervctf-monitor:latest
               restart: unless-stopped
               environment:
-                - CTFD_URL=http://ctfd:8000
-                - CTFD_API_KEY={{ ctfd_api_key | default('') }}
+                - CTFD_DB_URL={{ ctfd_db_url }}
                 - MONITOR_TOKEN={{ monitor_token }}
                 - PUBLIC_HOST={{ ansible_host }}
                 - MONITOR_PORT={{ monitor_port }}
                 - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
                 - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
+                - CTFD_UPLOADS_DIR={{ ctfd_path }}/.data/CTFd/uploads
+              networks:
+                - default
+                - internal
               volumes:
                 - /var/run/docker.sock:/var/run/docker.sock
                 - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
                 - {{ ctfd_path }}/remote-monitor/data:{{ ctfd_path }}/remote-monitor/data
+                - {{ ctfd_path }}/.data/CTFd/uploads:{{ ctfd_path }}/.data/CTFd/uploads
               ports:
                 - "{{ monitor_port }}:{{ monitor_port }}"
         dest: "{{ ctfd_path }}/docker-compose.override.yml"

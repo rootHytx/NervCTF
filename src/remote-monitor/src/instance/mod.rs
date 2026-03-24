@@ -8,9 +8,8 @@ pub mod vagrant;
 use anyhow::{anyhow, Result};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use reqwest::Client;
 use serde_json::Value;
-use tracing::{info, warn};
+use mysql_async::Pool;
 use crate::db::Db;
 
 /// Generate a random flag for `flag_mode = "random"`, or return None for static/no flag.
@@ -27,80 +26,6 @@ pub fn generate_flag(config: &Value) -> Option<String> {
         .map(char::from)
         .collect();
     Some(format!("{}{}{}", prefix, random, suffix))
-}
-
-/// POST a flag to CTFd's /api/v1/flags and return the created flag ID.
-/// Returns None if CTFd rejects the request or the response can't be parsed.
-async fn post_flag_to_ctfd(
-    client: &Client,
-    ctfd_url: &str,
-    ctfd_api_key: &str,
-    challenge_id: i64,
-    flag: &str,
-) -> Option<i64> {
-    let resp = match client
-        .post(format!("{}/api/v1/flags", ctfd_url))
-        .header("Authorization", format!("Token {}", ctfd_api_key))
-        .json(&serde_json::json!({
-            "challenge_id": challenge_id,
-            "content":      flag,
-            "type":         "static",
-            "data":         "",
-        }))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("post_flag_to_ctfd: request failed for challenge {}: {}", challenge_id, e);
-            return None;
-        }
-    };
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        warn!("post_flag_to_ctfd: CTFd returned {} for challenge {}: {}", status, challenge_id, body);
-        return None;
-    }
-    let val: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("post_flag_to_ctfd: failed to parse response for challenge {}: {}", challenge_id, e);
-            return None;
-        }
-    };
-    let flag_id = val["data"]["id"].as_i64();
-    if flag_id.is_none() {
-        warn!("post_flag_to_ctfd: no id in response for challenge {}: {}", challenge_id, val);
-    } else {
-        info!("post_flag_to_ctfd: registered flag {} for challenge {}", flag_id.unwrap(), challenge_id);
-    }
-    flag_id
-}
-
-/// DELETE a flag from CTFd's /api/v1/flags/<id>. Errors are logged and swallowed.
-pub async fn delete_flag_from_ctfd(
-    client: &Client,
-    ctfd_url: &str,
-    ctfd_api_key: &str,
-    flag_id: i64,
-) {
-    let url = format!("{}/api/v1/flags/{}", ctfd_url, flag_id);
-    match client
-        .delete(&url)
-        .header("Authorization", format!("Token {}", ctfd_api_key))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-    {
-        Err(e) => warn!("delete_flag_from_ctfd: request failed for flag {}: {}", flag_id, e),
-        Ok(resp) if !resp.status().is_success() => {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!("delete_flag_from_ctfd: CTFd returned {} for flag {}: {}", status, flag_id, body);
-        }
-        Ok(_) => info!("delete_flag_from_ctfd: deleted flag {}", flag_id),
-    }
 }
 
 /// Sanitize a challenge name to a valid Docker name component.
@@ -144,7 +69,7 @@ pub async fn cleanup_container(container_id: &str) {
 
 /// Provision a new instance for a team.
 ///
-/// Generates a random flag (if `flag_mode = "random"`), registers it with CTFd,
+/// Generates a random flag (if `flag_mode = "random"`), registers it with CTFd's DB,
 /// starts the container, and persists everything in the DB.
 ///
 /// Returns `(host, port, connection_type, expires_at)`.
@@ -155,9 +80,7 @@ pub async fn provision(
     user_id: Option<i64>,
     config: &Value,
     public_host: &str,
-    http_client: &Client,
-    ctfd_url: &str,
-    ctfd_api_key: &str,
+    ctfd_pool: &Pool,
 ) -> Result<(String, u16, String, String)> {
     let backend = config["backend"].as_str().unwrap_or("docker");
     let internal_port = config["internal_port"].as_u64().unwrap_or(4000) as u32;
@@ -192,7 +115,7 @@ pub async fn provision(
             ).await?;
 
             let ctfd_flag_id = match (&flag, ctfd_id) {
-                (Some(f), Some(cid)) => post_flag_to_ctfd(http_client, ctfd_url, ctfd_api_key, cid, f).await,
+                (Some(f), Some(cid)) => crate::ctfd_db::create_flag(ctfd_pool, cid, f).await,
                 _ => None,
             };
 
@@ -241,7 +164,7 @@ pub async fn provision(
             ).await?;
 
             let ctfd_flag_id = match (&flag, ctfd_id) {
-                (Some(f), Some(cid)) => post_flag_to_ctfd(http_client, ctfd_url, ctfd_api_key, cid, f).await,
+                (Some(f), Some(cid)) => crate::ctfd_db::create_flag(ctfd_pool, cid, f).await,
                 _ => None,
             };
 
@@ -262,7 +185,7 @@ pub async fn provision(
             let cid = lxc::launch(lxc_image, &cname, host_port, internal_port, flag.as_deref()).await?;
 
             let ctfd_flag_id = match (&flag, ctfd_id) {
-                (Some(f), Some(cid_val)) => post_flag_to_ctfd(http_client, ctfd_url, ctfd_api_key, cid_val, f).await,
+                (Some(f), Some(cid_val)) => crate::ctfd_db::create_flag(ctfd_pool, cid_val, f).await,
                 _ => None,
             };
 

@@ -122,6 +122,17 @@ function renderConnectionInfo(connection, parent) {
         a.rel = "noopener noreferrer";
         parent.append(a, document.createElement("br"));
       });
+    } else if (connection.type === "https") {
+      Object.entries(connection.ports).forEach(function (entry) {
+        var ext = entry[1];
+        var portSuffix = ext && ext !== 443 ? ":" + ext : "";
+        var a = document.createElement("a");
+        a.href = "https://" + connection.host + portSuffix;
+        a.textContent = "https://" + connection.host + portSuffix;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        parent.append(a, document.createElement("br"));
+      });
     } else if (connection.type === "ssh") {
       Object.entries(connection.ports).forEach(function (entry) {
         var ext = entry[1];
@@ -165,8 +176,10 @@ function renderConnectionInfo(connection, parent) {
       parent.append(a);
     } else if (connection.type === "https") {
       var a = document.createElement("a");
-      a.href = "https://" + connection.host;
-      a.textContent = "https://" + connection.host;
+      var portSuffix = connection.port && connection.port !== 443
+        ? ":" + connection.port : "";
+      a.href = "https://" + connection.host + portSuffix;
+      a.textContent = "https://" + connection.host + portSuffix;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
       parent.append(a);

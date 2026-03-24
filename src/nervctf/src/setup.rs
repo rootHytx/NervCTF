@@ -184,10 +184,17 @@ pub fn run_setup() -> Result<()> {
     println!();
 
     // ── CHALLENGES BASE_DIR ────────────────────────────────────────────────────
-    let base_dir = prompt_with_default(
-        "Local challenges directory",
-        Some(config.base_dir.as_deref().unwrap_or(".")),
-    )?;
+    let base_dir = loop {
+        let input = prompt_with_default(
+            "Local challenges directory",
+            Some(config.base_dir.as_deref().unwrap_or(".")),
+        )?;
+        let p = std::path::Path::new(&input);
+        if p == std::path::Path::new(".") || p.is_dir() {
+            break input;
+        }
+        println!("  [!] '{}' is not an existing directory. Try again.", input);
+    };
 
     // ── TARGET_IP ──────────────────────────────────────────────────────────────
     let target_ip = {
@@ -297,7 +304,6 @@ pub fn run_setup() -> Result<()> {
             .default(false)
             .interact()?;
         if !redeploy {
-            prompt_and_save_api_key(&mut config, &config_path)?;
             println!("\nCTFd URL:      {}", ctfd_url);
             println!("Monitor URL:   {}", monitor_url);
             println!("Monitor Token: {}", monitor_token);
@@ -343,16 +349,10 @@ pub fn run_setup() -> Result<()> {
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
     }
-    if let Some(ref key) = config.ctfd_api_key {
-        evars.push(format!("ctfd_api_key={}", key));
-    }
-
     let inventory = format!("[ctfd]\n{} ansible_user={}\n", target_ip, target_user);
 
     println!("\nRunning Ansible playbook...");
     run_ansible_playbook(PLAYBOOK, &inventory, &evars)?;
-
-    prompt_and_save_api_key(&mut config, &config_path)?;
 
     println!("\nNervCTF setup complete!");
     println!("  CTFd URL:      {}", ctfd_url);
@@ -519,23 +519,3 @@ pub fn run_upgrade() -> Result<()> {
     Ok(())
 }
 
-/// Prompt for the CTFd API key and save it to config if provided.
-fn prompt_and_save_api_key(config: &mut crate::Config, config_path: &std::path::Path) -> Result<()> {
-    if config.ctfd_api_key.is_some() {
-        println!("\nCTFd API key already set in config.");
-        return Ok(());
-    }
-    println!("\nEnter your CTFd admin API key (leave blank to set it later):");
-    let key: String = Input::new()
-        .with_prompt("CTFd API key")
-        .allow_empty(true)
-        .interact_text()?;
-    if !key.trim().is_empty() {
-        config.ctfd_api_key = Some(key.trim().to_string());
-        save_config(config, config_path)?;
-        println!("  [ok] API key saved to {}", config_path.display());
-    } else {
-        println!("  Skipped. Set ctfd_api_key in {} when ready.", config_path.display());
-    }
-    Ok(())
-}

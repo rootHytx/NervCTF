@@ -16,13 +16,15 @@ pub struct CtfdClient {
 }
 
 impl CtfdClient {
-    pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
+    pub fn new(monitor_url: &str, monitor_token: &str) -> Result<Self> {
+        let base_url = monitor_url;
+        let api_key = monitor_token;
         // Content-Type omitted: json() sets it for JSON, multipart() sets it for uploads
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "Authorization",
             header::HeaderValue::from_str(&format!("Token {}", api_key))
-                .map_err(|e| anyhow!("Invalid API key: {}", e))?,
+                .map_err(|e| anyhow!("Invalid monitor token: {}", e))?,
         );
         headers.insert(
             "Accept",

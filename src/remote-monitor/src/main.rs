@@ -1,10 +1,21 @@
-//! Remote Monitor — CTFd API proxy + instance lifecycle manager
+//! Remote Monitor — CTFd SQL backend + instance lifecycle manager
 //!
 //! Routes:
 //!   GET  /health                         — liveness check (no auth)
 //!   GET  /admin                          — admin dashboard (monitor token via ?token= or header)
 //!   GET  /instance/:name                 — HTML player page
 //!   ANY  /api/v1/diff                    — local/remote diff (monitor token)
+//!   GET/POST   /api/v1/challenges        — list / create challenges (monitor token)
+//!   GET/PATCH/DELETE /api/v1/challenges/{id} — get / update / delete challenge (monitor token)
+//!   GET/POST   /api/v1/flags             — list (?challenge_id=N) / create flags (monitor token)
+//!   DELETE     /api/v1/flags/{id}        — delete flag (monitor token)
+//!   GET/POST   /api/v1/hints             — list / create hints (monitor token)
+//!   DELETE     /api/v1/hints/{id}        — delete hint (monitor token)
+//!   GET/POST   /api/v1/tags              — list / create tags (monitor token)
+//!   DELETE     /api/v1/tags/{id}         — delete tag (monitor token)
+//!   GET/POST   /api/v1/files             — list / upload files (monitor token)
+//!   DELETE     /api/v1/files/{id}        — delete file (monitor token)
+//!   POST       /api/v1/topics            — create topic (monitor token)
 //!   POST /api/v1/instance/build          — build Docker image (monitor token)
 //!   POST /api/v1/instance/build-compose  — upload+extract compose dir + pre-build images (monitor token)
 //!   POST /api/v1/instance/register       — register instance config (monitor token)
@@ -17,18 +28,17 @@
 //!   GET  /api/v1/instance/info           — get own instance (CTFd user token)
 //!   POST /api/v1/instance/renew          — extend timeout (CTFd user token)
 //!   DELETE /api/v1/instance/stop         — destroy instance (CTFd user token)
-//!   ANY  /api/v1/*path                   — transparent proxy to CTFd (monitor token)
 //!
 //! Environment variables:
-//!   CTFD_URL       — CTFd URL reachable from within the Docker network
-//!                    (e.g. http://ctfd:8000 when running as a compose service)
-//!   CTFD_API_KEY   — CTFd admin token (required)
-//!   MONITOR_TOKEN  — admin token for nervctf CLI (required)
-//!   PUBLIC_HOST    — hostname/IP returned in instance connection info (required)
-//!   MONITOR_PORT   — bind port (default: 33133)
-//!   MONITOR_BIND   — bind address (default: 0.0.0.0)
-//!   DB_PATH        — SQLite database path (default: ./monitor.db)
+//!   CTFD_DB_URL        — MariaDB connection string (required)
+//!   CTFD_UPLOADS_DIR   — Path to CTFd uploads directory for file writes (optional)
+//!   MONITOR_TOKEN      — admin token for nervctf CLI (required)
+//!   PUBLIC_HOST        — hostname/IP returned in instance connection info (required)
+//!   MONITOR_PORT       — bind port (default: 33133)
+//!   MONITOR_BIND       — bind address (default: 0.0.0.0)
+//!   DB_PATH            — SQLite database path (default: ./monitor.db)
 
+mod ctfd_db;
 mod db;
 mod instance;
 
@@ -36,15 +46,13 @@ use anyhow::Result;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 use axum::{
-    body::Body,
-    extract::{Multipart, Path, Request, State},
+    extract::{Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
-    routing::{any, delete, get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use bytes::Bytes;
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -55,17 +63,14 @@ use db::Db;
 
 #[derive(Clone)]
 struct AppState {
-    ctfd_url: String,
-    ctfd_api_key: String,
     monitor_token: String,
     public_host: String,
-    http_client: Client,
     db: Db,
+    ctfd_pool: mysql_async::Pool,
     /// Host-visible directory where compose challenge sources are stored.
-    /// Must be bind-mounted at the same path inside the container so that the
-    /// host Docker daemon (accessed via /var/run/docker.sock) can reach the
-    /// build context during `docker compose build`.
     challenges_base_dir: String,
+    /// Path to CTFd uploads directory for file writes (empty string if not set).
+    ctfd_uploads_dir: String,
 }
 
 #[tokio::main]
@@ -77,8 +82,6 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let ctfd_url = env::var("CTFD_URL").expect("CTFD_URL is required");
-    let ctfd_api_key = env::var("CTFD_API_KEY").expect("CTFD_API_KEY is required");
     let monitor_token = env::var("MONITOR_TOKEN").expect("MONITOR_TOKEN is required");
     let public_host = env::var("PUBLIC_HOST").expect("PUBLIC_HOST is required");
     let port = env::var("MONITOR_PORT").unwrap_or_else(|_| "33133".to_string());
@@ -86,20 +89,20 @@ async fn main() -> Result<()> {
     let db_path = env::var("DB_PATH").unwrap_or_else(|_| "./monitor.db".to_string());
     let challenges_base_dir = env::var("CHALLENGES_BASE_DIR")
         .unwrap_or_else(|_| "/opt/nervctf/challenges".to_string());
+    let ctfd_uploads_dir = env::var("CTFD_UPLOADS_DIR").unwrap_or_default();
+
+    let ctfd_db_url = env::var("CTFD_DB_URL").expect("CTFD_DB_URL is required");
 
     let db = db::open(&db_path)?;
-    let http_client = Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    let ctfd_pool = ctfd_db::create_pool(&ctfd_db_url)?;
 
     let state = Arc::new(AppState {
-        ctfd_url: ctfd_url.trim_end_matches('/').to_string(),
-        ctfd_api_key,
         monitor_token,
         public_host,
-        http_client,
         db: db.clone(),
+        ctfd_pool,
         challenges_base_dir,
+        ctfd_uploads_dir,
     });
 
     // Spawn background expiry task
@@ -113,12 +116,7 @@ async fn main() -> Result<()> {
                         info!("expiry: cleaning up {}/{}", challenge_name, team_id);
                         let _ = db::delete_instance(&expiry_state.db, &challenge_name, team_id);
                         if let Some(flag_id) = ctfd_flag_id {
-                            instance::delete_flag_from_ctfd(
-                                &expiry_state.http_client,
-                                &expiry_state.ctfd_url,
-                                &expiry_state.ctfd_api_key,
-                                flag_id,
-                            ).await;
+                            ctfd_db::delete_flag(&expiry_state.ctfd_pool, flag_id).await;
                         }
                         if let Some(cid) = container_id {
                             instance::cleanup_container(&cid).await;
@@ -132,14 +130,30 @@ async fn main() -> Result<()> {
 
     let addr = format!("{}:{}", bind, port);
     info!("Starting remote-monitor on {}", addr);
-    info!("CTFD_URL={}", state.ctfd_url);
     info!("PUBLIC_HOST={}", state.public_host);
 
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/admin", get(admin_dashboard_handler))
         .route("/instance/{name}", get(instance_page_handler))
-        .route("/api/v1/diff", any(diff_handler))
+        .route("/api/v1/diff", get(diff_handler).post(diff_handler).patch(diff_handler).delete(diff_handler))
+        // CTFd challenge CRUD (monitor token — used by nervctf CLI)
+        .route("/api/v1/challenges", get(ctfd_challenges_list).post(ctfd_challenge_create))
+        .route("/api/v1/challenges/{id}", get(ctfd_challenge_get).patch(ctfd_challenge_update).delete(ctfd_challenge_delete))
+        // Flags
+        .route("/api/v1/flags", get(ctfd_flags_list).post(ctfd_flag_create))
+        .route("/api/v1/flags/{id}", delete(ctfd_flag_delete))
+        // Hints
+        .route("/api/v1/hints", get(ctfd_hints_list).post(ctfd_hint_create))
+        .route("/api/v1/hints/{id}", delete(ctfd_hint_delete))
+        // Tags
+        .route("/api/v1/tags", get(ctfd_tags_list).post(ctfd_tag_create))
+        .route("/api/v1/tags/{id}", delete(ctfd_tag_delete))
+        // Files
+        .route("/api/v1/files", get(ctfd_files_list).post(ctfd_files_upload))
+        .route("/api/v1/files/{id}", delete(ctfd_file_delete))
+        // Topics
+        .route("/api/v1/topics", post(ctfd_topic_create))
         // Admin routes (monitor token)
         .route("/api/v1/instance/build", post(instance_build_handler))
         .route("/api/v1/instance/build-compose", post(build_compose_handler))
@@ -161,8 +175,6 @@ async fn main() -> Result<()> {
         .route("/api/v1/instance/info", get(instance_info_handler))
         .route("/api/v1/instance/renew", post(instance_renew_handler))
         .route("/api/v1/instance/stop", delete(instance_stop_handler))
-        // Fallthrough proxy — must be last
-        .route("/api/v1/*path", any(proxy_handler))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -182,23 +194,12 @@ fn check_monitor_auth(headers: &HeaderMap, expected_token: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Validate a CTFd user token and return team_id by calling GET /api/v1/users/me
+/// Validate a CTFd user token and return team_id via direct MariaDB lookup.
 async fn validate_ctfd_token(
-    http_client: &Client,
-    ctfd_url: &str,
+    pool: &mysql_async::Pool,
     token: &str,
 ) -> Option<i64> {
-    let resp = http_client
-        .get(format!("{}/api/v1/users/me", ctfd_url))
-        .header("Authorization", format!("Token {}", token))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let val: Value = resp.json().await.ok()?;
-    val["data"]["team_id"].as_i64()
+    ctfd_db::validate_token(pool, token).await
 }
 
 fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
@@ -624,7 +625,7 @@ async fn instance_request_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.http_client, &state.ctfd_url, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token or not in a team"}))).into_response(),
     };
@@ -655,7 +656,7 @@ async fn instance_request_handler(
 
     match instance::provision(
         &state.db, &body.challenge_name, team_id, None, &config, &state.public_host,
-        &state.http_client, &state.ctfd_url, &state.ctfd_api_key,
+        &state.ctfd_pool,
     ).await {
         Ok((host, port, conn, expires_at)) => Json(json!({
             "host": host,
@@ -679,7 +680,7 @@ async fn instance_info_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.http_client, &state.ctfd_url, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token"}))).into_response(),
     };
@@ -715,7 +716,7 @@ async fn instance_renew_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.http_client, &state.ctfd_url, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token"}))).into_response(),
     };
@@ -763,7 +764,7 @@ async fn instance_stop_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response(),
     };
 
-    let team_id = match validate_ctfd_token(&state.http_client, &state.ctfd_url, &token).await {
+    let team_id = match validate_ctfd_token(&state.ctfd_pool, &token).await {
         Some(id) => id,
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token"}))).into_response(),
     };
@@ -774,9 +775,7 @@ async fn instance_stop_handler(
                 instance::cleanup_container(&cid).await;
             }
             if let Some(flag_id) = ctfd_flag_id {
-                instance::delete_flag_from_ctfd(
-                    &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
-                ).await;
+                ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
             }
             Json(json!({"ok": true})).into_response()
         }
@@ -879,7 +878,7 @@ async fn plugin_request_handler(
     info!("plugin_request: provisioning '{}' for team {}", body.challenge_name, body.team_id);
     match instance::provision(
         &state.db, &body.challenge_name, body.team_id, body.user_id, &config, &state.public_host,
-        &state.http_client, &state.ctfd_url, &state.ctfd_api_key,
+        &state.ctfd_pool,
     ).await {
         Ok((host, port, conn, expires_at)) => {
             info!("plugin_request: provisioned {}:{} ({})", host, port, conn);
@@ -951,11 +950,8 @@ async fn plugin_stop_handler(
     }
     match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
-            // Delete CTFd flag synchronously first — fast HTTP call, must happen before response.
             if let Some(flag_id) = ctfd_flag_id {
-                instance::delete_flag_from_ctfd(
-                    &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
-                ).await;
+                ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
             }
             // Container teardown in background — compose down is slow.
             if let Some(cid) = container_id {
@@ -992,11 +988,8 @@ async fn plugin_solve_handler(
     }
     match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
-            // Delete CTFd flag synchronously first — fast HTTP call, must happen before response.
             if let Some(flag_id) = ctfd_flag_id {
-                instance::delete_flag_from_ctfd(
-                    &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
-                ).await;
+                ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
             }
             // Record the correct solve. This happens after delete_instance() purges
             // incorrect attempts, so the correct row is always persisted.
@@ -1039,9 +1032,7 @@ async fn plugin_stop_all_handler(
                     instance::cleanup_container(&cid).await;
                 }
                 if let Some(flag_id) = ctfd_flag_id {
-                    instance::delete_flag_from_ctfd(
-                        &state.http_client, &state.ctfd_url, &state.ctfd_api_key, flag_id,
-                    ).await;
+                    ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
                 }
             }
             Json(json!({"ok": true})).into_response()
@@ -1190,20 +1181,10 @@ async fn diff_handler(
         }
     };
 
-    let resp = state
-        .http_client
-        .get(format!("{}/api/v1/challenges", state.ctfd_url))
-        .header("Authorization", format!("Token {}", state.ctfd_api_key))
-        .send()
-        .await;
-
-    let remote_challenges = match resp {
-        Ok(r) => {
-            let data: Value = r.json().await.unwrap_or_default();
-            data["data"].as_array().cloned().unwrap_or_default()
-        }
+    let remote_challenges = match ctfd_db::list_challenges(&state.ctfd_pool).await {
+        Ok(v) => v,
         Err(e) => {
-            return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Failed to reach CTFd: {}", e)}))).into_response();
+            return (StatusCode::BAD_GATEWAY, Json(json!({"error": format!("Failed to query CTFd DB: {}", e)}))).into_response();
         }
     };
 
@@ -1252,96 +1233,371 @@ async fn diff_handler(
     .into_response()
 }
 
-// ── Proxy handler ─────────────────────────────────────────────────────────────
+// ── CTFd challenge CRUD handlers ──────────────────────────────────────────────
 
-async fn proxy_handler(
+fn ctfd_ok(data: Value) -> Response {
+    Json(json!({"success": true, "data": data})).into_response()
+}
+
+fn ctfd_list(data: Vec<Value>) -> Response {
+    Json(json!({"success": true, "data": data, "meta": {"pagination": {"next": null}}})).into_response()
+}
+
+fn ctfd_err(status: StatusCode, msg: &str) -> Response {
+    (status, Json(json!({"success": false, "errors": {"message": msg}}))).into_response()
+}
+
+fn ctfd_deleted() -> Response {
+    Json(json!({"success": true})).into_response()
+}
+
+async fn ctfd_challenges_list(
     State(state): State<Arc<AppState>>,
-    Path(path): Path<String>,
-    request: Request,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(request.headers(), &state.monitor_token) {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::list_challenges_full(&state.ctfd_pool).await {
+        Ok(list) => ctfd_list(list),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_challenge_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::create_challenge(&state.ctfd_pool, &body).await {
+        Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_challenge_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::get_challenge_full(&state.ctfd_pool, id).await {
+        Ok(Some(v)) => ctfd_ok(v),
+        Ok(None) => ctfd_err(StatusCode::NOT_FOUND, "Challenge not found"),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_challenge_update(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::update_challenge(&state.ctfd_pool, id, &body).await {
+        Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_challenge_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::delete_challenge(&state.ctfd_pool, id).await {
+        Ok(()) => ctfd_deleted(),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ── Flags ─────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct ChallengeIdQuery {
+    challenge_id: Option<i64>,
+}
+
+async fn ctfd_flags_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<ChallengeIdQuery>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let cid = match params.challenge_id {
+        Some(id) => id,
+        None => return ctfd_err(StatusCode::BAD_REQUEST, "missing challenge_id"),
+    };
+    match ctfd_db::list_flags(&state.ctfd_pool, cid).await {
+        Ok(list) => ctfd_list(list),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_flag_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::create_flag_full(&state.ctfd_pool, &body).await {
+        Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_flag_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::delete_flag_by_id(&state.ctfd_pool, id).await {
+        Ok(()) => ctfd_deleted(),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ── Hints ─────────────────────────────────────────────────────────────────────
+
+async fn ctfd_hints_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<ChallengeIdQuery>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let cid = match params.challenge_id {
+        Some(id) => id,
+        None => return ctfd_err(StatusCode::BAD_REQUEST, "missing challenge_id"),
+    };
+    match ctfd_db::list_hints(&state.ctfd_pool, cid).await {
+        Ok(list) => ctfd_list(list),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_hint_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::create_hint(&state.ctfd_pool, &body).await {
+        Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_hint_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::delete_hint(&state.ctfd_pool, id).await {
+        Ok(()) => ctfd_deleted(),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ── Tags ──────────────────────────────────────────────────────────────────────
+
+async fn ctfd_tags_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<ChallengeIdQuery>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let cid = match params.challenge_id {
+        Some(id) => id,
+        None => return ctfd_err(StatusCode::BAD_REQUEST, "missing challenge_id"),
+    };
+    match ctfd_db::list_tags(&state.ctfd_pool, cid).await {
+        Ok(list) => ctfd_list(list),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_tag_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::create_tag(&state.ctfd_pool, &body).await {
+        Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_tag_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::delete_tag(&state.ctfd_pool, id).await {
+        Ok(()) => ctfd_deleted(),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ── Files ─────────────────────────────────────────────────────────────────────
+
+async fn ctfd_files_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<ChallengeIdQuery>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let cid = match params.challenge_id {
+        Some(id) => id,
+        None => return ctfd_err(StatusCode::BAD_REQUEST, "missing challenge_id"),
+    };
+    match ctfd_db::list_files(&state.ctfd_pool, cid).await {
+        Ok(list) => ctfd_list(list),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_files_upload(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
-    let method_str = request.method().as_str().to_string();
-    let req_method =
-        reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
-    info!("proxy: {} /api/v1/{}{}", method_str, path, request.uri().query().map(|q| format!("?{}", q)).unwrap_or_default());
+    let mut challenge_id: Option<i64> = None;
+    let mut file_type = "challenge".to_string();
+    let mut file_parts: Vec<(String, Vec<u8>)> = Vec::new();
 
-    let query = request
-        .uri()
-        .query()
-        .map(|q| format!("?{}", q))
-        .unwrap_or_default();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name() {
+            Some("challenge_id") => {
+                challenge_id = field.text().await.ok().and_then(|s| s.parse().ok());
+            }
+            Some("type") => {
+                file_type = field.text().await.unwrap_or_else(|_| "challenge".to_string());
+            }
+            Some("file") => {
+                let fname = field.file_name().unwrap_or("upload").to_string();
+                if let Ok(bytes) = field.bytes().await {
+                    file_parts.push((fname, bytes.to_vec()));
+                }
+            }
+            _ => {}
+        }
+    }
 
-    let ctfd_url = format!("{}/api/v1/{}{}", state.ctfd_url, path, query);
-    let req_headers = request.headers().clone();
-
-    let body_bytes = match axum::body::to_bytes(request.into_body(), 100 * 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "Failed to read request body").into_response(),
+    let cid = match challenge_id {
+        Some(id) => id,
+        None => return ctfd_err(StatusCode::BAD_REQUEST, "missing challenge_id"),
     };
 
-    let mut req_builder = state
-        .http_client
-        .request(req_method, &ctfd_url)
-        .header("Authorization", format!("Token {}", state.ctfd_api_key));
-
-    for (name, value) in &req_headers {
-        let name_lower = name.as_str().to_lowercase();
-        if name_lower == "authorization" || name_lower == "host" || name_lower == "content-length" {
-            continue;
-        }
-        if let Ok(val) = value.to_str() {
-            req_builder = req_builder.header(name.as_str(), val);
-        }
+    if file_parts.is_empty() {
+        return ctfd_err(StatusCode::BAD_REQUEST, "no files provided");
     }
 
-    if !body_bytes.is_empty() {
-        req_builder = req_builder.body(body_bytes.to_vec());
-    }
+    let mut results: Vec<Value> = Vec::new();
 
-    match req_builder.send().await {
-        Ok(resp) => {
-            let status_u16 = resp.status().as_u16();
-            let status = StatusCode::from_u16(status_u16).unwrap_or(StatusCode::BAD_GATEWAY);
+    for (filename, bytes) in file_parts {
+        let uuid: String = {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            (0..16).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
+        };
+        let location = format!("{}/{}", uuid, filename);
 
-            let resp_header_pairs: Vec<(String, Vec<u8>)> = resp
-                .headers()
-                .iter()
-                .map(|(n, v)| (n.as_str().to_string(), v.as_bytes().to_vec()))
-                .collect();
-
-            let resp_body = match resp.bytes().await {
-                Ok(b) => b,
-                Err(_) => return (StatusCode::BAD_GATEWAY, "Failed to read CTFd response").into_response(),
-            };
-
-            if status_u16 >= 400 {
-                warn!("proxy: upstream {} for {} — body: {}", status_u16, ctfd_url,
-                    std::str::from_utf8(&resp_body).unwrap_or("<binary>").chars().take(200).collect::<String>());
+        if !state.ctfd_uploads_dir.is_empty() {
+            let dir = format!("{}/{}", state.ctfd_uploads_dir.trim_end_matches('/'), uuid);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                warn!("ctfd_files_upload: create dir {}: {}", dir, e);
             } else {
-                info!("proxy: upstream {} for {}", status_u16, ctfd_url);
-            }
-
-            let mut builder = Response::builder().status(status);
-            for (name_str, value_bytes) in &resp_header_pairs {
-                let name_lower = name_str.to_lowercase();
-                if name_lower == "transfer-encoding" || name_lower == "connection" {
-                    continue;
-                }
-                if let (Ok(n), Ok(v)) = (
-                    axum::http::HeaderName::from_bytes(name_str.as_bytes()),
-                    axum::http::HeaderValue::from_bytes(value_bytes),
-                ) {
-                    builder = builder.header(n, v);
+                let fpath = format!("{}/{}", dir, filename);
+                if let Err(e) = std::fs::write(&fpath, &bytes) {
+                    warn!("ctfd_files_upload: write {}: {}", fpath, e);
                 }
             }
-
-            builder.body(Body::from(resp_body)).unwrap_or_else(|_| {
-                (StatusCode::INTERNAL_SERVER_ERROR, "Response build error").into_response()
-            })
         }
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response(),
+
+        match ctfd_db::create_file_record(&state.ctfd_pool, cid, &file_type, &location).await {
+            Ok(id) => results.push(json!({"id": id, "location": location, "type": file_type})),
+            Err(e) => return ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        }
+    }
+
+    Json(json!({"success": true, "data": results})).into_response()
+}
+
+async fn ctfd_file_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::delete_file_record(&state.ctfd_pool, id).await {
+        Ok(Some(location)) => {
+            if !state.ctfd_uploads_dir.is_empty() {
+                let fpath = format!("{}/{}", state.ctfd_uploads_dir.trim_end_matches('/'), location);
+                let _ = std::fs::remove_file(&fpath);
+                if let Some(parent) = std::path::Path::new(&fpath).parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            }
+            ctfd_deleted()
+        }
+        Ok(None) => ctfd_deleted(),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ── Topics ────────────────────────────────────────────────────────────────────
+
+async fn ctfd_topic_create(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::create_topic(&state.ctfd_pool, &body).await {
+        Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

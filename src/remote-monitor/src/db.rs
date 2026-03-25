@@ -252,6 +252,27 @@ pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Optio
     }
 }
 
+/// Insert a placeholder row with status='provisioning' so the info endpoint can
+/// return status immediately while compose runs in the background.
+/// Uses INSERT OR IGNORE so a concurrent retry doesn't clobber an existing row.
+pub fn insert_provisioning_stub(
+    db: &Db,
+    challenge_name: &str,
+    team_id: i64,
+    user_id: Option<i64>,
+    host: &str,
+    connection_type: &str,
+    expires_at: &str,
+) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute(
+        "INSERT OR IGNORE INTO instances (challenge_name, team_id, user_id, host, port, connection_type, status, expires_at)
+         VALUES (?1, ?2, ?3, ?4, 0, ?5, 'provisioning', ?6)",
+        params![challenge_name, team_id, user_id, host, connection_type, expires_at],
+    )?;
+    Ok(())
+}
+
 pub fn insert_instance(
     db: &Db,
     challenge_name: &str,
@@ -529,7 +550,23 @@ pub fn list_sharing_alerts(db: &Db) -> Result<Vec<Value>> {
     Ok(result)
 }
 
-/// Returns true if the team already has a correct solve recorded for this challenge.
+/// Reverts instances from status='solved' back to 'running' when the corresponding
+/// CTFd submission no longer exists in the ctfd_solves cache (i.e. was deleted in CTFd).
+pub fn revert_unsolved_instances(db: &Db) -> Result<usize> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n = conn.execute(
+        "UPDATE instances SET status='running'
+         WHERE status='solved'
+         AND NOT EXISTS (
+           SELECT 1 FROM ctfd_solves cs
+           WHERE cs.challenge_name = instances.challenge_name
+           AND cs.team_id = instances.team_id
+         )",
+        [],
+    )?;
+    Ok(n)
+}
+
 /// Full-replace the ctfd_solves cache with the current snapshot from MariaDB.
 /// Any rows not in `rows` (i.e. deleted submissions) are removed.
 pub fn replace_ctfd_solves(db: &Db, rows: &[(i64, Option<i64>, String, String)]) -> Result<()> {

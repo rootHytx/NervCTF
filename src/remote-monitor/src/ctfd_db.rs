@@ -681,6 +681,11 @@ pub async fn sync_solves(pool: &Pool, db: &Db) -> Result<()> {
     let n = rows.len();
     crate::db::replace_ctfd_solves(db, &rows)
         .map_err(|e| anyhow!("ctfd_db: sync_solves: sqlite: {}", e))?;
+    let reverted = crate::db::revert_unsolved_instances(db)
+        .map_err(|e| anyhow!("ctfd_db: sync_solves: revert: {}", e))?;
+    if reverted > 0 {
+        tracing::info!("ctfd_db: sync_solves: reverted {} instance(s) to running (solve deleted in CTFd)", reverted);
+    }
     tracing::debug!("ctfd_db: sync_solves: replaced with {} rows", n);
     Ok(())
 }

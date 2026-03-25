@@ -402,11 +402,17 @@ def get_instance_info(challenge_id):
             allow_redirects=False,
         )
         data = _monitor_json(resp)
-        if data.get("status") == "running":
+        status = data.get("status", "")
+        if status == "running":
             return {
                 "status": "running",
                 "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
                 "connection": _to_connection(data),
+            }, 200
+        if status == "provisioning":
+            return {
+                "status": "provisioning",
+                "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
             }, 200
         return data, resp.status_code
     except Exception as e:
@@ -443,11 +449,16 @@ def request_instance():
                 "team_id": team_id,
                 "user_id": user.id if user else None,
             },
-            timeout=60,
+            timeout=15,
             allow_redirects=False,
         )
         data = _monitor_json(resp)
         if resp.ok and not data.get("error"):
+            if data.get("status") == "provisioning":
+                return {
+                    "status": "provisioning",
+                    "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
+                }, 200
             return {
                 "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
                 "connection": _to_connection(data),

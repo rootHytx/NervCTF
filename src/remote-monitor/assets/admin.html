@@ -8,16 +8,28 @@
   * { box-sizing: border-box; }
   body { font-family: monospace; background: #111; color: #ddd; margin: 0; padding: 20px; }
   h1 { color: #eee; font-size: 1.4rem; margin-bottom: 0.2rem; }
-  h2 { font-size: 1.1rem; margin: 1.8rem 0 0.6rem; color: #bbb; border-bottom: 1px solid #333; padding-bottom: 4px; }
+  h2 { font-size: 1.1rem; margin: 1.8rem 0 0.5rem; color: #bbb; border-bottom: 1px solid #333; padding-bottom: 4px; }
   #token-info { font-size: 0.8rem; color: #666; margin-bottom: 1rem; }
   .status { font-size: 0.8rem; color: #888; margin-bottom: 0.4rem; }
-  .toolbar { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.4rem; font-size: 0.82rem; }
+  .section-hdr { display: flex; align-items: baseline; gap: 1rem; }
+  .count-badge { font-size: 0.75rem; background: #333; color: #aaa; padding: 1px 6px; border-radius: 2px; }
+  #alerts-count-badge { background: #5a2020; color: #ffaaaa; }
+  .toolbar {
+    display: flex; align-items: center; gap: 0.5rem;
+    margin-bottom: 0.4rem; font-size: 0.82rem; flex-wrap: wrap;
+  }
   .toolbar label { color: #888; }
-  .toolbar select, .toolbar input[type=number] {
+  .toolbar select {
     background: #1e1e1e; border: 1px solid #444; color: #ccc;
     padding: 2px 6px; font-family: monospace; font-size: 0.82rem;
   }
-  .toolbar input[type=number] { width: 70px; }
+  .btn-page {
+    background: #1e1e1e; border: 1px solid #444; color: #ccc; cursor: pointer;
+    font-family: monospace; font-size: 0.82rem; padding: 2px 10px;
+  }
+  .btn-page:hover:not(:disabled) { background: #2e2e2e; }
+  .btn-page:disabled { opacity: 0.3; cursor: default; }
+  .page-info { color: #666; font-size: 0.78rem; min-width: 5rem; text-align: center; }
   table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
   th { background: #1e1e1e; color: #aaa; text-align: left; padding: 6px 8px; border-bottom: 1px solid #333; }
   td { padding: 5px 8px; border-bottom: 1px solid #222; vertical-align: top; word-break: break-all; }
@@ -26,12 +38,11 @@
   .badge-ok   { color: #4caf50; }
   .badge-fail { color: #f44; }
   .badge-sharing { color: #ff9800; font-weight: bold; }
-  #alerts-section table th, #alerts-section table td { background: #1a0a0a; }
-  #alerts-section th { background: #2a1010; }
-  #alerts-section tr:hover td { background: #220e0e; }
-  .section-hdr { display: flex; align-items: baseline; gap: 1rem; }
-  .count-badge { font-size: 0.75rem; background: #333; color: #aaa; padding: 1px 6px; border-radius: 2px; }
-  #alerts-count-badge { background: #5a2020; color: #ffaaaa; }
+  #alerts-section ~ .toolbar select,
+  #alerts-section ~ #alerts-table table th,
+  #alerts-section ~ #alerts-table table td { background: #1a0a0a; }
+  .alert-tbl th { background: #2a1010 !important; }
+  .alert-tbl tr:hover td { background: #220e0e !important; }
   .btn-stop {
     background: #6e1a1a; border: none; color: #ffaaaa; cursor: pointer;
     font-family: monospace; font-size: 0.78rem; padding: 2px 8px;
@@ -47,52 +58,93 @@
 <div id="token-info">Token: (loaded from ?token= param)</div>
 <div class="status" id="last-refresh">Loading...</div>
 
+<!-- ── Flag Sharing Alerts ─────────────────────────────────────────────── -->
 <div class="section-hdr" id="alerts-section">
   <h2>Flag Sharing Alerts</h2>
   <span class="count-badge" id="alerts-count-badge">0</span>
 </div>
+<div class="toolbar">
+  <label>Challenge:</label>
+  <select id="alerts-challenge" onchange="sectionPageReset('alerts')"><option value="">All</option></select>
+  <label>Show:</label>
+  <select id="alerts-limit" onchange="sectionPageReset('alerts')">
+    <option value="10">10</option><option value="20">20</option>
+    <option value="50" selected>50</option><option value="100">100</option><option value="0">All</option>
+  </select>
+  <button class="btn-page" id="alerts-prev" onclick="sectionPage('alerts',-1)">&#8592; Prev</button>
+  <span class="page-info" id="alerts-pageinfo"></span>
+  <button class="btn-page" id="alerts-next" onclick="sectionPage('alerts', 1)">Next &#8594;</button>
+</div>
 <div id="alerts-table"></div>
 
+<!-- ── Active Instances ───────────────────────────────────────────────── -->
 <div class="section-hdr">
   <h2>Active Instances</h2>
   <span class="count-badge" id="instances-count">0</span>
 </div>
+<div class="toolbar">
+  <label>Challenge:</label>
+  <select id="instances-challenge" onchange="sectionPageReset('instances')"><option value="">All</option></select>
+  <label>Show:</label>
+  <select id="instances-limit" onchange="sectionPageReset('instances')">
+    <option value="10">10</option><option value="20">20</option>
+    <option value="50" selected>50</option><option value="100">100</option><option value="0">All</option>
+  </select>
+  <button class="btn-page" id="instances-prev" onclick="sectionPage('instances',-1)">&#8592; Prev</button>
+  <span class="page-info" id="instances-pageinfo"></span>
+  <button class="btn-page" id="instances-next" onclick="sectionPage('instances', 1)">Next &#8594;</button>
+</div>
 <div id="instances-table"></div>
 
+<!-- ── Correct Solves ─────────────────────────────────────────────────── -->
 <div class="section-hdr">
   <h2>Correct Solves</h2>
   <span class="count-badge" id="solves-count">0</span>
 </div>
+<div class="toolbar">
+  <label>Challenge:</label>
+  <select id="solves-challenge" onchange="sectionPageReset('solves')"><option value="">All</option></select>
+  <label>Show:</label>
+  <select id="solves-limit" onchange="sectionPageReset('solves')">
+    <option value="10">10</option><option value="20">20</option>
+    <option value="50" selected>50</option><option value="100">100</option><option value="0">All</option>
+  </select>
+  <button class="btn-page" id="solves-prev" onclick="sectionPage('solves',-1)">&#8592; Prev</button>
+  <span class="page-info" id="solves-pageinfo"></span>
+  <button class="btn-page" id="solves-next" onclick="sectionPage('solves', 1)">Next &#8594;</button>
+</div>
 <div id="solves-table"></div>
 
-<h2>Recent Flag Attempts</h2>
-<div class="toolbar">
-  <label for="attempts-limit">Show:</label>
-  <select id="attempts-limit" onchange="onLimitChange()">
-    <option value="5">5</option>
-    <option value="10">10</option>
-    <option value="50">50</option>
-    <option value="100">100</option>
-    <option value="200" selected>200</option>
-    <option value="custom">Custom...</option>
-  </select>
-  <input type="number" id="attempts-limit-custom" min="1" max="200" value="20"
-         style="display:none" oninput="renderAttemptsFiltered()" placeholder="N">
+<!-- ── Recent Flag Attempts ───────────────────────────────────────────── -->
+<div class="section-hdr">
+  <h2>Recent Flag Attempts</h2>
   <span class="count-badge" id="attempts-count">0</span>
+</div>
+<div class="toolbar">
+  <label>Challenge:</label>
+  <select id="attempts-challenge" onchange="sectionPageReset('attempts')"><option value="">All</option></select>
+  <label>Show:</label>
+  <select id="attempts-limit" onchange="sectionPageReset('attempts')">
+    <option value="20">20</option><option value="50">50</option>
+    <option value="100">100</option><option value="200" selected>200</option><option value="0">All</option>
+  </select>
+  <button class="btn-page" id="attempts-prev" onclick="sectionPage('attempts',-1)">&#8592; Prev</button>
+  <span class="page-info" id="attempts-pageinfo"></span>
+  <button class="btn-page" id="attempts-next" onclick="sectionPage('attempts', 1)">Next &#8594;</button>
 </div>
 <div id="attempts-table"></div>
 
 <script>
 (function () {
   var token = '';
-  var search = window.location.search;
-  var match = search.match(/[?&]token=([^&]*)/);
+  var match = window.location.search.match(/[?&]token=([^&]*)/);
   if (match) {
     token = decodeURIComponent(match[1]);
-    var masked = token.length > 6 ? token.slice(0, 6) + '***' : '***';
-    document.getElementById('token-info').textContent = 'Token: ' + masked;
+    document.getElementById('token-info').textContent =
+      'Token: ' + (token.length > 6 ? token.slice(0, 6) + '***' : '***');
   } else {
-    document.getElementById('token-info').textContent = 'No token in URL (?token=...) — API calls will fail with 401';
+    document.getElementById('token-info').textContent =
+      'No token in URL (?token=...) — API calls will fail with 401';
   }
 
   function authHeaders() {
@@ -106,14 +158,9 @@
     return d.innerHTML;
   }
 
-  // Renders "Name (id)" if name is known, otherwise just the id.
   function nameId(name, id) {
     if (name) return escText(name) + ' <span style="color:#666">(' + escText(id) + ')</span>';
     return escText(id);
-  }
-
-  function updateRefreshTime() {
-    document.getElementById('last-refresh').textContent = 'Last refresh: ' + new Date().toLocaleTimeString();
   }
 
   function fetchJSON(url, cb) {
@@ -123,16 +170,109 @@
       .catch(function (e) { cb(null, e); });
   }
 
-  // ── Alerts ────────────────────────────────────────────────────────────────
+  // ── Section state ──────────────────────────────────────────────────────────
 
-  function renderAlerts(data) {
-    var el = document.getElementById('alerts-table');
+  var state = {
+    alerts:    { page: 0, data: [] },
+    instances: { page: 0, data: [] },
+    solves:    { page: 0, data: [] },
+    attempts:  { page: 0, data: [] },
+  };
+
+  // solvedSet: "challenge_name|team_id" → true, derived from allSolves (ctfd_solves-backed)
+  var solvedSet = new Set();
+  // aliveSet: "challenge_name|team_id" → true for running instances
+  var aliveSet = new Set();
+
+  window.sectionPageReset = function(name) {
+    state[name].page = 0;
+    renderSection(name);
+  };
+
+  window.sectionPage = function(name, delta) {
+    state[name].page += delta;
+    renderSection(name);
+  };
+
+  function getLimit(name) {
+    return parseInt(document.getElementById(name + '-limit').value) || 0;
+  }
+
+  function getChallenge(name) {
+    return document.getElementById(name + '-challenge').value;
+  }
+
+  function updateChallengeFilter(name, data) {
+    var sel = document.getElementById(name + '-challenge');
+    var current = sel.value;
+    var names = [];
+    data.forEach(function (r) {
+      if (r.challenge_name && names.indexOf(r.challenge_name) < 0)
+        names.push(r.challenge_name);
+    });
+    names.sort();
+    // Rebuild options preserving selection if still valid
+    while (sel.options.length > 1) sel.remove(1);
+    names.forEach(function (n) {
+      var opt = document.createElement('option');
+      opt.value = n;
+      opt.textContent = n;
+      if (n === current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+
+  function renderSection(name) {
+    var s = state[name];
+    var challenge = getChallenge(name);
+    var limit = getLimit(name);
+
+    var filtered = (name === 'attempts')
+      ? attemptsFiltered(s.data, challenge)
+      : s.data.filter(function (r) {
+          return !challenge || r.challenge_name === challenge;
+        });
+
+    var total = filtered.length;
+    var totalPages = (limit > 0) ? Math.max(1, Math.ceil(total / limit)) : 1;
+    // Clamp page
+    if (s.page >= totalPages) s.page = totalPages - 1;
+    if (s.page < 0) s.page = 0;
+
+    var pageData = (limit > 0)
+      ? filtered.slice(s.page * limit, (s.page + 1) * limit)
+      : filtered;
+
+    // Pagination controls
+    var prevBtn = document.getElementById(name + '-prev');
+    var nextBtn = document.getElementById(name + '-next');
+    var pageInfo = document.getElementById(name + '-pageinfo');
+    if (prevBtn) prevBtn.disabled = (s.page <= 0);
+    if (nextBtn) nextBtn.disabled = (s.page >= totalPages - 1);
+    if (pageInfo) {
+      pageInfo.textContent = limit > 0
+        ? 'p.' + (s.page + 1) + '/' + totalPages + ' (' + total + ')'
+        : '(' + total + ')';
+    }
+
+    var el = document.getElementById(name + '-table');
+    switch (name) {
+      case 'alerts':    renderAlertsRows(pageData, el); break;
+      case 'instances': renderInstancesRows(pageData, el); break;
+      case 'solves':    renderSolvesRows(pageData, el); break;
+      case 'attempts':  renderAttemptsRows(pageData, el); break;
+    }
+  }
+
+  // ── Alerts ─────────────────────────────────────────────────────────────────
+
+  function renderAlertsRows(data, el) {
     var badge = document.getElementById('alerts-count-badge');
-    if (!Array.isArray(data)) { return; }
-    badge.textContent = data.length;
-    updateRefreshTime();
-    if (data.length === 0) { el.innerHTML = '<p class="empty">No sharing alerts detected.</p>'; return; }
-    var html = '<table><thead><tr>' +
+    badge.textContent = state.alerts.data.length;
+    if (data.length === 0) {
+      el.innerHTML = '<p class="empty">No sharing alerts detected.</p>'; return;
+    }
+    var html = '<table class="alert-tbl"><thead><tr>' +
       '<th>Time</th><th>Challenge</th><th>Team (submitter)</th><th>User</th>' +
       '<th>Owner Team</th><th>Correct?</th><th>Submitted Flag</th>' +
       '</tr></thead><tbody>';
@@ -153,29 +293,32 @@
 
   function loadAlerts() {
     fetchJSON('/api/v1/admin/attempts?alerts_only=true', function (data, err) {
-      renderAlerts(err ? [] : data);
+      if (!Array.isArray(data)) data = [];
+      state.alerts.data = data;
+      updateChallengeFilter('alerts', data);
+      renderSection('alerts');
+      document.getElementById('last-refresh').textContent =
+        'Last refresh: ' + new Date().toLocaleTimeString();
     });
   }
 
-  // ── Instances ─────────────────────────────────────────────────────────────
+  // ── Instances ──────────────────────────────────────────────────────────────
 
-  function renderInstances(data) {
-    var el = document.getElementById('instances-table');
-    var badge = document.getElementById('instances-count');
-    if (!Array.isArray(data)) { return; }
-    var running = data.filter(function (r) { return r.status === 'running'; });
-    var visible = data.filter(function (r) { return r.status === 'running' || r.status === 'solved'; });
-    badge.textContent = running.length;
-    if (visible.length === 0) { el.innerHTML = '<p class="empty">No active instances.</p>'; return; }
+  function renderInstancesRows(data, el) {
+    // badge shows running count from full (unfiltered) dataset
+    var running = state.instances.data.filter(function (r) { return r.status === 'running'; });
+    document.getElementById('instances-count').textContent = running.length;
+
+    if (data.length === 0) {
+      el.innerHTML = '<p class="empty">No active instances.</p>'; return;
+    }
     var html = '<table><thead><tr>' +
       '<th>Challenge</th><th>Team</th><th>User</th><th>Host:Port</th>' +
       '<th>Type</th><th>Status</th><th>Expires At</th><th>Created At</th><th>Action</th>' +
       '</tr></thead><tbody>';
-    visible.forEach(function (r) {
+    data.forEach(function (r) {
       var isSolved = r.status === 'solved';
       var rowClass = isSolved ? ' class="row-solved"' : '';
-      // Build the onclick value and HTML-encode double quotes so they survive
-      // inside a double-quoted attribute (JSON.stringify wraps strings in "…").
       var stopCall = 'stopInstance(' + JSON.stringify(r.challenge_name) + ',' + Number(r.team_id) + ')';
       var stopAttr = stopCall.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
       var actionCell = isSolved
@@ -197,14 +340,18 @@
     el.innerHTML = html;
   }
 
-  var allInstances = [];
-
   function loadInstances() {
     fetchJSON('/api/v1/admin/instances', function (data, err) {
-      allInstances = Array.isArray(data) ? data : [];
-      renderInstances(allInstances);
-      // Re-render attempts: their visibility depends on which instances are alive.
-      renderAttemptsFiltered();
+      if (!Array.isArray(data)) data = [];
+      state.instances.data = data;
+      // Rebuild aliveSet for attempts filter
+      aliveSet = new Set(
+        data.filter(function (i) { return i.status === 'running'; })
+            .map(function (i) { return i.challenge_name + '|' + String(i.team_id); })
+      );
+      updateChallengeFilter('instances', data);
+      renderSection('instances');
+      renderSection('attempts'); // alive set changed
     });
   }
 
@@ -222,24 +369,22 @@
       .catch(function (e) { alert('Network error: ' + e.message); });
   };
 
-  // ── Solves ────────────────────────────────────────────────────────────────
+  // ── Solves ─────────────────────────────────────────────────────────────────
 
-  function renderSolves(data) {
-    var el = document.getElementById('solves-table');
-    var badge = document.getElementById('solves-count');
-    if (!Array.isArray(data)) { return; }
-    badge.textContent = data.length;
-    if (data.length === 0) { el.innerHTML = '<p class="empty">No solves yet.</p>'; return; }
+  function renderSolvesRows(data, el) {
+    document.getElementById('solves-count').textContent = state.solves.data.length;
+    if (data.length === 0) {
+      el.innerHTML = '<p class="empty">No solves yet.</p>'; return;
+    }
     var html = '<table><thead><tr>' +
-      '<th>Time</th><th>Challenge</th><th>Team</th><th>User</th><th>Flag</th>' +
+      '<th>Time</th><th>Challenge</th><th>Team</th><th>User</th>' +
       '</tr></thead><tbody>';
     data.forEach(function (r) {
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
         '<td>' + escText(r.challenge_name) + '</td>' +
         '<td class="badge-ok">' + nameId(r.team_name, r.team_id) + '</td>' +
-        '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
-        '<td>' + escText(r.submitted_flag) + '</td>' +
+        '<td>' + (r.user_id !== null ? nameId(r.user_name, r.user_id) : '—') + '</td>' +
         '</tr>';
     });
     html += '</tbody></table>';
@@ -248,61 +393,53 @@
 
   function loadSolves() {
     fetchJSON('/api/v1/admin/solves', function (data, err) {
-      renderSolves(err ? [] : data);
+      if (!Array.isArray(data)) data = [];
+      state.solves.data = data;
+      // Rebuild solvedSet for attempts is_correct derivation
+      solvedSet = new Set(data.map(function (s) {
+        return s.challenge_name + '|' + String(s.team_id);
+      }));
+      updateChallengeFilter('solves', data);
+      renderSection('solves');
+      renderSection('attempts'); // solvedSet changed
     });
   }
 
-  // ── Attempts ──────────────────────────────────────────────────────────────
+  // ── Attempts ───────────────────────────────────────────────────────────────
 
-  var allAttempts = [];
-
-  window.onLimitChange = function() {
-    var sel = document.getElementById('attempts-limit');
-    var custom = document.getElementById('attempts-limit-custom');
-    custom.style.display = sel.value === 'custom' ? '' : 'none';
-    renderAttemptsFiltered();
-  };
-
-  window.renderAttemptsFiltered = function() {
-    // Build a set of "challenge|team" keys for teams with a running instance.
-    var alive = new Set(
-      allInstances
-        .filter(function (i) { return i.status === 'running'; })
-        .map(function (i) { return i.challenge_name + '|' + String(i.team_id); })
-    );
-
-    // Only show an attempt if it is noteworthy past instance death:
-    //   - correct submission (solve event)
-    //   - flag sharing alert
-    //   - team still has a live instance (in-progress noise)
-    var visible = allAttempts.filter(function (r) {
-      return r.is_correct
-        || r.is_flag_sharing
-        || alive.has(r.challenge_name + '|' + String(r.team_id));
+  // Pre-filter: only show notable attempts (correct per CTFd, sharing, or alive instance).
+  // is_correct is derived from solvedSet (ctfd_solves-backed) not the stored flag.
+  function attemptsFiltered(data, challenge) {
+    return data.filter(function (r) {
+      if (challenge && r.challenge_name !== challenge) return false;
+      var key = r.challenge_name + '|' + String(r.team_id);
+      var isCorrect = r.is_correct && solvedSet.has(key);
+      return isCorrect || r.is_flag_sharing || aliveSet.has(key);
     });
+  }
 
-    var sel = document.getElementById('attempts-limit');
-    var custom = document.getElementById('attempts-limit-custom');
-    var limit = sel.value === 'custom'
-      ? (parseInt(custom.value) || 10)
-      : parseInt(sel.value) || 200;
-    var data = visible.slice(0, limit);
-    var badge = document.getElementById('attempts-count');
-    badge.textContent = data.length + ' / ' + visible.length;
+  function renderAttemptsRows(data, el) {
+    // badge shows filtered total, not page count
+    var challenge = getChallenge('attempts');
+    var filtered = attemptsFiltered(state.attempts.data, challenge);
+    document.getElementById('attempts-count').textContent = filtered.length;
 
-    var el = document.getElementById('attempts-table');
-    if (data.length === 0) { el.innerHTML = '<p class="empty">No flag attempts recorded.</p>'; return; }
+    if (data.length === 0) {
+      el.innerHTML = '<p class="empty">No flag attempts recorded.</p>'; return;
+    }
     var html = '<table><thead><tr>' +
       '<th>Time</th><th>Challenge</th><th>Team</th><th>User</th>' +
       '<th>Correct?</th><th>Sharing?</th><th>Owner Team</th><th>Submitted Flag</th>' +
       '</tr></thead><tbody>';
     data.forEach(function (r) {
+      var key = r.challenge_name + '|' + String(r.team_id);
+      var isCorrect = r.is_correct && solvedSet.has(key);
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
         '<td>' + escText(r.challenge_name) + '</td>' +
         '<td>' + nameId(r.team_name, r.team_id) + '</td>' +
         '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
-        '<td>' + (r.is_correct ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
+        '<td>' + (isCorrect ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
         '<td>' + (r.is_flag_sharing ? '<span class="badge-sharing">SHARING</span>' : '') + '</td>' +
         '<td>' + (r.owner_team_id !== null ? nameId(r.owner_team_name, r.owner_team_id) : '') + '</td>' +
         '<td>' + escText(r.submitted_flag) + '</td>' +
@@ -310,21 +447,18 @@
     });
     html += '</tbody></table>';
     el.innerHTML = html;
-  };
-
-  function renderAttempts(data) {
-    if (!Array.isArray(data)) { return; }
-    allAttempts = data;
-    renderAttemptsFiltered();
   }
 
   function loadAttempts() {
     fetchJSON('/api/v1/admin/attempts', function (data, err) {
-      renderAttempts(err ? [] : data);
+      if (!Array.isArray(data)) data = [];
+      state.attempts.data = data;
+      updateChallengeFilter('attempts', data);
+      renderSection('attempts');
     });
   }
 
-  // ── Initial load + polling ────────────────────────────────────────────────
+  // ── Boot ───────────────────────────────────────────────────────────────────
 
   loadAlerts();
   loadInstances();
@@ -333,7 +467,7 @@
 
   setInterval(loadAlerts,    15000);
   setInterval(loadInstances, 15000);
-  setInterval(loadSolves,    30000);
+  setInterval(loadSolves,    15000);
   setInterval(loadAttempts,  30000);
 }());
 </script>

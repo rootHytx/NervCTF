@@ -89,6 +89,30 @@ function formatExpiry(timestampMs) {
   return "Expires in " + Math.ceil(secondsLeft / 60) + " minutes";
 }
 
+var _pollTimer = null;
+
+function _pollUntilRunning(challenge_id, alert) {
+  if (_pollTimer) clearTimeout(_pollTimer);
+  _pollTimer = setTimeout(function () {
+    _pollTimer = null;
+    fetch("/api/v1/containers/info/" + challenge_id, {
+      method: "GET",
+      headers: { Accept: "application/json", "CSRF-Token": init.csrfNonce },
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.status === "provisioning") {
+          _pollUntilRunning(challenge_id, alert);
+        } else {
+          view_container_info(challenge_id);
+        }
+      })
+      .catch(function () {
+        _pollUntilRunning(challenge_id, alert);
+      });
+  }, 3000);
+}
+
 function renderConnectionInfo(connection, parent) {
   // url_list (multi-port subdomain)
   if (connection.type === "url_list" && connection.urls) {
@@ -229,7 +253,12 @@ function view_container_info(challenge_id) {
         alert.classList.add("alert-info");
         hideUpdateBtns();
         showCreateBtn();
-      } else if (data.status === "running" || data.status === "provisioning") {
+      } else if (data.status === "provisioning") {
+        alert.textContent = "Instance is provisioning\u2026";
+        hideCreateBtn();
+        showUpdateBtns();
+        _pollUntilRunning(challenge_id, alert);
+      } else if (data.status === "running") {
         var expires = document.createElement("span");
         expires.textContent = formatExpiry(data.expires_at);
         alert.append(expires, document.createElement("br"));
@@ -283,6 +312,11 @@ function container_request(challenge_id) {
         alert.textContent = data.error;
         alert.classList.add("alert-danger");
         showCreateBtn();
+      } else if (data.status === "provisioning") {
+        alert.textContent = "Instance is provisioning\u2026";
+        hideCreateBtn();
+        showUpdateBtns();
+        _pollUntilRunning(challenge_id, alert);
       } else {
         var expires = document.createElement("span");
         expires.textContent = formatExpiry(data.expires_at);

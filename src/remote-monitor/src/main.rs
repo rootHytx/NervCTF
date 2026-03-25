@@ -874,11 +874,12 @@ async fn plugin_request_handler(
         return (StatusCode::CONFLICT, Json(json!({"error": "Challenge already solved", "solved": true}))).into_response();
     }
 
-    // Return existing running instance
+    // Return existing running or in-progress instance
     if let Ok(Some(inst)) = db::get_instance(&state.db, &body.challenge_name, body.team_id) {
-        if inst.status == "running" {
-            info!("plugin_request: returning existing instance for {}/{}", body.challenge_name, body.team_id);
+        if inst.status == "running" || inst.status == "provisioning" {
+            info!("plugin_request: returning existing {} instance for {}/{}", inst.status, body.challenge_name, body.team_id);
             return Json(json!({
+                "status": inst.status,
                 "host": inst.host,
                 "port": inst.port,
                 "connection_type": inst.connection_type,
@@ -906,25 +907,49 @@ async fn plugin_request_handler(
         }
     };
 
-    info!("plugin_request: provisioning '{}' for team {}", body.challenge_name, body.team_id);
-    match instance::provision(
-        &state.db, &body.challenge_name, body.team_id, body.user_id, &config, &state.public_host,
-        &state.ctfd_pool,
-    ).await {
-        Ok((host, port, conn, expires_at)) => {
-            info!("plugin_request: provisioned {}:{} ({})", host, port, conn);
-            Json(json!({
-                "host": host,
-                "port": port,
-                "connection_type": conn,
-                "expires_at": expires_at,
-            })).into_response()
-        }
-        Err(e) => {
-            error!("plugin_request: provision error: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response()
-        }
+    // Derive reasonable placeholder values for the provisioning stub
+    let connection_type = config["connection"].as_str().unwrap_or("nc").to_string();
+    let timeout_minutes = config["timeout_minutes"].as_u64().unwrap_or(45);
+    let expires_at = instance::expires_at_string(timeout_minutes);
+
+    // Insert stub immediately so the client can poll for status
+    if let Err(e) = db::insert_provisioning_stub(
+        &state.db, &body.challenge_name, body.team_id, body.user_id,
+        &state.public_host, &connection_type, &expires_at,
+    ) {
+        error!("plugin_request: failed to insert provisioning stub: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
+
+    // Provision in background — compose up can take 30-60 s
+    let state_bg = Arc::clone(&state);
+    let challenge_name_bg = body.challenge_name.clone();
+    let team_id_bg = body.team_id;
+    let user_id_bg = body.user_id;
+    tokio::spawn(async move {
+        info!("provision_bg: starting '{}' team {}", challenge_name_bg, team_id_bg);
+        match instance::provision(
+            &state_bg.db, &challenge_name_bg, team_id_bg, user_id_bg,
+            &config, &state_bg.public_host, &state_bg.ctfd_pool,
+        ).await {
+            Ok((host, port, conn, exp)) => {
+                info!("provision_bg: done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id_bg);
+            }
+            Err(e) => {
+                error!("provision_bg: '{}' team {} error: {}", challenge_name_bg, team_id_bg, e);
+                // Remove the stub so the client can retry
+                let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id_bg);
+            }
+        }
+    });
+
+    Json(json!({
+        "status": "provisioning",
+        "host": state.public_host,
+        "port": 0,
+        "connection_type": connection_type,
+        "expires_at": expires_at,
+    })).into_response()
 }
 
 async fn plugin_renew_handler(
@@ -1170,7 +1195,7 @@ async fn admin_attempts_handler(
     let alerts_only = params.get("alerts_only").map(|v| v == "true").unwrap_or(false);
     let db = Arc::clone(&state.db);
     let result = tokio::task::spawn_blocking(move || {
-        if alerts_only { db::list_sharing_alerts(&db) } else { db::list_flag_attempts(&db, 200) }
+        if alerts_only { db::list_sharing_alerts(&db) } else { db::list_flag_attempts(&db, i64::MAX) }
     }).await;
     match result {
         Ok(Ok(list)) => Json(json!(list)).into_response(),

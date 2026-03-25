@@ -849,6 +849,7 @@ async fn plugin_info_handler(
             "expires_at": inst.expires_at,
             "renewals_used": inst.renewals_used,
             "container_id": inst.container_id,
+            "flag": inst.flag,
         })).into_response(),
         Ok(None) => Json(json!({"status": "none"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),

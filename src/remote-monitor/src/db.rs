@@ -223,12 +223,13 @@ pub struct InstanceRow {
     pub status: String,
     pub renewals_used: i64,
     pub expires_at: String,
+    pub flag: Option<String>,
 }
 
 pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<InstanceRow>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT id, challenge_name, team_id, container_id, host, port, connection_type, status, renewals_used, expires_at
+        "SELECT id, challenge_name, team_id, container_id, host, port, connection_type, status, renewals_used, expires_at, flag
          FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
     )?;
     let mut rows = stmt.query(params![challenge_name, team_id])?;
@@ -244,6 +245,7 @@ pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Optio
             status: row.get(7)?,
             renewals_used: row.get(8)?,
             expires_at: row.get(9)?,
+            flag: row.get(10)?,
         }))
     } else {
         Ok(None)

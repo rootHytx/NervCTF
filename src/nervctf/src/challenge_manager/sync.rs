@@ -1,8 +1,4 @@
-use crate::challenge_manager::ChallengeManager;
 use crate::ctfd_api::models::{Challenge, FlagContent};
-use anyhow::{anyhow, Result};
-
-use std::collections::HashMap;
 
 /// Returns true if the remote challenge needs to be updated to match local.
 pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
@@ -94,199 +90,6 @@ pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
     }
 
     false
-}
-
-pub struct ChallengeSynchronizer {
-    challenge_manager: ChallengeManager,
-}
-
-impl ChallengeSynchronizer {
-    pub fn new(challenge_manager: ChallengeManager) -> Self {
-        Self { challenge_manager }
-    }
-
-    pub async fn sync(&mut self, show_diff: bool) -> Result<()> {
-        println!("starting challenge synchronization...");
-
-        let local_challenges = self.challenge_manager.scan_local_challenges()?;
-        println!("local challenges: {}", local_challenges.len());
-        let remote_challenges = self.challenge_manager.get_all_challenges().await?.unwrap();
-        println!("remote challenges: {}", remote_challenges.len());
-
-        self.challenge_manager
-            .generate_requirements_list(local_challenges.clone());
-
-        let local_map: HashMap<String, &Challenge> = local_challenges
-            .iter()
-            .map(|c| (c.name.clone(), c))
-            .collect();
-
-        let remote_map: HashMap<String, &crate::ctfd_api::models::Challenge> = remote_challenges
-            .iter()
-            .map(|c| (c.name.clone(), c))
-            .collect();
-
-        let mut actions = Vec::new();
-
-        for (name, local_challenge) in &local_map {
-            if let Some(remote_challenge) = remote_map.get(name) {
-                if self.needs_update(remote_challenge, local_challenge)? {
-                    actions.push(SyncAction::Update {
-                        name: name.clone(),
-                        local: local_challenge,
-                        remote: remote_challenge,
-                    });
-                } else {
-                    actions.push(SyncAction::UpToDate {
-                        name: name.clone(),
-                        challenge: local_challenge,
-                    });
-                }
-            } else {
-                actions.push(SyncAction::Create {
-                    name: name.clone(),
-                    challenge: local_challenge,
-                });
-            }
-        }
-
-        for (name, remote_challenge) in &remote_map {
-            if !local_map.contains_key(name) {
-                actions.push(SyncAction::RemoteOnly {
-                    name: name.clone(),
-                    challenge: remote_challenge,
-                });
-            }
-        }
-
-        if show_diff {
-            self.show_diff(&actions)?;
-        }
-
-        self.execute_actions(actions).await?;
-
-        println!("synchronization complete.");
-        Ok(())
-    }
-
-    fn needs_update(&self, remote: &Challenge, local: &Challenge) -> Result<bool> {
-        Ok(needs_update(remote, local))
-    }
-
-    fn show_diff(&self, actions: &[SyncAction<'_>]) -> Result<()> {
-        println!("\nsync diff:");
-        println!("{}", "=".repeat(50));
-        let mut created_string = String::from("[+] CREATE:\n");
-        let mut updated_string = String::from("[~] UPDATE:\n");
-        let mut up_to_date_string = String::from("[=] UP-TO-DATE:\n");
-        let mut remote_only_string = String::from("[i] REMOTE-ONLY:\n");
-        let mut has_creates = false;
-        let mut has_updates = false;
-        let mut has_up_to_date = false;
-        let mut has_remote_only = false;
-
-        for action in actions {
-            match action {
-                SyncAction::Create { name, .. } => {
-                    if !has_creates {
-                        has_creates = true;
-                    }
-                    created_string.push_str(format!("\t - {}\n", name).as_str());
-                }
-                SyncAction::Update { name, .. } => {
-                    if !has_updates {
-                        has_updates = true;
-                    }
-                    updated_string.push_str(format!("\t - {}\n", name).as_str());
-                }
-                SyncAction::UpToDate { name, .. } => {
-                    if !has_up_to_date {
-                        has_up_to_date = true;
-                    }
-                    up_to_date_string.push_str(format!("\t - {}\n", name).as_str());
-                }
-                SyncAction::RemoteOnly { name, .. } => {
-                    if !has_remote_only {
-                        has_remote_only = true;
-                    }
-                    remote_only_string.push_str(format!("\t - {}\n", name).as_str());
-                }
-            }
-        }
-        if has_creates {
-            println!("{}", created_string);
-        }
-        if has_updates {
-            println!("{}", updated_string);
-        }
-        if has_up_to_date {
-            println!("{}", up_to_date_string);
-        }
-        if has_remote_only {
-            println!("{}", remote_only_string);
-        }
-        println!("{}", "=".repeat(50));
-        Ok(())
-    }
-
-    async fn execute_actions(&mut self, mut actions: Vec<SyncAction<'_>>) -> Result<()> {
-        let mut created = 0;
-        let mut updated = 0;
-        let mut up_to_date = 0;
-        let mut remote_only = 0;
-        println!("Actions: {}", actions.len());
-        actions = self
-            .challenge_manager
-            .requirements_queue
-            .resolve_dependencies(actions);
-        println!("Actions: {}", actions.len());
-        println!("Do you wish to proceed? (y/N)");
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if input.trim().to_lowercase() != "y" {
-            println!("aborted.");
-            return Ok(());
-        }
-        println!("\nexecuting synchronization actions...");
-        for action in &actions {
-            match action {
-                SyncAction::Create { name, challenge } => {
-                    println!("[+] creating: {}", name);
-                    self.challenge_manager.create_challenge(challenge).await?;
-                    created += 1;
-                }
-                SyncAction::Update {
-                    name,
-                    local,
-                    remote,
-                } => {
-                    println!("[~] updating: {}", name);
-                    let challenge_id = remote
-                        .id
-                        .ok_or_else(|| anyhow!("Remote challenge has no ID"))?;
-                    self.challenge_manager
-                        .update_challenge(challenge_id, local)
-                        .await?;
-                    updated += 1;
-                }
-                SyncAction::UpToDate { name, .. } => {
-                    println!("[=] up-to-date: {}", name);
-                    up_to_date += 1;
-                }
-                SyncAction::RemoteOnly { name, .. } => {
-                    println!("[i] remote-only: {}", name);
-                    remote_only += 1;
-                }
-            }
-        }
-        println!("\nsummary:");
-        println!("  Created: {}", created);
-        println!("  Updated: {}", updated);
-        println!("  Up-to-date: {}", up_to_date);
-        println!("  Remote-only: {}", remote_only);
-
-        Ok(())
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -471,7 +274,7 @@ mod tests {
 
     #[test]
     fn detailed_flag_same_content_as_simple_no_update() {
-        use crate::ctfd_api::models::{FlagType};
+        use crate::ctfd_api::models::FlagType;
         let mut remote = base();
         remote.flags = Some(vec![FlagContent::Detailed {
             id: None,
@@ -548,26 +351,4 @@ mod tests {
         }]);
         assert!(!needs_update(&remote, &local));
     }
-}
-
-/// Represents synchronization actions
-#[derive(Clone, Debug)]
-pub enum SyncAction<'a> {
-    Create {
-        name: String,
-        challenge: &'a Challenge,
-    },
-    Update {
-        name: String,
-        local: &'a Challenge,
-        remote: &'a crate::ctfd_api::models::Challenge,
-    },
-    UpToDate {
-        name: String,
-        challenge: &'a Challenge,
-    },
-    RemoteOnly {
-        name: String,
-        challenge: &'a crate::ctfd_api::models::Challenge,
-    },
 }

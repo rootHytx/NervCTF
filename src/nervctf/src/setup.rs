@@ -145,14 +145,6 @@ fn find_plugin_src() -> Option<PathBuf> {
     None
 }
 
-fn check_ctfd_running(ip: &str) -> bool {
-    let addr = format!("{}:80", ip);
-    if let Ok(parsed) = addr.parse::<std::net::SocketAddr>() {
-        std::net::TcpStream::connect_timeout(&parsed, std::time::Duration::from_secs(3)).is_ok()
-    } else {
-        false
-    }
-}
 
 fn prompt_with_default(prompt: &str, default: Option<&str>) -> Result<String> {
     let mut builder = Input::new().with_prompt(prompt);
@@ -187,7 +179,7 @@ pub fn run_setup() -> Result<()> {
     let base_dir = loop {
         let input = prompt_with_default(
             "Local challenges directory",
-            Some(config.base_dir.as_deref().unwrap_or(".")),
+            Some(config.challenges_dir.as_deref().unwrap_or(".")),
         )?;
         let p = std::path::Path::new(&input);
         if p == std::path::Path::new(".") || p.is_dir() {
@@ -214,6 +206,21 @@ pub fn run_setup() -> Result<()> {
         "Remote sudo user",
         Some(config.target_user.as_deref().unwrap_or("root")),
     )?;
+
+    // ── RUNNER (split-machine mode, optional) ─────────────────────────────────
+    let runner_ip_input = prompt_with_default(
+        "Challenge runner IP (blank = same machine as CTFd)",
+        Some(config.runner_ip.as_deref().unwrap_or("")),
+    )?;
+    let (runner_ip, runner_user) = if !runner_ip_input.trim().is_empty() {
+        let ru = prompt_with_default(
+            "Runner sudo user",
+            Some(config.runner_user.as_deref().unwrap_or("root")),
+        )?;
+        (Some(runner_ip_input), Some(ru))
+    } else {
+        (None, None)
+    };
 
     // ── CTFD_REMOTE_PATH ───────────────────────────────────────────────────────
     let ctfd_path = prompt_with_default(
@@ -280,39 +287,20 @@ pub fn run_setup() -> Result<()> {
     };
 
     // ── Save config before deployment ─────────────────────────────────────────
-    config.base_dir = Some(base_dir.clone());
+    config.challenges_dir = Some(base_dir.clone());
     config.target_ip = Some(target_ip.clone());
     config.target_user = Some(target_user.clone());
+    config.runner_ip = runner_ip.clone();
+    config.runner_user = runner_user.clone();
     config.ctfd_remote_path = Some(ctfd_path.clone());
     config.monitor_port = Some(monitor_port.clone());
     config.monitor_token = Some(monitor_token.clone());
     config.ssh_pubkey_path = Some(ssh_pubkey_path.clone());
-    let ctfd_url = format!("http://{}", target_ip);
     let monitor_url = format!("http://{}:{}", target_ip, monitor_port);
-    config.ctfd_url = Some(ctfd_url.clone());
     config.monitor_url = Some(monitor_url.clone());
 
     save_config(&config, &config_path)?;
     println!("  [ok] config saved to {}", config_path.display());
-
-    // ── Check if already running ───────────────────────────────────────────────
-    println!("\nChecking if CTFd is already running at {}...", target_ip);
-    if check_ctfd_running(&target_ip) {
-        println!("  CTFd appears to already be running at {}:80.", target_ip);
-        let redeploy = Confirm::new()
-            .with_prompt("Redeploy anyway? (runs the Ansible playbook again)")
-            .default(false)
-            .interact()?;
-        if !redeploy {
-            println!("\nCTFd URL:      {}", ctfd_url);
-            println!("Monitor URL:   {}", monitor_url);
-            println!("Monitor Token: {}", monitor_token);
-            println!("Admin Panel:   {}/admin?token={}", monitor_url, monitor_token);
-            return Ok(());
-        }
-    } else {
-        println!("  CTFd not detected -- proceeding with fresh deployment.");
-    }
 
     // ── Find remote-monitor binary ─────────────────────────────────────────────
     let monitor_binary = find_monitor_binary();
@@ -343,19 +331,33 @@ pub fn run_setup() -> Result<()> {
         format!("monitor_token={}", monitor_token),
         format!("monitor_port={}", monitor_port),
     ];
+    if let Some(n) = config.max_concurrent_provisions {
+        evars.push(format!("max_concurrent_provisions={}", n));
+    }
     if let Some(ref bin) = monitor_binary {
         evars.push(format!("monitor_binary={}", bin.display()));
     }
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
     }
-    let inventory = format!("[ctfd]\n{} ansible_user={}\n", target_ip, target_user);
+    if let Some(ref rip) = runner_ip {
+        evars.push(format!("runner_ip={}", rip));
+    }
+    let mut inventory = format!(
+        "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+        target_ip, target_user
+    );
+    if let (Some(ref rip), Some(ref ruser)) = (&runner_ip, &runner_user) {
+        inventory.push_str(&format!(
+            "\n[runner]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+            rip, ruser
+        ));
+    }
 
     println!("\nRunning Ansible playbook...");
     run_ansible_playbook(PLAYBOOK, &inventory, &evars)?;
 
     println!("\nNervCTF setup complete!");
-    println!("  CTFd URL:      {}", ctfd_url);
     println!("  Monitor URL:   {}", monitor_url);
     println!("  Monitor Token: {}", monitor_token);
     println!("  Admin Panel:   {}/admin?token={}", monitor_url, monitor_token);
@@ -499,6 +501,9 @@ pub fn run_upgrade() -> Result<()> {
         format!("ctfd_path={}", ctfd_path),
         format!("monitor_port={}", monitor_port),
     ];
+    if let Some(n) = config.max_concurrent_provisions {
+        evars.push(format!("max_concurrent_provisions={}", n));
+    }
     if let Some(ref bin) = monitor_binary {
         evars.push(format!("monitor_binary={}", bin.display()));
     }
@@ -506,7 +511,10 @@ pub fn run_upgrade() -> Result<()> {
         evars.push(format!("plugin_src={}", plugin.display()));
     }
 
-    let inventory = format!("[ctfd]\n{} ansible_user={}\n", target_ip, target_user);
+    let inventory = format!(
+        "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+        target_ip, target_user
+    );
 
     println!("\nRunning upgrade playbook...");
     run_ansible_playbook(UPGRADE_PLAYBOOK, &inventory, &evars)?;

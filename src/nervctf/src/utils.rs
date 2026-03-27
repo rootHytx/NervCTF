@@ -6,12 +6,6 @@ use std::path::{Path, PathBuf};
 /// Configuration loaded from `.nervctf.yml` (merged with env vars and CLI flags).
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Config {
-    // CTFd connection
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctfd_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctfd_api_key: Option<String>,
-
     // Remote monitor
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_url: Option<String>,
@@ -20,7 +14,7 @@ pub struct Config {
 
     // Challenge base directory
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub base_dir: Option<String>,
+    pub challenges_dir: Option<String>,
 
     // Setup / deployment fields
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,6 +27,16 @@ pub struct Config {
     pub ctfd_remote_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_port: Option<String>,
+
+    // Monitor tuning
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_provisions: Option<u32>,
+
+    // Split-machine mode: separate host for running challenge containers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_user: Option<String>,
 }
 
 /// Walk up from `start_dir` looking for `.nervctf.yml` or `.nervctf.yaml`.

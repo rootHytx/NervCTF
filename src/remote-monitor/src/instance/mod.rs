@@ -55,14 +55,16 @@ pub fn container_name(challenge_name: &str) -> String {
 /// The `container_id` field stores either a Docker container ID (for docker backend)
 /// or a compose project name (for compose backend). We try Docker removal first,
 /// then compose down if it looks like a project name.
-pub async fn cleanup_container(container_id: &str) {
+///
+/// `runner_ssh` — SSH target for split-machine mode (e.g. `docker@192.168.1.50`).
+pub async fn cleanup_container(container_id: &str, runner_ssh: Option<&str>) {
     // Compose project names and LXC/Docker container names all start with "ctf-"
     if container_id.starts_with("ctf-") && container_id.len() < 80 {
         let _ = compose::down(container_id).await;
         let _ = lxc::delete(container_id).await;
     }
     // Always also try docker remove (no-op if not a container ID)
-    if let Err(e) = docker::remove_container(container_id).await {
+    if let Err(e) = docker::remove_container(container_id, runner_ssh).await {
         eprintln!("  cleanup: failed to remove {}: {}", container_id, e);
     }
 }
@@ -71,6 +73,8 @@ pub async fn cleanup_container(container_id: &str) {
 ///
 /// Generates a random flag (if `flag_mode = "random"`), registers it with CTFd's DB,
 /// starts the container, and persists everything in the DB.
+///
+/// `runner_ssh` — SSH target for split-machine mode (e.g. `docker@192.168.1.50`).
 ///
 /// Returns `(host, port, connection_type, expires_at)`.
 pub async fn provision(
@@ -81,6 +85,7 @@ pub async fn provision(
     config: &Value,
     public_host: &str,
     ctfd_pool: &Pool,
+    runner_ssh: Option<&str>,
 ) -> Result<(String, u16, String, String)> {
     let backend = config["backend"].as_str().unwrap_or("docker");
     let internal_port = config["internal_port"].as_u64().unwrap_or(4000) as u32;
@@ -112,6 +117,7 @@ pub async fn provision(
                 internal_port,
                 command,
                 &env_vars,
+                runner_ssh,
             ).await?;
 
             let ctfd_flag_id = match (&flag, ctfd_id) {

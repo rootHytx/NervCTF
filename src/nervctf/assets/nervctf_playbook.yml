@@ -5,6 +5,7 @@
     ansible_python_interpreter: auto_silent
     docker_user: docker
     monitor_port: "{{ monitor_port | default('33133') }}"
+    max_concurrent_provisions: "{{ max_concurrent_provisions | default('4') }}"
 
   tasks:
     # ── Docker ─────────────────────────────────────────────────────────────────
@@ -56,6 +57,28 @@
               - docker-buildx-plugin
               - docker-compose-plugin
             state: present
+
+    # ── Docker daemon config ───────────────────────────────────────────────────
+    # Expand the default bridge-network address pool from ~30 to ~4096 /24s.
+    # Without this, docker compose up fails with "could not find an available,
+    # non-overlapping IPv4 address pool" once ~30 teams have active instances.
+    - name: Write Docker daemon config (expanded address pool)
+      copy:
+        content: |
+          {
+            "default-address-pools": [
+              {"base": "172.16.0.0/12", "size": 24}
+            ]
+          }
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+      register: docker_daemon_json
+
+    - name: Restart Docker daemon if config changed
+      systemd:
+        name: docker
+        state: restarted
+      when: docker_daemon_json.changed
 
     # ── Docker user ────────────────────────────────────────────────────────────
     - name: Ensure docker group exists
@@ -235,8 +258,26 @@
         content: |
           FROM debian:bookworm-slim
           RUN apt-get update && apt-get install -y --no-install-recommends \
-              docker.io ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
+                  ca-certificates curl gnupg libsqlite3-0 openssh-client && \
+              install -m 0755 -d /etc/apt/keyrings && \
+              curl -fsSL https://download.docker.com/linux/debian/gpg \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+                https://download.docker.com/linux/debian bookworm stable" \
+                > /etc/apt/sources.list.d/docker.list && \
+              apt-get update && \
+              apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin && \
+              rm -rf /var/lib/apt/lists/*
+          RUN printf '#!/bin/sh\n\
+          if [ -f /run/monitor_ssh_key ]; then\n\
+            mkdir -p /root/.ssh && chmod 700 /root/.ssh\n\
+            cp /run/monitor_ssh_key /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa\n\
+            printf "Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n" > /root/.ssh/config\n\
+            chmod 600 /root/.ssh/config\n\
+          fi\n\
+          exec "$@"\n' > /entrypoint.sh && chmod +x /entrypoint.sh
           COPY remote-monitor /usr/local/bin/remote-monitor
+          ENTRYPOINT ["/entrypoint.sh"]
           CMD ["/usr/local/bin/remote-monitor"]
         dest: "{{ ctfd_path }}/remote-monitor/Dockerfile"
         owner: "{{ docker_user }}"
@@ -272,11 +313,52 @@
         ctfd_db_url: >-
           {{
             (ctfd_env_raw.content | default('') | b64decode)
-            | regex_search('DATABASE_URL=([^\n\r]+)')
-            | regex_replace('^DATABASE_URL=', '')
+            | regex_findall('DATABASE_URL=([^\n\r]+)')
+            | first
+            | default('mysql://ctfd:ctfd@db/ctfd')
             | regex_replace('\+pymysql', '')
-            | default('mysql://ctfd:ctfd@db/ctfd', true)
           }}
+
+    # ── SSH keypair for monitor→runner (split-machine mode only) ──────────────
+    - name: Generate SSH keypair for remote-monitor (split mode)
+      when: runner_ip is defined
+      command: >-
+        ssh-keygen -t rsa -b 4096 -N ""
+        -f {{ ctfd_path }}/remote-monitor/monitor_ssh_key
+      args:
+        creates: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key"
+      become_user: "{{ docker_user }}"
+
+    - name: Set monitor SSH private key permissions
+      when: runner_ip is defined
+      file:
+        path: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key"
+        mode: "0600"
+        owner: "{{ docker_user }}"
+        group: docker
+
+    - name: Read monitor SSH public key
+      when: runner_ip is defined
+      slurp:
+        src: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key.pub"
+      register: monitor_pubkey_raw
+
+    - name: Set monitor_pubkey fact
+      when: runner_ip is defined
+      set_fact:
+        monitor_pubkey: "{{ monitor_pubkey_raw.content | b64decode | trim }}"
+
+    - name: Write SSH client config for monitor container
+      when: runner_ip is defined
+      copy:
+        content: |
+          Host *
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+        dest: "{{ ctfd_path }}/remote-monitor/ssh_config"
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0644"
 
     # ── docker-compose override (monitor service + CTFd env) ───────────────────
     - name: Write docker-compose override
@@ -295,17 +377,27 @@
               environment:
                 - CTFD_DB_URL={{ ctfd_db_url }}
                 - MONITOR_TOKEN={{ monitor_token }}
-                - PUBLIC_HOST={{ ansible_host }}
+                - PUBLIC_HOST={{ runner_ip | default(ansible_host) }}
                 - MONITOR_PORT={{ monitor_port }}
                 - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
+          {% if runner_ip is defined %}
+                - CHALLENGES_BASE_DIR=/home/docker/challenges
+                - RUNNER_SSH_TARGET=docker@{{ runner_ip }}
+          {% else %}
                 - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
+          {% endif %}
                 - CTFD_UPLOADS_DIR={{ ctfd_path }}/.data/CTFd/uploads
+                - MAX_CONCURRENT_PROVISIONS={{ max_concurrent_provisions }}
               networks:
                 - default
                 - internal
               volumes:
+          {% if runner_ip is defined %}
+                - {{ ctfd_path }}/remote-monitor/monitor_ssh_key:/run/monitor_ssh_key:ro
+          {% else %}
                 - /var/run/docker.sock:/var/run/docker.sock
                 - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+          {% endif %}
                 - {{ ctfd_path }}/remote-monitor/data:{{ ctfd_path }}/remote-monitor/data
                 - {{ ctfd_path }}/.data/CTFd/uploads:{{ ctfd_path }}/.data/CTFd/uploads
               ports:
@@ -321,3 +413,123 @@
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: plugin_src is defined or monitor_token is defined
+
+# ── Runner: separate machine for challenge containers (split-machine mode) ────
+- hosts: runner
+  become: yes
+  vars:
+    ansible_python_interpreter: auto_silent
+    docker_user: docker
+
+  tasks:
+    # ── Docker ─────────────────────────────────────────────────────────────────
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_installed
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Install Docker
+      when: docker_installed.rc != 0
+      block:
+        - name: Install apt prerequisites
+          apt:
+            name: [ca-certificates, curl]
+            state: present
+            update_cache: yes
+
+        - name: Create keyring directory
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: "0755"
+
+        - name: Download Docker GPG key
+          get_url:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            dest: /etc/apt/keyrings/docker.asc
+            mode: "0644"
+            force: no
+
+        - name: Add Docker apt repository
+          apt_repository:
+            repo: >-
+              deb [arch={{ ansible_architecture | replace('x86_64', 'amd64') }}
+              signed-by=/etc/apt/keyrings/docker.asc]
+              https://download.docker.com/linux/ubuntu
+              {{ ansible_distribution_release }} stable
+            filename: docker
+            state: present
+            update_cache: yes
+
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+
+    # ── Docker daemon config ───────────────────────────────────────────────────
+    - name: Write Docker daemon config (expanded address pool + BuildKit)
+      copy:
+        content: |
+          {
+            "default-address-pools": [
+              {"base": "172.16.0.0/12", "size": 24}
+            ],
+            "features": {"buildkit": true}
+          }
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+      register: docker_daemon_json_runner
+
+    - name: Restart Docker daemon if config changed
+      systemd:
+        name: docker
+        state: restarted
+      when: docker_daemon_json_runner.changed
+
+    # ── Docker user ────────────────────────────────────────────────────────────
+    - name: Ensure docker group exists
+      group:
+        name: docker
+        state: present
+
+    - name: Ensure docker user exists
+      user:
+        name: "{{ docker_user }}"
+        groups: docker
+        shell: /bin/bash
+        state: present
+        create_home: yes
+
+    # ── SSH server ─────────────────────────────────────────────────────────────
+    - name: Ensure openssh-server is installed
+      apt:
+        name: openssh-server
+        state: present
+
+    - name: Ensure SSH service is running
+      systemd:
+        name: ssh
+        state: started
+        enabled: yes
+
+    # ── Authorize remote-monitor's SSH public key ──────────────────────────────
+    - name: Authorize remote-monitor SSH public key
+      authorized_key:
+        user: "{{ docker_user }}"
+        state: present
+        key: "{{ hostvars[groups['ctfd'][0]]['monitor_pubkey'] }}"
+
+    # ── Challenges directory (where compose challenge sources are stored) ──────
+    - name: Create challenges directory on runner
+      file:
+        path: /home/docker/challenges
+        state: directory
+        owner: "{{ docker_user }}"
+        group: docker
+        mode: "0755"

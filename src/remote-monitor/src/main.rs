@@ -67,10 +67,18 @@ struct AppState {
     public_host: String,
     db: Db,
     ctfd_pool: mysql_async::Pool,
-    /// Host-visible directory where compose challenge sources are stored.
+    /// Directory where compose challenge sources are stored.
+    /// In split-machine mode this path lives on the **runner** host.
     challenges_base_dir: String,
     /// Path to CTFd uploads directory for file writes (empty string if not set).
     ctfd_uploads_dir: String,
+    /// SSH target for split-machine mode, e.g. `docker@192.168.1.50`.
+    /// When set, all Docker/compose commands are executed on the runner via SSH
+    /// instead of the local Docker daemon.
+    runner_ssh_target: Option<String>,
+    /// Limits concurrent docker/compose provision operations to prevent port-pick
+    /// races and avoid overwhelming the Docker daemon socket.
+    provision_sem: Arc<tokio::sync::Semaphore>,
 }
 
 #[tokio::main]
@@ -91,10 +99,24 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "/opt/nervctf/challenges".to_string());
     let ctfd_uploads_dir = env::var("CTFD_UPLOADS_DIR").unwrap_or_default();
 
+    // Split-machine mode: parse RUNNER_SSH_TARGET (e.g. "docker@192.168.1.50")
+    // or fall back to extracting the target from DOCKER_HOST=ssh://user@host.
+    let runner_ssh_target: Option<String> = env::var("RUNNER_SSH_TARGET").ok()
+        .or_else(|| {
+            env::var("DOCKER_HOST").ok()
+                .filter(|h| h.starts_with("ssh://"))
+                .map(|h| h.trim_start_matches("ssh://").to_string())
+        })
+        .filter(|s| !s.is_empty());
+
     let ctfd_db_url = env::var("CTFD_DB_URL").expect("CTFD_DB_URL is required");
 
     let db = db::open(&db_path)?;
     let ctfd_pool = ctfd_db::create_pool(&ctfd_db_url)?;
+
+    let max_concurrent_provisions: usize = env::var("MAX_CONCURRENT_PROVISIONS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    info!("provision concurrency limit: {}", max_concurrent_provisions);
 
     let state = Arc::new(AppState {
         monitor_token,
@@ -103,6 +125,8 @@ async fn main() -> Result<()> {
         ctfd_pool,
         challenges_base_dir,
         ctfd_uploads_dir,
+        runner_ssh_target,
+        provision_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_provisions)),
     });
 
     // Spawn background CTFd solve sync task (read-only from MariaDB → SQLite cache)
@@ -138,7 +162,7 @@ async fn main() -> Result<()> {
                             ctfd_db::delete_flag(&expiry_state.ctfd_pool, flag_id).await;
                         }
                         if let Some(cid) = container_id {
-                            instance::cleanup_container(&cid).await;
+                            instance::cleanup_container(&cid, expiry_state.runner_ssh_target.as_deref()).await;
                         }
                     }
                 }
@@ -160,6 +184,11 @@ async fn main() -> Result<()> {
     let addr = format!("{}:{}", bind, port);
     info!("Starting remote-monitor on {}", addr);
     info!("PUBLIC_HOST={}", state.public_host);
+    info!("CHALLENGES_BASE_DIR={}", state.challenges_base_dir);
+    match &state.runner_ssh_target {
+        Some(target) => info!("Split-machine mode: runner={} (challenges stored on runner at {})", target, state.challenges_base_dir),
+        None => info!("Single-machine mode: challenges at {}", state.challenges_base_dir),
+    }
 
     let app = Router::new()
         .route("/health", get(health_handler))
@@ -186,6 +215,7 @@ async fn main() -> Result<()> {
         // Admin routes (monitor token)
         .route("/api/v1/instance/build", post(instance_build_handler))
         .route("/api/v1/instance/build-compose", post(build_compose_handler))
+        .route("/api/v1/instance/build-compose-remote", post(build_compose_remote_handler))
         .route("/api/v1/instance/register", post(instance_register_handler))
         .route("/api/v1/instance/list", get(instance_list_handler))
         .route("/api/v1/admin/instances", get(admin_instances_handler))
@@ -501,7 +531,7 @@ async fn instance_build_handler(
 
     let image_tag = format!("{}:latest", instance::sanitize_name(&challenge_name));
 
-    if let Err(e) = instance::docker::build_image(tmp.path(), &image_tag).await {
+    if let Err(e) = instance::docker::build_image(tmp.path(), &image_tag, state.runner_ssh_target.as_deref()).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
 
@@ -550,52 +580,6 @@ async fn build_compose_handler(
     let sanitized = instance::sanitize_name(&challenge_name);
     let extract_dir = format!("{}/{}", state.challenges_base_dir.trim_end_matches('/'), sanitized);
 
-    // Write tar to temp file
-    let tmp = match tempfile::NamedTempFile::new() {
-        Ok(f) => f,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
-    };
-    if let Err(e) = std::fs::write(tmp.path(), &tar_bytes) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-    }
-
-    // Wipe any existing challenge directory so stale placeholder directories
-    // (created by Docker when bind-mount sources were missing on a previous run)
-    // cannot block tar from extracting files over them.
-    if std::path::Path::new(&extract_dir).exists() {
-        if let Err(e) = std::fs::remove_dir_all(&extract_dir) {
-            error!("build-compose: failed to remove existing {}: {}", extract_dir, e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-        }
-    }
-    if let Err(e) = std::fs::create_dir_all(&extract_dir) {
-        error!("build-compose: failed to create {}: {}", extract_dir, e);
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-    }
-    info!("build-compose: extracting {} bytes to {}", tar_bytes.len(), extract_dir);
-
-    // Extract tar.gz into the challenge directory
-    let extract_out = tokio::process::Command::new("tar")
-        .args(["-xzf", tmp.path().to_str().unwrap_or(""), "-C", &extract_dir])
-        .output()
-        .await;
-
-    match extract_out {
-        Ok(out) if out.status.success() => {
-            info!("build-compose: extraction complete for {}", challenge_name);
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr).to_string();
-            error!("build-compose: tar extraction failed for {}: {}", challenge_name, err);
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("tar extraction failed: {}", err)}))).into_response();
-        }
-        Err(e) => {
-            error!("build-compose: tar spawn failed: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-        }
-    }
-
     // Determine compose file path from DB config (if challenge is already registered)
     let compose_file_str = db::get_config(&state.db, &challenge_name)
         .ok()
@@ -605,35 +589,178 @@ async fn build_compose_handler(
         .unwrap_or_else(|| "docker-compose.yml".to_string());
 
     let compose_path = if compose_file_str.starts_with('/') {
-        compose_file_str
+        compose_file_str.clone()
     } else {
         format!("{}/{}", extract_dir, compose_file_str)
     };
 
-    info!("build-compose: building images with compose file {}", compose_path);
+    if let Some(ref target) = state.runner_ssh_target {
+        // ── Split-machine mode: extract tar and build on the runner via SSH ──
+        info!("build-compose: uploading {} bytes to runner:{}", tar_bytes.len(), extract_dir);
 
-    // Pre-build all images (no --build at runtime)
-    let build_out = instance::compose::compose_cmd().await
-        .args(["-f", compose_path.as_str(), "build"])
-        .output()
-        .await;
-
-    match build_out {
-        Ok(out) if out.status.success() => {
-            info!("build-compose: images built successfully for {}", challenge_name);
-        }
-        Ok(out) => {
-            let err = String::from_utf8_lossy(&out.stderr).to_string();
-            error!("build-compose: docker compose build failed for {}: {}", challenge_name, err);
-            return (StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("docker compose build failed: {}", err)}))).into_response();
-        }
-        Err(e) => {
-            error!("build-compose: compose spawn failed: {}", e);
+        // Write tar to a temp file locally first
+        let tmp = match tempfile::NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        };
+        if let Err(e) = std::fs::write(tmp.path(), &tar_bytes) {
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
         }
+
+        // Wipe + create dir, extract tar, and build — all on the runner in one SSH session
+        let remote_cmd = format!(
+            "rm -rf '{dir}' && mkdir -p '{dir}' && tar -xzf - -C '{dir}' && DOCKER_BUILDKIT=1 docker compose -f '{compose}' build",
+            dir = extract_dir,
+            compose = compose_path,
+        );
+
+        let extract_out = tokio::process::Command::new("ssh")
+            .args([
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "BatchMode=yes",
+                target,
+                &remote_cmd,
+            ])
+            .stdin(std::process::Stdio::from(
+                std::fs::File::open(tmp.path()).unwrap(),
+            ))
+            .output()
+            .await;
+
+        match extract_out {
+            Ok(out) if out.status.success() => {
+                info!("build-compose: images built on runner for {}", challenge_name);
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                error!("build-compose: remote build failed for {}: {}", challenge_name, err);
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("remote build failed: {}", err)}))).into_response();
+            }
+            Err(e) => {
+                error!("build-compose: ssh spawn failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            }
+        }
+    } else {
+        // ── Single-machine mode: extract locally and build locally ──
+
+        // Write tar to temp file
+        let tmp = match tempfile::NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        };
+        if let Err(e) = std::fs::write(tmp.path(), &tar_bytes) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+
+        // Wipe any existing challenge directory so stale placeholder directories
+        // cannot block tar from extracting files over them.
+        if std::path::Path::new(&extract_dir).exists() {
+            if let Err(e) = std::fs::remove_dir_all(&extract_dir) {
+                error!("build-compose: failed to remove existing {}: {}", extract_dir, e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            }
+        }
+        if let Err(e) = std::fs::create_dir_all(&extract_dir) {
+            error!("build-compose: failed to create {}: {}", extract_dir, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+        }
+        info!("build-compose: extracting {} bytes to {}", tar_bytes.len(), extract_dir);
+
+        let extract_out = tokio::process::Command::new("tar")
+            .args(["-xzf", tmp.path().to_str().unwrap_or(""), "-C", &extract_dir])
+            .output()
+            .await;
+
+        match extract_out {
+            Ok(out) if out.status.success() => {
+                info!("build-compose: extraction complete for {}", challenge_name);
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr).to_string();
+                error!("build-compose: tar extraction failed for {}: {}", challenge_name, err);
+                return (StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": format!("tar extraction failed: {}", err)}))).into_response();
+            }
+            Err(e) => {
+                error!("build-compose: tar spawn failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+            }
+        }
+
+        info!("build-compose: building images with compose file {}", compose_path);
+
+        if let Err(e) = instance::compose::build(&compose_path, None).await {
+            error!("build-compose: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()}))).into_response();
+        }
+        info!("build-compose: images built successfully for {}", challenge_name);
     }
 
+    Json(json!({"ok": true, "compose_dir": extract_dir})).into_response()
+}
+
+// ── Admin: build compose images on runner (split-machine mode) ───────────────
+// Called by the CLI after it has rsynced challenge files directly to the runner.
+// No multipart — just a JSON body telling us which challenge and compose file.
+
+#[derive(Deserialize)]
+struct BuildComposeRemoteBody {
+    challenge_name: String,
+    #[serde(default)]
+    compose_file: Option<String>,
+    #[serde(default)]
+    challenges_dir: Option<String>,
+}
+
+async fn build_compose_remote_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BuildComposeRemoteBody>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+
+    let target = match &state.runner_ssh_target {
+        Some(t) => t.clone(),
+        None => return (StatusCode::BAD_REQUEST,
+            Json(json!({"error": "build-compose-remote requires split-machine mode (RUNNER_SSH_TARGET)"}))).into_response(),
+    };
+
+    let sanitized = instance::sanitize_name(&body.challenge_name);
+    let base_dir = body.challenges_dir.as_deref()
+        .unwrap_or(&state.challenges_base_dir);
+    let extract_dir = format!("{}/{}", base_dir.trim_end_matches('/'), sanitized);
+
+    let compose_from_db = db::get_config(&state.db, &body.challenge_name)
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+        .and_then(|v| v["compose_file"].as_str().map(|s| s.to_string()));
+
+    let compose_file_str = body.compose_file.as_deref()
+        .or(compose_from_db.as_deref())
+        .unwrap_or("docker-compose.yml");
+
+    let compose_path = if compose_file_str.starts_with('/') {
+        compose_file_str.to_string()
+    } else {
+        format!("{}/{}", extract_dir, compose_file_str)
+    };
+
+    info!("build-compose-remote: building images on runner for {} ({})", body.challenge_name, compose_path);
+
+    if let Err(e) = instance::compose::build(&compose_path, Some(&target)).await {
+        error!("build-compose-remote: {}", e);
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()}))).into_response();
+    }
+
+    info!("build-compose-remote: images built successfully for {}", body.challenge_name);
     Json(json!({"ok": true, "compose_dir": extract_dir})).into_response()
 }
 
@@ -685,7 +812,7 @@ async fn instance_request_handler(
 
     match instance::provision(
         &state.db, &body.challenge_name, team_id, None, &config, &state.public_host,
-        &state.ctfd_pool,
+        &state.ctfd_pool, state.runner_ssh_target.as_deref(),
     ).await {
         Ok((host, port, conn, expires_at)) => Json(json!({
             "host": host,
@@ -801,7 +928,7 @@ async fn instance_stop_handler(
     match db::delete_instance(&state.db, &body.challenge_name, team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
             if let Some(cid) = container_id {
-                instance::cleanup_container(&cid).await;
+                instance::cleanup_container(&cid, state.runner_ssh_target.as_deref()).await;
             }
             if let Some(flag_id) = ctfd_flag_id {
                 ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
@@ -921,18 +1048,29 @@ async fn plugin_request_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
 
-    // Provision in background — compose up can take 30-60 s
+    // Provision in background — compose up can take 30-60 s.
+    // Semaphore limits concurrent provisions to prevent port-pick races and
+    // avoid overwhelming the Docker daemon socket under high concurrency.
     let state_bg = Arc::clone(&state);
     let challenge_name_bg = body.challenge_name.clone();
     let team_id_bg = body.team_id;
     let user_id_bg = body.user_id;
     tokio::spawn(async move {
+        let _permit = match state_bg.provision_sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => {
+                error!("provision_bg: semaphore closed for '{}' team {}", challenge_name_bg, team_id_bg);
+                let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id_bg);
+                return;
+            }
+        };
         info!("provision_bg: starting '{}' team {}", challenge_name_bg, team_id_bg);
         match instance::provision(
             &state_bg.db, &challenge_name_bg, team_id_bg, user_id_bg,
             &config, &state_bg.public_host, &state_bg.ctfd_pool,
+            state_bg.runner_ssh_target.as_deref(),
         ).await {
-            Ok((host, port, conn, exp)) => {
+            Ok((host, port, conn, _exp)) => {
                 info!("provision_bg: done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id_bg);
             }
             Err(e) => {
@@ -941,6 +1079,7 @@ async fn plugin_request_handler(
                 let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id_bg);
             }
         }
+        // _permit dropped here — releases the semaphore slot
     });
 
     Json(json!({
@@ -1011,7 +1150,8 @@ async fn plugin_stop_handler(
             }
             // Container teardown in background — compose down is slow.
             if let Some(cid) = container_id {
-                tokio::spawn(async move { instance::cleanup_container(&cid).await; });
+                let ssh = state.runner_ssh_target.clone();
+                tokio::spawn(async move { instance::cleanup_container(&cid, ssh.as_deref()).await; });
             }
             Json(json!({"ok": true})).into_response()
         }
@@ -1058,7 +1198,8 @@ async fn plugin_solve_handler(
             }
             // Container teardown in background — compose down is slow.
             if let Some(cid) = container_id {
-                tokio::spawn(async move { instance::cleanup_container(&cid).await; });
+                let ssh = state.runner_ssh_target.clone();
+                tokio::spawn(async move { instance::cleanup_container(&cid, ssh.as_deref()).await; });
             }
             Json(json!({"ok": true})).into_response()
         }
@@ -1085,7 +1226,7 @@ async fn plugin_stop_all_handler(
         Ok(pairs) => {
             for (container_id, ctfd_flag_id) in pairs {
                 if let Some(cid) = container_id {
-                    instance::cleanup_container(&cid).await;
+                    instance::cleanup_container(&cid, state.runner_ssh_target.as_deref()).await;
                 }
                 if let Some(flag_id) = ctfd_flag_id {
                     ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;

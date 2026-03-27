@@ -234,10 +234,21 @@ function view_container_info(challenge_id) {
     headers: { Accept: "application/json", "CSRF-Token": init.csrfNonce },
   })
     .then(function (r) {
+      if (r.status === 401 || r.status === 403 || r.redirected) {
+        return { status: "not_logged_in" };
+      }
       return r.json();
     })
     .then(function (data) {
       while (alert.firstChild) alert.removeChild(alert.firstChild);
+
+      if (data.status === "not_logged_in") {
+        alert.textContent = "Log in to fetch instance.";
+        alert.classList.add("alert-info");
+        hideUpdateBtns();
+        hideCreateBtn();
+        return;
+      }
 
       if (data.status === "solved") {
         alert.textContent = "Challenge solved. No instance needed.";

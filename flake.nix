@@ -46,8 +46,14 @@
         aarch64 = pkgs.pkgsCross.aarch64-multiplatform;
         mingw64 = pkgs.pkgsCross.mingwW64;
 
-        commonBuildInputs = with pkgs; [ openssl sqlite ];
-        commonNativeBuildInputs = [ pkgs.pkg-config rustToolchain ];
+        commonBuildInputs = with pkgs; [
+          openssl
+          sqlite
+        ];
+        commonNativeBuildInputs = [
+          pkgs.pkg-config
+          rustToolchain
+        ];
         commonEnv = {
           PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.sqlite.dev}/lib/pkgconfig";
           LIBRARY_PATH = "${pkgs.sqlite}/lib";
@@ -75,6 +81,7 @@
           inherit src;
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
+          cargoExtraArgs = "--offline";
           # Silence "could not find system library 'openssl'" during dep build
           OPENSSL_NO_VENDOR = "1";
         };
@@ -88,7 +95,7 @@
           // {
             inherit cargoArtifacts;
             pname = "nervctf";
-            version = "0.1.0";
+            version = "2.1.0";
             cargoExtraArgs = "--package nervctf";
           }
         );
@@ -98,7 +105,7 @@
           // {
             inherit cargoArtifacts;
             pname = "remote-monitor";
-            version = "0.1.0";
+            version = "2.1.0";
             cargoExtraArgs = "--package remote-monitor";
             doCheck = false;
           }

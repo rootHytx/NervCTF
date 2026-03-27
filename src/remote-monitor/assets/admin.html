@@ -9,7 +9,7 @@
   body { font-family: monospace; background: #111; color: #ddd; margin: 0; padding: 20px; }
   h1 { color: #eee; font-size: 1.4rem; margin-bottom: 0.2rem; }
   h2 { font-size: 1.1rem; margin: 1.8rem 0 0.5rem; color: #bbb; border-bottom: 1px solid #333; padding-bottom: 4px; }
-  #token-info { font-size: 0.8rem; color: #666; margin-bottom: 1rem; }
+  #token-info { font-size: 0.8rem; color: #666; margin-bottom: 0.3rem; }
   .status { font-size: 0.8rem; color: #888; margin-bottom: 0.4rem; }
   .section-hdr { display: flex; align-items: baseline; gap: 1rem; }
   .count-badge { font-size: 0.75rem; background: #333; color: #aaa; padding: 1px 6px; border-radius: 2px; }
@@ -48,14 +48,39 @@
     font-family: monospace; font-size: 0.78rem; padding: 2px 8px;
   }
   .btn-stop:hover { background: #9e2a2a; }
+  .btn-stop-all {
+    background: #7a1e1e; border: 1px solid #a03030; color: #ffaaaa; cursor: pointer;
+    font-family: monospace; font-size: 0.82rem; padding: 2px 12px; font-weight: bold;
+  }
+  .btn-stop-all:hover:not(:disabled) { background: #b03030; }
+  .btn-stop-all:disabled { opacity: 0.4; cursor: default; }
   .row-solved { opacity: 0.55; }
   .badge-solved { color: #888; font-size: 0.78rem; }
+  /* CTFd links */
+  a.cl { color: #7abfff; text-decoration: none; }
+  a.cl:hover { text-decoration: underline; }
+  /* Toggles */
+  .toggle-lbl { color: #666; cursor: pointer; user-select: none; white-space: nowrap; }
+  .toggle-lbl input[type=checkbox] { cursor: pointer; accent-color: #7abfff; }
+  .sep { color: #444; }
+  /* CTFd URL input */
+  #ctfd-url-input {
+    background: #1e1e1e; border: 1px solid #444; color: #aaa;
+    font-family: monospace; font-size: 0.78rem; padding: 2px 6px; width: 15rem;
+  }
+  #ctfd-url-input::placeholder { color: #555; }
 </style>
 </head>
 <body>
 
 <h1>NervCTF Monitor Admin</h1>
 <div id="token-info">Token: (loaded from ?token= param)</div>
+<div class="toolbar" style="margin-bottom:0.8rem">
+  <label style="color:#666">CTFd URL:</label>
+  <input id="ctfd-url-input" type="text" placeholder="http://ctfd-host" oninput="saveCTFdUrl(this.value)">
+  <span class="sep">|</span>
+  <label class="toggle-lbl"><input type="checkbox" id="links-toggle" onchange="toggleLinks(this)"> &#128279; CTFd Links</label>
+</div>
 <div class="status" id="last-refresh">Loading...</div>
 
 <!-- ── Flag Sharing Alerts ─────────────────────────────────────────────── -->
@@ -93,6 +118,9 @@
   <button class="btn-page" id="instances-prev" onclick="sectionPage('instances',-1)">&#8592; Prev</button>
   <span class="page-info" id="instances-pageinfo"></span>
   <button class="btn-page" id="instances-next" onclick="sectionPage('instances', 1)">Next &#8594;</button>
+  <button class="btn-stop-all" id="instances-stop-all" onclick="stopAll()">Stop All</button>
+  <span class="sep">|</span>
+  <label class="toggle-lbl"><input type="checkbox" id="hide-solved-toggle" onchange="toggleHideSolved(this)"> Hide Solved</label>
 </div>
 <div id="instances-table"></div>
 
@@ -147,6 +175,43 @@
       'No token in URL (?token=...) — API calls will fail with 401';
   }
 
+  // ── Persistent settings ───────────────────────────────────────────────────
+
+  var ctfdUrl = localStorage.getItem('ctfd_url') || '';
+  var ctfdLinksEnabled = localStorage.getItem('ctfd_links') === '1';
+  var hideSolved = localStorage.getItem('hide_solved') === '1';
+
+  document.getElementById('ctfd-url-input').value = ctfdUrl;
+  document.getElementById('links-toggle').checked = ctfdLinksEnabled;
+  document.getElementById('hide-solved-toggle').checked = hideSolved;
+
+  window.saveCTFdUrl = function(val) {
+    ctfdUrl = val.trim();
+    localStorage.setItem('ctfd_url', ctfdUrl);
+    rerenderAll();
+  };
+
+  window.toggleLinks = function(cb) {
+    ctfdLinksEnabled = cb.checked;
+    localStorage.setItem('ctfd_links', ctfdLinksEnabled ? '1' : '0');
+    rerenderAll();
+  };
+
+  window.toggleHideSolved = function(cb) {
+    hideSolved = cb.checked;
+    localStorage.setItem('hide_solved', hideSolved ? '1' : '0');
+    renderSection('instances');
+  };
+
+  function rerenderAll() {
+    renderSection('alerts');
+    renderSection('instances');
+    renderSection('solves');
+    renderSection('attempts');
+  }
+
+  // ── HTML helpers ──────────────────────────────────────────────────────────
+
   function authHeaders() {
     return { 'Authorization': 'Token ' + token, 'Content-Type': 'application/json' };
   }
@@ -161,6 +226,24 @@
   function nameId(name, id) {
     if (name) return escText(name) + ' <span style="color:#666">(' + escText(id) + ')</span>';
     return escText(id);
+  }
+
+  function linkTeam(id, name) {
+    var label = nameId(name, id);
+    if (!ctfdLinksEnabled || !ctfdUrl || id == null) return label;
+    return '<a class="cl" href="' + escText(ctfdUrl) + '/teams/' + encodeURIComponent(id) + '" target="_blank">' + label + '</a>';
+  }
+
+  function linkUser(id, name) {
+    if (id === null || id === undefined) return '—';
+    var label = nameId(name, id);
+    if (!ctfdLinksEnabled || !ctfdUrl) return label;
+    return '<a class="cl" href="' + escText(ctfdUrl) + '/users/' + encodeURIComponent(id) + '" target="_blank">' + label + '</a>';
+  }
+
+  function linkChallenge(name) {
+    if (!ctfdLinksEnabled || !ctfdUrl || !name) return escText(name);
+    return '<a class="cl" href="' + escText(ctfdUrl) + '/challenges" target="_blank">' + escText(name) + '</a>';
   }
 
   function fetchJSON(url, cb) {
@@ -211,7 +294,6 @@
         names.push(r.challenge_name);
     });
     names.sort();
-    // Rebuild options preserving selection if still valid
     while (sel.options.length > 1) sel.remove(1);
     names.forEach(function (n) {
       var opt = document.createElement('option');
@@ -227,15 +309,23 @@
     var challenge = getChallenge(name);
     var limit = getLimit(name);
 
-    var filtered = (name === 'attempts')
-      ? attemptsFiltered(s.data, challenge)
-      : s.data.filter(function (r) {
-          return !challenge || r.challenge_name === challenge;
-        });
+    var filtered;
+    if (name === 'attempts') {
+      filtered = attemptsFiltered(s.data, challenge);
+    } else if (name === 'instances') {
+      filtered = s.data.filter(function (r) {
+        if (challenge && r.challenge_name !== challenge) return false;
+        if (hideSolved && r.status === 'solved') return false;
+        return true;
+      });
+    } else {
+      filtered = s.data.filter(function (r) {
+        return !challenge || r.challenge_name === challenge;
+      });
+    }
 
     var total = filtered.length;
     var totalPages = (limit > 0) ? Math.max(1, Math.ceil(total / limit)) : 1;
-    // Clamp page
     if (s.page >= totalPages) s.page = totalPages - 1;
     if (s.page < 0) s.page = 0;
 
@@ -243,7 +333,6 @@
       ? filtered.slice(s.page * limit, (s.page + 1) * limit)
       : filtered;
 
-    // Pagination controls
     var prevBtn = document.getElementById(name + '-prev');
     var nextBtn = document.getElementById(name + '-next');
     var pageInfo = document.getElementById(name + '-pageinfo');
@@ -279,10 +368,10 @@
     data.forEach(function (r) {
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
-        '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td class="badge-sharing">' + nameId(r.team_name, r.team_id) + '</td>' +
-        '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
-        '<td>' + (r.owner_team_id !== null ? nameId(r.owner_team_name, r.owner_team_id) : '') + '</td>' +
+        '<td>' + linkChallenge(r.challenge_name) + '</td>' +
+        '<td class="badge-sharing">' + linkTeam(r.team_id, r.team_name) + '</td>' +
+        '<td>' + linkUser(r.user_id, r.user_name) + '</td>' +
+        '<td>' + (r.owner_team_id !== null ? linkTeam(r.owner_team_id, r.owner_team_name) : '') + '</td>' +
         '<td>' + (r.is_correct ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
         '<td>' + escText(r.submitted_flag) + '</td>' +
         '</tr>';
@@ -305,7 +394,6 @@
   // ── Instances ──────────────────────────────────────────────────────────────
 
   function renderInstancesRows(data, el) {
-    // badge shows running count from full (unfiltered) dataset
     var running = state.instances.data.filter(function (r) { return r.status === 'running'; });
     document.getElementById('instances-count').textContent = running.length;
 
@@ -325,9 +413,9 @@
         ? '<span class="badge-solved">Solved</span>'
         : '<button class="btn-stop" onclick="' + stopAttr + '">Stop</button>';
       html += '<tr' + rowClass + '>' +
-        '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td>' + nameId(r.team_name, r.team_id) + '</td>' +
-        '<td>' + (r.user_id !== null ? nameId(r.user_name, r.user_id) : '—') + '</td>' +
+        '<td>' + linkChallenge(r.challenge_name) + '</td>' +
+        '<td>' + linkTeam(r.team_id, r.team_name) + '</td>' +
+        '<td>' + linkUser(r.user_id, r.user_name) + '</td>' +
         '<td>' + escText(r.host) + ':' + escText(r.port) + '</td>' +
         '<td>' + escText(r.connection_type) + '</td>' +
         '<td>' + escText(r.status) + '</td>' +
@@ -344,19 +432,17 @@
     fetchJSON('/api/v1/admin/instances', function (data, err) {
       if (!Array.isArray(data)) data = [];
       state.instances.data = data;
-      // Rebuild aliveSet for attempts filter
       aliveSet = new Set(
         data.filter(function (i) { return i.status === 'running'; })
             .map(function (i) { return i.challenge_name + '|' + String(i.team_id); })
       );
       updateChallengeFilter('instances', data);
       renderSection('instances');
-      renderSection('attempts'); // alive set changed
+      renderSection('attempts');
     });
   }
 
   window.stopInstance = function(challengeName, teamId) {
-    if (!confirm('Stop instance for team ' + teamId + ' on "' + challengeName + '"?')) return;
     fetch('/api/v1/plugin/stop', {
       method: 'DELETE',
       headers: authHeaders(),
@@ -367,6 +453,43 @@
         else { alert('Error: ' + (d.error || JSON.stringify(d))); }
       })
       .catch(function (e) { alert('Network error: ' + e.message); });
+  };
+
+  window.stopAll = function() {
+    var challenge = getChallenge('instances');
+    var btn = document.getElementById('instances-stop-all');
+    btn.disabled = true;
+    btn.textContent = 'Stopping…';
+
+    var names = challenge
+      ? [challenge]
+      : state.instances.data
+          .map(function (r) { return r.challenge_name; })
+          .filter(function (n, i, a) { return a.indexOf(n) === i; });
+
+    if (names.length === 0) {
+      btn.disabled = false;
+      btn.textContent = 'Stop All';
+      return;
+    }
+
+    var remaining = names.length;
+    names.forEach(function (name) {
+      fetch('/api/v1/plugin/stop_all', {
+        method: 'DELETE',
+        headers: authHeaders(),
+        body: JSON.stringify({ challenge_name: name }),
+      })
+        .catch(function () {})
+        .finally(function () {
+          remaining--;
+          if (remaining === 0) {
+            btn.disabled = false;
+            btn.textContent = 'Stop All';
+            loadInstances();
+          }
+        });
+    });
   };
 
   // ── Solves ─────────────────────────────────────────────────────────────────
@@ -382,9 +505,9 @@
     data.forEach(function (r) {
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
-        '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td class="badge-ok">' + nameId(r.team_name, r.team_id) + '</td>' +
-        '<td>' + (r.user_id !== null ? nameId(r.user_name, r.user_id) : '—') + '</td>' +
+        '<td>' + linkChallenge(r.challenge_name) + '</td>' +
+        '<td class="badge-ok">' + linkTeam(r.team_id, r.team_name) + '</td>' +
+        '<td>' + linkUser(r.user_id, r.user_name) + '</td>' +
         '</tr>';
     });
     html += '</tbody></table>';
@@ -395,20 +518,17 @@
     fetchJSON('/api/v1/admin/solves', function (data, err) {
       if (!Array.isArray(data)) data = [];
       state.solves.data = data;
-      // Rebuild solvedSet for attempts is_correct derivation
       solvedSet = new Set(data.map(function (s) {
         return s.challenge_name + '|' + String(s.team_id);
       }));
       updateChallengeFilter('solves', data);
       renderSection('solves');
-      renderSection('attempts'); // solvedSet changed
+      renderSection('attempts');
     });
   }
 
   // ── Attempts ───────────────────────────────────────────────────────────────
 
-  // Pre-filter: only show notable attempts (correct per CTFd, sharing, or alive instance).
-  // is_correct is derived from solvedSet (ctfd_solves-backed) not the stored flag.
   function attemptsFiltered(data, challenge) {
     return data.filter(function (r) {
       if (challenge && r.challenge_name !== challenge) return false;
@@ -419,7 +539,6 @@
   }
 
   function renderAttemptsRows(data, el) {
-    // badge shows filtered total, not page count
     var challenge = getChallenge('attempts');
     var filtered = attemptsFiltered(state.attempts.data, challenge);
     document.getElementById('attempts-count').textContent = filtered.length;
@@ -436,12 +555,12 @@
       var isCorrect = r.is_correct && solvedSet.has(key);
       html += '<tr>' +
         '<td>' + escText(r.timestamp) + '</td>' +
-        '<td>' + escText(r.challenge_name) + '</td>' +
-        '<td>' + nameId(r.team_name, r.team_id) + '</td>' +
-        '<td>' + nameId(r.user_name, r.user_id) + '</td>' +
+        '<td>' + linkChallenge(r.challenge_name) + '</td>' +
+        '<td>' + linkTeam(r.team_id, r.team_name) + '</td>' +
+        '<td>' + linkUser(r.user_id, r.user_name) + '</td>' +
         '<td>' + (isCorrect ? '<span class="badge-ok">YES</span>' : '<span class="badge-fail">no</span>') + '</td>' +
         '<td>' + (r.is_flag_sharing ? '<span class="badge-sharing">SHARING</span>' : '') + '</td>' +
-        '<td>' + (r.owner_team_id !== null ? nameId(r.owner_team_name, r.owner_team_id) : '') + '</td>' +
+        '<td>' + (r.owner_team_id !== null ? linkTeam(r.owner_team_id, r.owner_team_name) : '') + '</td>' +
         '<td>' + escText(r.submitted_flag) + '</td>' +
         '</tr>';
     });

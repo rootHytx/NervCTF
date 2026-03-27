@@ -3,7 +3,6 @@
 
 use crate::ctfd_api::models::Challenge;
 use anyhow::{anyhow, Context, Result};
-use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -169,48 +168,6 @@ impl DirectoryScanner {
         Ok(config)
     }
 
-    pub fn get_relative_path(&self, base_path: &Path, file_path: &Path) -> Result<PathBuf> {
-        file_path
-            .strip_prefix(base_path)
-            .map(|p| p.to_path_buf())
-            .map_err(|e| anyhow!("Failed to get relative path: {}", e))
-    }
-
-    pub fn validate_challenge_files(&self, config: &Challenge, base_path: &Path) -> Result<()> {
-        // Check if files referenced in challenge exist
-        if let Some(files) = &config.files {
-            for file in files {
-                let file_path = base_path.join(file.clone());
-                if !file_path.exists() {
-                    return Err(anyhow!(
-                        "Referenced file does not exist: {}",
-                        file_path.display()
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn find_challenge_files(&self, base_path: &Path) -> Result<Vec<PathBuf>> {
-        let mut files = Vec::new();
-
-        for entry in WalkDir::new(base_path)
-            .max_depth(5)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() && self.is_challenge_file(path) {
-                files.push(path.to_path_buf());
-            }
-        }
-
-        Ok(files)
-    }
-
     pub fn get_stats(&self, challenges: &[Challenge]) -> ChallengeStats {
         let mut stats = ChallengeStats::default();
 
@@ -239,7 +196,7 @@ impl DirectoryScanner {
 }
 
 /// Statistics about scanned challenges
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 pub struct ChallengeStats {
     pub total_challenges: usize,
     pub total_points: u32,
@@ -383,50 +340,6 @@ mod tests {
     }
 
     #[test]
-    fn test_find_challenge_files_returns_paths() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let sub = temp_dir.path().join("chall");
-        fs::create_dir_all(&sub)?;
-        fs::write(
-            sub.join("challenge.yml"),
-            "name: x\ncategory: y\nvalue: 1\ntype: standard\nflags:\n  - flag{x}\n",
-        )?;
-
-        let scanner = DirectoryScanner::new();
-        let files = scanner.find_challenge_files(temp_dir.path())?;
-
-        assert_eq!(files.len(), 1);
-        assert!(files[0].ends_with("challenge.yml"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_validate_challenge_files_missing() -> Result<()> {
-        let temp_dir = tempdir()?;
-        let yaml = "name: x\ncategory: y\nvalue: 1\ntype: standard\nflags:\n  - flag{x}\nfiles:\n  - missing.zip\n";
-        let chall: Challenge = serde_yaml::from_str(yaml)?;
-
-        let scanner = DirectoryScanner::new();
-        let result = scanner.validate_challenge_files(&chall, temp_dir.path());
-        assert!(result.is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn test_validate_challenge_files_present() -> Result<()> {
-        let temp_dir = tempdir()?;
-        fs::write(temp_dir.path().join("binary"), b"ELF")?;
-
-        let yaml = "name: x\ncategory: y\nvalue: 1\ntype: standard\nflags:\n  - flag{x}\nfiles:\n  - binary\n";
-        let chall: Challenge = serde_yaml::from_str(yaml)?;
-
-        let scanner = DirectoryScanner::new();
-        let result = scanner.validate_challenge_files(&chall, temp_dir.path());
-        assert!(result.is_ok());
-        Ok(())
-    }
-
-    #[test]
     fn test_get_stats_counts_correctly() {
         let yaml = "name: x\ncategory: web\nvalue: 100\ntype: standard\nflags:\n  - flag{x}\n  - flag{alt}\nhints:\n  - free hint\n  - content: paid\n    cost: 50\nfiles:\n  - file.zip\n";
         let chall: Challenge = serde_yaml::from_str(yaml).unwrap();
@@ -464,24 +377,4 @@ mod tests {
         assert!(stats.categories.contains(&"crypto".to_string()));
     }
 
-    #[test]
-    fn test_get_relative_path() -> Result<()> {
-        let scanner = DirectoryScanner::new();
-        let base = Path::new("/challenges");
-        let target = Path::new("/challenges/web/sqli/challenge.yml");
-
-        let rel = scanner.get_relative_path(base, target)?;
-        assert_eq!(rel, Path::new("web/sqli/challenge.yml"));
-        Ok(())
-    }
-
-    #[test]
-    fn test_get_relative_path_not_under_base() {
-        let scanner = DirectoryScanner::new();
-        let base = Path::new("/challenges");
-        let target = Path::new("/other/file.yml");
-
-        let result = scanner.get_relative_path(base, target);
-        assert!(result.is_err());
-    }
 }

@@ -53,8 +53,26 @@
         content: |
           FROM debian:bookworm-slim
           RUN apt-get update && apt-get install -y --no-install-recommends \
-              docker.io ca-certificates libsqlite3-0 && rm -rf /var/lib/apt/lists/*
+                  ca-certificates curl gnupg libsqlite3-0 openssh-client && \
+              install -m 0755 -d /etc/apt/keyrings && \
+              curl -fsSL https://download.docker.com/linux/debian/gpg \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
+              echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+                https://download.docker.com/linux/debian bookworm stable" \
+                > /etc/apt/sources.list.d/docker.list && \
+              apt-get update && \
+              apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin docker-compose-plugin && \
+              rm -rf /var/lib/apt/lists/*
+          RUN printf '#!/bin/sh\n\
+          if [ -f /run/monitor_ssh_key ]; then\n\
+            mkdir -p /root/.ssh && chmod 700 /root/.ssh\n\
+            cp /run/monitor_ssh_key /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa\n\
+            printf "Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n" > /root/.ssh/config\n\
+            chmod 600 /root/.ssh/config\n\
+          fi\n\
+          exec "$@"\n' > /entrypoint.sh && chmod +x /entrypoint.sh
           COPY remote-monitor /usr/local/bin/remote-monitor
+          ENTRYPOINT ["/entrypoint.sh"]
           CMD ["/usr/local/bin/remote-monitor"]
         dest: "{{ ctfd_path }}/remote-monitor/Dockerfile"
         owner: "{{ docker_user }}"

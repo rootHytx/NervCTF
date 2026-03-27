@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Ok, Result};
-use reqwest::blocking::Client as BlockingClient;
-use reqwest::{blocking::multipart, header, Client, Method, Response};
+use reqwest::{header, Client, Method, Response};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -11,19 +10,15 @@ const DEFAULT_TIMEOUT: u64 = 10;
 #[derive(Clone)]
 pub struct CtfdClient {
     client: Client,
-    blocking_client: BlockingClient,
     base_url: String,
 }
 
 impl CtfdClient {
     pub fn new(monitor_url: &str, monitor_token: &str) -> Result<Self> {
-        let base_url = monitor_url;
-        let api_key = monitor_token;
-        // Content-Type omitted: json() sets it for JSON, multipart() sets it for uploads
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "Authorization",
-            header::HeaderValue::from_str(&format!("Token {}", api_key))
+            header::HeaderValue::from_str(&format!("Token {}", monitor_token))
                 .map_err(|e| anyhow!("Invalid monitor token: {}", e))?,
         );
         headers.insert(
@@ -32,11 +27,6 @@ impl CtfdClient {
         );
 
         let client = Client::builder()
-            .default_headers(headers.clone())
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let blocking_client = BlockingClient::builder()
             .default_headers(headers)
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT))
             .redirect(reqwest::redirect::Policy::none())
@@ -44,8 +34,7 @@ impl CtfdClient {
 
         Ok(Self {
             client,
-            blocking_client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: monitor_url.trim_end_matches('/').to_string(),
         })
     }
 
@@ -107,7 +96,6 @@ impl CtfdClient {
             serde_json::from_value(data.clone())
                 .map_err(|e| anyhow!("Deserialization error: {}", e))
         } else {
-            // Fallback: try to deserialize the whole JSON value
             serde_json::from_value(json.clone()).map_err(|e| {
                 anyhow!(
                     "Unexpected response format and deserialization error: {}",
@@ -132,26 +120,13 @@ impl CtfdClient {
         }
     }
 
-    /// NOTE: kept for legacy callers; prefer upload_file for async contexts.
-    pub async fn post_file<T: DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        form: Option<multipart::Form>,
-    ) -> Result<Option<T>> {
-        let url = format!("{}{}{}", self.base_url, BASE_PATH, endpoint);
-        if let Some(form) = form {
-            self.blocking_client.post(&url).multipart(form).send()?;
-        };
-        Ok(None)
-    }
-
     /// Upload a file using the async client (safe to call from within tokio).
     pub async fn upload_file(&self, endpoint: &str, form: reqwest::multipart::Form) -> Result<()> {
         let url = format!("{}{}{}", self.base_url, BASE_PATH, endpoint);
         let response = self
             .client
             .post(&url)
-            .timeout(Duration::from_secs(120)) // allow 2 min for large files
+            .timeout(Duration::from_secs(120))
             .header("Accept", "application/json")
             .multipart(form)
             .send()

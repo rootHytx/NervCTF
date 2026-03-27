@@ -47,22 +47,6 @@ impl CtfdClient {
         if all.is_empty() { Ok(None) } else { Ok(Some(all)) }
     }
 
-    pub async fn get_challenge(&self, id: u32) -> Result<Option<Challenge>> {
-        self.execute(Method::GET, &format!("/challenges/{}", id), None::<&()>)
-            .await
-    }
-    /// Get a specific challenge ID by name
-    pub async fn get_challenge_id(&self, name: &str) -> Result<Option<u32>> {
-        if let Some(challenges) = self.get_challenges().await? {
-            for challenge in challenges {
-                if challenge.name == name {
-                    return Ok(Option::from(challenge.id));
-                }
-            }
-        }
-        Ok(None)
-    }
-
     pub async fn create_challenge(&self, data: &Value) -> Result<Option<Challenge>> {
         self.execute(Method::POST, "/challenges", Some(data)).await
     }

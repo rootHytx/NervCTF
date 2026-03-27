@@ -26,9 +26,9 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Base directory path (defaults to current directory)
+    /// Challenges directory path (defaults to current directory)
     #[arg(short, long, default_value = ".")]
-    base_dir: PathBuf,
+    challenges_dir: PathBuf,
 
     /// Verbose output
     #[arg(short, long)]
@@ -54,6 +54,9 @@ enum Commands {
         /// Show diff without applying changes
         #[arg(short, long)]
         dry_run: bool,
+        /// Force re-deploy all challenges even if up to date (re-syncs files to runner, rebuilds images)
+        #[arg(long)]
+        recreate: bool,
     },
 
     /// List all challenges found locally
@@ -92,6 +95,14 @@ enum Commands {
     },
 }
 
+/// Split-machine mode: SSH target for rsyncing challenge files to the runner.
+struct RunnerTarget {
+    /// e.g. "docker@192.168.1.50"
+    ssh_target: String,
+    /// Remote path where challenges are stored, e.g. "/home/docker/challenges"
+    challenges_dir: String,
+}
+
 // ── Queue types for deferred phases ──────────────────────────────────────────
 
 struct FileUploadJob {
@@ -126,20 +137,20 @@ async fn main() -> Result<()> {
 
     // Load config from .nervctf.yml — always search from CWD upwards so the
     // file is found regardless of what --base-dir is set to.
-    let cwd = env::current_dir().unwrap_or_else(|_| cli.base_dir.clone());
+    let cwd = env::current_dir().unwrap_or_else(|_| cli.challenges_dir.clone());
     let (file_config, config_path) = load_config(&cwd);
 
-    // Resolve effective base_dir: CLI flag > .nervctf.yml > "."
+    // Resolve effective challenges_dir: CLI flag > .nervctf.yml > "."
     // We treat the clap default (".") as "not explicitly set", so the config
     // file can override it.
-    let effective_base_dir: PathBuf = if cli.base_dir != PathBuf::from(".") {
-        cli.base_dir.clone() // explicitly passed by the user
+    let effective_base_dir: PathBuf = if cli.challenges_dir != PathBuf::from(".") {
+        cli.challenges_dir.clone() // explicitly passed by the user
     } else {
         file_config
-            .base_dir
+            .challenges_dir
             .as_deref()
             .map(PathBuf::from)
-            .unwrap_or(cli.base_dir.clone())
+            .unwrap_or(cli.challenges_dir.clone())
     };
 
     // Commands that only need base_dir (no CTFd credentials required)
@@ -182,11 +193,20 @@ async fn main() -> Result<()> {
 
     let client = CtfdClient::new(&monitor_url, &monitor_token)?;
 
+    // Build runner target if split-machine mode is configured
+    let runner_target = match (&file_config.runner_ip, &file_config.runner_user) {
+        (Some(ip), Some(user)) if !ip.is_empty() => Some(RunnerTarget {
+            ssh_target: format!("{}@{}", user, ip),
+            challenges_dir: "/home/docker/challenges".to_string(),
+        }),
+        _ => None,
+    };
+
     let scanner = DirectoryScanner::new();
 
     match cli.command {
-        Commands::Deploy { dry_run } => {
-            deploy_challenges(&client, &monitor_url, &scanner, &effective_base_dir, dry_run).await?;
+        Commands::Deploy { dry_run, recreate } => {
+            deploy_challenges(&client, &monitor_url, &scanner, &effective_base_dir, dry_run, recreate, runner_target.as_ref()).await?;
         }
         Commands::List { detailed } => {
             list_challenges(&scanner, &effective_base_dir, detailed).await?;
@@ -244,6 +264,8 @@ async fn deploy_challenges(
     scanner: &DirectoryScanner,
     base_dir: &PathBuf,
     dry_run: bool,
+    recreate: bool,
+    runner: Option<&RunnerTarget>,
 ) -> Result<()> {
     use std::path::Path;
 
@@ -280,7 +302,7 @@ async fn deploy_challenges(
 
     for local in &local_challenges {
         if let Some(remote) = remote_map.get(&local.name) {
-            if needs_update(remote, local) {
+            if recreate || needs_update(remote, local) {
                 let remote_id = remote
                     .id
                     .ok_or_else(|| anyhow!("Remote challenge '{}' has no ID", local.name))?;
@@ -319,13 +341,15 @@ async fn deploy_challenges(
         return Ok(());
     }
 
-    print!("Proceed? (y/N): ");
-    std::io::stdout().flush()?;
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    if input.trim().to_lowercase() != "y" {
-        println!("aborted.");
-        return Ok(());
+    if !recreate {
+        print!("Proceed? (y/N): ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim().to_lowercase() != "y" {
+            println!("aborted.");
+            return Ok(());
+        }
     }
 
     println!("\n-- phase 1: cores, flags, tags, hints");
@@ -343,7 +367,7 @@ async fn deploy_challenges(
                 println!("ok (ID {})", id);
                 created += 1;
                 if local.challenge_type == ChallengeType::Instance {
-                    if let Err(e) = deploy_instance(client, local, id).await {
+                    if let Err(e) = deploy_instance(client, local, id, runner).await {
                         eprintln!("  [!] instance deploy error for '{}': {}", local.name, e);
                     }
                 }
@@ -376,7 +400,7 @@ async fn deploy_challenges(
                 println!("ok (ID {})", remote_id);
                 updated += 1;
                 if local.challenge_type == ChallengeType::Instance {
-                    if let Err(e) = deploy_instance(client, local, *remote_id).await {
+                    if let Err(e) = deploy_instance(client, local, *remote_id, runner).await {
                         eprintln!("  [!] instance deploy error for '{}': {}", local.name, e);
                     }
                 }
@@ -538,6 +562,7 @@ async fn deploy_instance(
     monitor_client: &CtfdClient,
     challenge: &Challenge,
     ctfd_id: u32,
+    runner: Option<&RunnerTarget>,
 ) -> Result<()> {
     use reqwest::Method;
 
@@ -570,42 +595,89 @@ async fn deploy_instance(
         Err(e) => eprintln!("   [!] monitor registration failed for '{}': {}", challenge.name, e),
     }
 
-    // If Compose backend with relative compose_file, upload challenge dir for pre-building
+    // If Compose backend with relative compose_file, sync challenge dir for pre-building.
+    // Split-machine mode: rsync directly to runner then tell monitor to build via SSH.
+    // Single-machine mode: tar+upload to monitor's /instance/build-compose.
     if let nervctf::ctfd_api::models::InstanceBackend::Compose = inst.backend {
         if let Some(cf) = &inst.compose_file {
             let is_local = !cf.starts_with('/');
             if is_local {
                 let context_dir = std::path::PathBuf::from(&challenge.source_path);
-                match tokio::process::Command::new("tar")
-                    .args(["-czf", "-", "."])
-                    .current_dir(&context_dir)
-                    .output()
-                    .await
-                {
-                    Ok(out) if out.status.success() => {
-                        let form = reqwest::multipart::Form::new()
-                            .text("challenge_name", challenge.name.clone())
-                            .part(
-                                "context",
-                                reqwest::multipart::Part::bytes(out.stdout)
-                                    .file_name("context.tar.gz")
-                                    .mime_str("application/gzip")
-                                    .unwrap(),
-                            );
-                        match monitor_client.upload_file("/instance/build-compose", form).await {
-                            Ok(_) => println!("   [ok] compose context uploaded and images built on monitor"),
-                            Err(e) => eprintln!("   [!] monitor compose build failed for '{}': {}", challenge.name, e),
+                let sanitized = challenge.name.to_lowercase()
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+                    .collect::<String>()
+                    .trim_matches('-')
+                    .to_string();
+
+                if let Some(rt) = runner {
+                    // Split-machine mode: rsync to runner, then tell monitor to build on runner
+                    let remote_dir = format!("{}/{}", rt.challenges_dir.trim_end_matches('/'), sanitized);
+                    let status = tokio::process::Command::new("rsync")
+                        .args([
+                            "-az", "--delete", "--mkpath",
+                            &format!("{}/", context_dir.display()),
+                            &format!("{}:{}/", rt.ssh_target, remote_dir),
+                        ])
+                        .status()
+                        .await;
+                    match status {
+                        Ok(s) if s.success() => {
+                            println!("   [ok] challenge files synced to runner:{}", remote_dir);
+                            // Tell the monitor to build images on the runner
+                            let build_payload = json!({
+                                "challenge_name": challenge.name,
+                                "compose_file": cf,
+                                "challenges_dir": rt.challenges_dir,
+                            });
+                            match monitor_client
+                                .execute::<serde_json::Value, _>(
+                                    Method::POST,
+                                    "/instance/build-compose-remote",
+                                    Some(&build_payload),
+                                )
+                                .await
+                            {
+                                Ok(_) => println!("   [ok] images built on runner"),
+                                Err(e) => eprintln!("   [!] remote build failed for '{}': {}", challenge.name, e),
+                            }
                         }
+                        Ok(s) => eprintln!("   [!] rsync to runner failed (exit {})", s.code().unwrap_or(-1)),
+                        Err(e) => eprintln!("   [!] rsync spawn failed: {}", e),
                     }
-                    Ok(out) => eprintln!(
-                        "   [!] tar failed for '{}': {}",
-                        challenge.name,
-                        String::from_utf8_lossy(&out.stderr)
-                    ),
-                    Err(e) => eprintln!(
-                        "   [!] failed to create build context for '{}': {}",
-                        challenge.name, e
-                    ),
+                } else {
+                    // Single-machine mode: tar+upload to monitor
+                    match tokio::process::Command::new("tar")
+                        .args(["-czf", "-", "."])
+                        .current_dir(&context_dir)
+                        .output()
+                        .await
+                    {
+                        Ok(out) if out.status.success() => {
+                            let form = reqwest::multipart::Form::new()
+                                .text("challenge_name", challenge.name.clone())
+                                .part(
+                                    "context",
+                                    reqwest::multipart::Part::bytes(out.stdout)
+                                        .file_name("context.tar.gz")
+                                        .mime_str("application/gzip")
+                                        .unwrap(),
+                                );
+                            match monitor_client.upload_file("/instance/build-compose", form).await {
+                                Ok(_) => println!("   [ok] compose context uploaded and images built on monitor"),
+                                Err(e) => eprintln!("   [!] monitor compose build failed for '{}': {}", challenge.name, e),
+                            }
+                        }
+                        Ok(out) => eprintln!(
+                            "   [!] tar failed for '{}': {}",
+                            challenge.name,
+                            String::from_utf8_lossy(&out.stderr)
+                        ),
+                        Err(e) => eprintln!(
+                            "   [!] failed to create build context for '{}': {}",
+                            challenge.name, e
+                        ),
+                    }
                 }
             }
         }
@@ -622,6 +694,7 @@ async fn deploy_instance(
                     std::path::PathBuf::from(&challenge.source_path).join(img)
                 };
 
+                // Docker backend: always tar+upload (monitor handles SSH build if split mode)
                 match tokio::process::Command::new("tar")
                     .args(["-czf", "-", "."])
                     .current_dir(&context_dir)

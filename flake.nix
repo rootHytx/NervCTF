@@ -95,7 +95,7 @@
           // {
             inherit cargoArtifacts;
             pname = "nervctf";
-            version = "2.1.0";
+            version = "2.2.0";
             cargoExtraArgs = "--package nervctf";
           }
         );
@@ -105,7 +105,7 @@
           // {
             inherit cargoArtifacts;
             pname = "remote-monitor";
-            version = "2.1.0";
+            version = "2.2.0";
             cargoExtraArgs = "--package remote-monitor";
             doCheck = false;
           }

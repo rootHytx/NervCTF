@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "nervctf")]
-#[command(version = "0.1.0")]
+#[command(version = "2.2.0")]
 #[command(about = "Minimalistic CTFd Challenge Management CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]

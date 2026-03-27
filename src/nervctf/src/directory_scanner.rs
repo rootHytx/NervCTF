@@ -1,7 +1,7 @@
 //! Directory scanner for auto-detecting CTFd challenges
 //! Recursively searches for challenge configuration files in current directory
 
-use crate::ctfd_api::models::Challenge;
+use crate::ctfd_api::models::{Challenge, ChallengeType, InstanceConfig};
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -138,6 +138,21 @@ impl DirectoryScanner {
             .unwrap_or(Path::new("."))
             .to_string_lossy()
             .to_string();
+
+        // Compatibility: if type=instance but no `instance:` block, try to build
+        // InstanceConfig from the `extra:` mapping (ctfcli-style challenge files
+        // put backend/internal_port/connection under extra:).
+        if config.challenge_type == ChallengeType::Instance && config.instance.is_none() {
+            if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+                if let Some(extra_val) = raw.get("extra") {
+                    if extra_val.get("backend").is_some() || extra_val.get("internal_port").is_some() {
+                        if let Ok(inst) = serde_yaml::from_value::<InstanceConfig>(extra_val.clone()) {
+                            config.instance = Some(inst);
+                        }
+                    }
+                }
+            }
+        }
 
         // Collect top-level YAML keys not recognised by the ctfcli spec so
         // the validator can warn about them.  JSON files are skipped since

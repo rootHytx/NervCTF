@@ -279,7 +279,7 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                 None => issues.push(Issue::error(
                     name,
                     "instance",
-                    "required for instance challenges — must have backend, internal_port, connection",
+                    "required for instance challenges — add an `instance:` block with backend, internal_port, connection (or put them under `extra:`)",
                 )),
                 Some(inst) => {
                     if inst.internal_port == 0 {
@@ -287,6 +287,36 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                     }
                     if inst.connection.trim().is_empty() {
                         issues.push(Issue::error(name, "instance.connection", "required (e.g. 'nc', 'http', 'ssh')"));
+                    }
+                    // Backend-specific required fields
+                    match inst.backend {
+                        crate::ctfd_api::models::InstanceBackend::Docker => {
+                            if inst.image.as_deref().unwrap_or("").trim().is_empty() {
+                                issues.push(Issue::error(
+                                    name, "instance.image",
+                                    "required for docker backend — docker image name or build path",
+                                ));
+                            }
+                        }
+                        crate::ctfd_api::models::InstanceBackend::Lxc => {
+                            if inst.lxc_image.as_deref().unwrap_or("").trim().is_empty() {
+                                issues.push(Issue::error(
+                                    name, "instance.lxc_image",
+                                    "required for lxc backend — LXC image alias (e.g. 'ubuntu:22.04')",
+                                ));
+                            }
+                        }
+                        crate::ctfd_api::models::InstanceBackend::Vagrant => {
+                            if inst.vagrantfile.as_deref().unwrap_or("").trim().is_empty() {
+                                issues.push(Issue::error(
+                                    name, "instance.vagrantfile",
+                                    "required for vagrant backend — path to Vagrantfile",
+                                ));
+                            }
+                        }
+                        crate::ctfd_api::models::InstanceBackend::Compose => {
+                            // compose_file defaults to docker-compose.yml; no strict requirement
+                        }
                     }
                     // Flag requirements
                     let is_random = matches!(inst.flag_mode, Some(InstanceFlagMode::Random));

@@ -567,6 +567,24 @@ pub fn revert_unsolved_instances(db: &Db) -> Result<usize> {
     Ok(n)
 }
 
+/// Remove `flag_attempts` records where `is_correct=1` but the solve no longer
+/// exists in the `ctfd_solves` cache (i.e. the CTFd submission was deleted).
+/// Returns the number of records removed.
+pub fn delete_stale_correct_attempts(db: &Db) -> Result<usize> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n = conn.execute(
+        "DELETE FROM flag_attempts
+         WHERE is_correct = 1
+         AND NOT EXISTS (
+             SELECT 1 FROM ctfd_solves cs
+             WHERE cs.challenge_name = flag_attempts.challenge_name
+             AND cs.team_id = flag_attempts.team_id
+         )",
+        [],
+    )?;
+    Ok(n)
+}
+
 /// Full-replace the ctfd_solves cache with the current snapshot from MariaDB.
 /// Any rows not in `rows` (i.e. deleted submissions) are removed.
 pub fn replace_ctfd_solves(db: &Db, rows: &[(i64, Option<i64>, String, String)]) -> Result<()> {

@@ -686,6 +686,11 @@ pub async fn sync_solves(pool: &Pool, db: &Db) -> Result<()> {
     if reverted > 0 {
         tracing::info!("ctfd_db: sync_solves: reverted {} instance(s) to running (solve deleted in CTFd)", reverted);
     }
+    let stale = crate::db::delete_stale_correct_attempts(db)
+        .map_err(|e| anyhow!("ctfd_db: sync_solves: delete_stale_attempts: {}", e))?;
+    if stale > 0 {
+        tracing::info!("ctfd_db: sync_solves: removed {} stale correct flag attempt(s) (submission deleted in CTFd)", stale);
+    }
     tracing::debug!("ctfd_db: sync_solves: replaced with {} rows", n);
     Ok(())
 }

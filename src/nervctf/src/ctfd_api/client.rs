@@ -57,12 +57,17 @@ impl CtfdClient {
         if status.is_success() {
             Ok(response)
         } else {
-            let error_text = response.text().await?;
+            let error_text = response.text().await.unwrap_or_default();
+            let detail = if error_text.is_empty() {
+                format!("HTTP {}", status)
+            } else {
+                error_text
+            };
             Err(anyhow!(
                 "API error ({} {}): {}",
                 method,
                 endpoint,
-                error_text
+                detail
             ))
         }
     }

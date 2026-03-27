@@ -52,7 +52,7 @@ release-linux: ## x86_64 Linux GNU — both binaries
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64
 	cp target/x86_64-unknown-linux-gnu/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64
-	@upx --best dist/$(BINARY_A)-linux-x86_64 dist/$(BINARY_B)-linux-x86_64 2>/dev/null || true
+	@upx --lzma dist/$(BINARY_A)-linux-x86_64 dist/$(BINARY_B)-linux-x86_64 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-linux-x86_64  dist/$(BINARY_B)-linux-x86_64"
 
 release-musl: ## x86_64 Linux musl static — both binaries
@@ -60,7 +60,7 @@ release-musl: ## x86_64 Linux musl static — both binaries
 	@mkdir -p dist
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_A) dist/$(BINARY_A)-linux-x86_64-static
 	cp target/x86_64-unknown-linux-musl/release/$(BINARY_B) dist/$(BINARY_B)-linux-x86_64-static
-	@upx --best dist/$(BINARY_A)-linux-x86_64-static dist/$(BINARY_B)-linux-x86_64-static 2>/dev/null || true
+	@upx --lzma dist/$(BINARY_A)-linux-x86_64-static dist/$(BINARY_B)-linux-x86_64-static 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-linux-x86_64-static  dist/$(BINARY_B)-linux-x86_64-static"
 
 # ── ARM (nervctf CLI only — remote-monitor is x86_64 Linux only) ──────────────
@@ -69,6 +69,7 @@ release-arm64: ## aarch64 Linux GNU — nervctf CLI only
 	$(NIX) cargo build --release --target aarch64-unknown-linux-gnu -p nervctf
 	@mkdir -p dist
 	cp target/aarch64-unknown-linux-gnu/release/$(BINARY_A) dist/$(BINARY_A)-linux-aarch64
+	@upx --lzma dist/$(BINARY_A)-linux-aarch64 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-linux-aarch64"
 
 # ── Windows (nervctf CLI only) ────────────────────────────────────────────────
@@ -77,7 +78,7 @@ release-windows: ## x86_64 Windows GNU — nervctf CLI only (MinGW via nix devel
 	$(NIX) cargo build --release --target x86_64-pc-windows-gnu -p nervctf
 	@mkdir -p dist
 	cp target/x86_64-pc-windows-gnu/release/$(BINARY_A).exe dist/$(BINARY_A)-windows-x86_64.exe
-	@upx --best dist/$(BINARY_A)-windows-x86_64.exe 2>/dev/null || true
+	@upx --lzma dist/$(BINARY_A)-windows-x86_64.exe 2>/dev/null || true
 	@echo "→ dist/$(BINARY_A)-windows-x86_64.exe"
 
 # ── macOS (nervctf CLI only — requires macOS machine) ────────────────────────

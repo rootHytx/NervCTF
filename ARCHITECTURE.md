@@ -115,24 +115,32 @@ the last cross-compiler from poisoning native builds.
 Priority (highest wins):
 1. CLI flags: `--monitor-url`, `--monitor-token`
 2. Env vars: `MONITOR_URL`, `MONITOR_TOKEN`
-3. `.nervctf.yml` / `.nervctf.yaml` (walked up from base_dir)
+3. `.nervctf.yml` / `.nervctf.yaml` (walked up from challenges_dir)
 
 **`Config` struct** (`utils.rs`):
 ```rust
 pub struct Config {
-    pub monitor_url:      Option<String>,
-    pub monitor_token:    Option<String>,
-    pub base_dir:         Option<String>,
-    pub target_ip:        Option<String>,   // setup only
-    pub target_user:      Option<String>,   // setup only
-    pub ssh_pubkey_path:  Option<String>,   // setup only
-    pub ctfd_remote_path: Option<String>,   // setup only
-    pub monitor_port:     Option<String>,   // setup only
+    pub monitor_url:              Option<String>,
+    pub monitor_token:            Option<String>,
+    pub challenges_dir:           Option<String>,
+    pub target_ip:                Option<String>,   // setup only
+    pub target_user:              Option<String>,   // setup only
+    pub ssh_pubkey_path:          Option<String>,   // setup only
+    pub ctfd_remote_path:         Option<String>,   // setup only
+    pub monitor_port:             Option<String>,   // setup only
+    pub max_concurrent_provisions: Option<u32>,     // monitor tuning
+    pub runner_ip:                Option<String>,   // split-machine mode
+    pub runner_user:              Option<String>,   // split-machine mode
 }
 ```
 
 `load_config(start_dir)` walks up directories looking for `.nervctf.yml`.
 `save_config(config, path)` serialises to YAML (skips `None` fields).
+
+**Split-machine mode**: when `runner_ip` + `runner_user` are set, `nervctf deploy` rsyncs
+challenge files directly to `{runner_user}@{runner_ip}:/home/docker/challenges/` instead of
+uploading via the monitor. After rsync, it calls `POST /api/v1/instance/build-compose-remote`
+to trigger image builds on the runner via SSH.
 
 ---
 
@@ -237,41 +245,42 @@ actions in dependency order, UpToDate/RemoteOnly appended after.
 nervctf [OPTIONS] <COMMAND>
 
 Options:
-  -b, --base-dir <PATH>      default "."
+  -c, --challenges-dir <PATH>   default "."
   -v, --verbose
-  -r, --remote               (legacy flag, no-op)
   --monitor-url <URL>
   --monitor-token <TOKEN>
 
 Commands:
-  deploy [--dry-run]         create new challenges + update changed ones
-  list                       list local challenges (table)
-  validate [--fix]           lint challenge.yml files
-  fix [--dry-run]            interactive YAML fixer (state/author/version)
-  sync [--diff]              two-way diff + interactive apply
-  setup                      Ansible-based server deployment wizard
-  export --output <PATH>     dump CTFd challenges to YAML files
-  delete <NAME>              delete challenge from CTFd
-  auto                       watch loop: deploy every 60s
+  deploy [--dry-run] [--recreate]   create new challenges + update changed ones
+  list [--detailed]                 list local challenges
+  scan [--detailed]                 scan + print statistics
+  validate [--debug]                lint challenge.yml files (full view with --debug)
+  fix [--dry-run]                   interactive YAML fixer (state/author/version)
+  setup [--upgrade]                 Ansible-based server deployment wizard
 ```
+
+`--recreate` forces all challenges into the update queue (skips up-to-date check, skips
+the `Proceed? (y/N)` prompt). Useful for re-syncing files to the runner or rebuilding images.
 
 ### Deploy flow (key logic in `deploy_challenges`):
 
 All API calls go to `remote-monitor`, which executes them against CTFd MariaDB directly.
 
-1. Scan local `challenges/` tree → `Vec<Challenge>`
-2. `GET /api/v1/challenges` (paginated) → remote list
-3. For each local challenge:
-   - Not on remote → `create_challenge_phase1()` (POST /challenges → monitor → SQL INSERT)
-   - On remote + `needs_update()` → `update_challenge_phase1()` (PATCH /challenges/{id} → monitor → SQL UPDATE)
-4. After all base creates/updates: flags, tags, files, hints, requirements, state patches
-5. For `type: instance`:
+1. Scan local challenges tree → `Vec<Challenge>`
+2. Run validator; abort if any errors
+3. `GET /api/v1/challenges` (paginated) → remote list
+4. For each local challenge:
+   - Not on remote → `create_challenge_phase1()` (`POST /challenges` → monitor → SQL INSERT)
+   - On remote + `needs_update()` or `--recreate` → `update_challenge_phase1()` (`PATCH /challenges/{id}` → monitor → SQL UPDATE)
+5. After all base creates/updates: flags, tags, files, hints, requirements, state patches
+6. For `type: instance`:
    - Deploy to CTFd as `standard` or `dynamic` (based on `extra.initial` presence)
-   - If monitor configured: upload tar.gz build context (`POST /api/v1/instance/build`
-     for docker backends with local image path, or `POST /api/v1/instance/build-compose`
-     for compose backends)
-   - Register config (`POST /api/v1/instance/register`)
-   - Append instance link to description (idempotent: checks for existing link)
+   - **Split-machine mode** (`runner_ip` set):
+     - rsync challenge dir to `{runner_user}@{runner_ip}:/home/docker/challenges/<name>/`
+     - `POST /api/v1/instance/build-compose-remote` → monitor SSHes to runner and runs `docker compose build`
+   - **Single-machine mode**:
+     - `POST /api/v1/instance/build` (docker, local image path) or `POST /api/v1/instance/build-compose` (compose) — uploads tar.gz
+   - `POST /api/v1/instance/register` — registers `InstanceConfig` on monitor
 
 ### `needs_update()` (`challenge_manager/sync.rs`)
 Free function (also used as method via delegation). Compares:
@@ -298,12 +307,13 @@ One request per file → CTFd returns 500. Matches ctfcli's `_create_all_files()
 pub struct CtfdClient {
     client: reqwest::Client,
     base_url: String,   // {monitor_url}/api/v1
-    api_key: String,    // monitor_token (used as Authorization: Token <monitor_token>)
+    // auth: Authorization: Token <monitor_token>
 }
 ```
 
-All API calls go to `remote-monitor`, which handles them via direct MariaDB SQL.
-The response shape is CTFd-compatible (`{"success": true, "data": ...}`).
+All API calls go to `remote-monitor` (`{monitor_url}/api/v1/...`), which handles them via
+direct MariaDB SQL. Response shape is CTFd-compatible (`{"success": true, "data": ...}`).
+No `CTFD_URL` or `CTFD_API_KEY` — the monitor is the sole gateway.
 
 - `execute(method, path, body) → Result<Option<Value>>`
 - `get_challenges()` — paginated via `meta.pagination.next`; loops until no next page
@@ -325,100 +335,98 @@ Bridge via string conversion (`.as_str()` / `.as_bytes()`). Do not mix HeaderMap
 ### AppState
 ```rust
 pub struct AppState {
-    pub db: Db,                    // Arc<Mutex<Connection>> (SQLite)
-    pub mysql_pool: Pool,          // mysql_async pool → CTFd MariaDB
-    pub monitor_token: String,     // from MONITOR_TOKEN env var
-    pub ctfd_url: String,          // from CTFD_URL env var (player token validation only)
-    pub public_host: String,       // from PUBLIC_HOST env var
-    pub ctfd_uploads_dir: String,  // from CTFD_UPLOADS_DIR env var
-    pub http_client: reqwest::Client,
+    pub monitor_token: String,          // MONITOR_TOKEN
+    pub public_host: String,            // PUBLIC_HOST
+    pub db: Db,                         // Arc<Mutex<Connection>> (SQLite)
+    pub ctfd_pool: mysql_async::Pool,   // CTFd MariaDB pool
+    pub challenges_base_dir: String,    // CHALLENGES_BASE_DIR
+    pub ctfd_uploads_dir: String,       // CTFD_UPLOADS_DIR
+    pub runner_ssh_target: Option<String>,  // RUNNER_SSH_TARGET (split-machine mode)
+    pub provision_sem: Arc<Semaphore>,  // MAX_CONCURRENT_PROVISIONS
 }
 ```
 
 ### Environment variables consumed by remote-monitor
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `CTFD_DB_URL` | `""` | MariaDB URL (`mysql://user:pass@host/db`) |
-| `CTFD_UPLOADS_DIR` | `""` | Absolute path to CTFd uploads dir (file writes) |
-| `CTFD_URL` | `http://localhost:8000` | CTFd base URL (player token validation only) |
-| `MONITOR_TOKEN` | `""` | Admin auth token for admin routes |
-| `PUBLIC_HOST` | `127.0.0.1` | Hostname returned to players in connection strings |
-| `MONITOR_PORT` | `33133` | TCP port to bind |
-| `DB_PATH` | `/data/monitor.db` | SQLite file path |
-| `CHALLENGES_BASE_DIR` | `/opt/nervctf/challenges` | Server-side challenge files root |
+| `CTFD_DB_URL` | required | MariaDB URL (`mysql://user:pass@host/db`) |
+| `MONITOR_TOKEN` | required | Admin auth token |
+| `PUBLIC_HOST` | required | Hostname returned to players in connection strings |
+| `CTFD_UPLOADS_DIR` | `""` | Absolute path to CTFd uploads dir (for file writes) |
+| `CHALLENGES_BASE_DIR` | `/opt/nervctf/challenges` | Root for challenge files |
+| `RUNNER_SSH_TARGET` | `""` | SSH target for split-machine mode (e.g. `docker@192.168.1.50`) |
+| `MONITOR_PORT` | `33133` | TCP bind port |
+| `MONITOR_BIND` | `0.0.0.0` | TCP bind address |
+| `DB_PATH` | `./monitor.db` | SQLite file path |
+| `MAX_CONCURRENT_PROVISIONS` | `4` | Semaphore limit for concurrent docker/compose ops |
+| `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd MariaDB → SQLite sync cycles |
 
 ### Admin dashboard
 
-```
-GET /admin?token=<MONITOR_TOKEN>
-```
-Self-contained HTML page (no CDN; air-gap safe). Token can be passed as `?token=` query param
-or `Authorization: Token <x>` header. The JS reads the token from the URL, stores it in memory,
-and sends it as a header with every API call.
+`GET /admin?token=<MONITOR_TOKEN>` — self-contained HTML (no CDN; air-gap safe).
+Token via `?token=` query param or `Authorization: Token` header.
 
 Three auto-refreshing tables:
-- **Flag sharing alerts** (15 s) — submissions where the flag matched a different team's instance
+- **Flag sharing alerts** (15 s) — flag submitted to wrong team's challenge instance
 - **Active instances** (15 s) — all running containers with team/user/host:port/expiry
 - **Recent flag attempts** (30 s) — last 200 attempts across all teams
 
 ### Routes
 
 **No auth:**
-- `GET /health` → `{"ok": true}`
-- `GET /instance/:name` → HTML player UI page
+- `GET /health` → `{"status": "ok"}`
+- `GET /instance/:name` → HTML player UI page (inline, no CDN)
 
-**Admin auth** (`Authorization: Token <MONITOR_TOKEN>` or `?token=` query param):
-- `GET /admin` → serves `assets/admin.html` (embedded via `include_str!`)
+**Admin (`Authorization: Token <MONITOR_TOKEN>` or `?token=`):**
+- `GET /admin` → serves admin dashboard HTML
 
-**Admin auth** (`Authorization: Token <MONITOR_TOKEN>`):
-- `POST /api/v1/instance/build` — multipart: `challenge_name` + `context` (tar.gz);
-  extracts to `CHALLENGES_BASE_DIR/<sanitized_name>/`, runs `docker build`, stores image tag in DB
-- `POST /api/v1/instance/build-compose` — multipart: `challenge_name` + `context` (tar.gz);
-  wipes existing dir first (prevents Docker placeholder dirs), extracts, runs `docker compose build`
-- `POST /api/v1/instance/register` — body: `{challenge_name, ctfd_id, backend, config_json}`;
-  upserts into `instance_configs` table
-- `GET /api/v1/instance/list` → array of registered configs
-- `GET /api/v1/admin/instances` → JSON array of all active instances
-- `GET /api/v1/admin/attempts[?alerts_only=true]` → JSON array of flag attempts (200 max) or sharing alerts only
+**Admin (`Authorization: Token <MONITOR_TOKEN>`):**
+- `POST /api/v1/instance/build` — multipart `challenge_name` + `context` (tar.gz); builds docker image
+- `POST /api/v1/instance/build-compose` — multipart; wipes dir first, extracts tar.gz, builds compose images (single-machine)
+- `POST /api/v1/instance/build-compose-remote` — JSON `{challenge_name, compose_file?, challenges_dir?}`; SSHes to runner and runs `docker compose build` (split-machine)
+- `POST /api/v1/instance/register` — `{challenge_name, ctfd_id, backend, config_json}`
+- `GET /api/v1/instance/list` → registered configs
+- `GET /api/v1/admin/instances` → all active instances as JSON
+- `GET /api/v1/admin/attempts[?alerts_only=true]` → flag attempt log (200 max) or sharing alerts
+- `GET /api/v1/admin/solves` → correct solves per team (from ctfd_solves cache)
+- CTFd CRUD (all via MariaDB SQL):
+  - `GET/POST /api/v1/challenges`, `GET/PATCH/DELETE /api/v1/challenges/{id}`
+  - `GET/POST /api/v1/flags`, `DELETE /api/v1/flags/{id}`
+  - `GET/POST /api/v1/hints`, `DELETE /api/v1/hints/{id}`
+  - `GET/POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`
+  - `GET/POST /api/v1/files`, `DELETE /api/v1/files/{id}` (disk + DB)
+  - `POST /api/v1/topics`
 
-**Plugin auth** (admin token + explicit team_id in body — called by CTFd plugin):
+**Plugin auth** (admin token + explicit `team_id` in body — called by CTFd plugin):
 - `GET /api/v1/plugin/info?challenge_name=X&team_id=N`
-- `POST /api/v1/plugin/request` body: `{challenge_name, team_id, user_id?}` → provisions instance
-- `POST /api/v1/plugin/renew` body: `{challenge_name, team_id}` → extends expiry
-- `DELETE /api/v1/plugin/stop` body: `{challenge_name, team_id}` → destroys instance
-- `DELETE /api/v1/plugin/stop_all` body: `{challenge_name}` → destroys all instances
-- `POST /api/v1/plugin/attempt` body: `{challenge_name, team_id, user_id, submitted_flag, is_correct}` →
-  records attempt; detects flag sharing by querying `instances.flag` for the submitted value
-  belonging to a different team; logs `warn!` and sets `is_flag_sharing=1` in DB if found
+- `POST /api/v1/plugin/request` → provisions instance
+- `POST /api/v1/plugin/renew` → extends expiry
+- `DELETE /api/v1/plugin/stop` → destroys one team's instance
+- `DELETE /api/v1/plugin/stop_all` → destroys all instances for a challenge
+- `POST /api/v1/plugin/solve` → marks solved + tears down instance
+- `POST /api/v1/plugin/attempt` → records flag submission; detects sharing via `team_flags` table
 
-**Player auth** (CTFd user token validated via `GET /api/v1/users/me` on CTFd):
-- `POST /api/v1/instance/request` body: `{challenge_name}` → provisions instance
+**Player auth** (CTFd user token validated via direct MariaDB lookup):
+- `POST /api/v1/instance/request` → provisions instance
 - `GET /api/v1/instance/info?challenge_name=X`
-- `POST /api/v1/instance/renew` body: `{challenge_name}`
-- `DELETE /api/v1/instance/stop` body: `{challenge_name}`
+- `POST /api/v1/instance/renew`
+- `DELETE /api/v1/instance/stop`
 
-**CTFd data routes** (admin token — all via MariaDB SQL):
-- `GET/POST /api/v1/challenges` — list/create challenges
-- `GET/PATCH/DELETE /api/v1/challenges/{id}` — get/update/delete challenge
-- `GET/POST /api/v1/flags` — list/create flags
-- `DELETE /api/v1/flags/{id}`
-- `GET/POST /api/v1/hints` — list/create hints
-- `DELETE /api/v1/hints/{id}`
-- `GET/POST /api/v1/tags` — list/create tags
-- `DELETE /api/v1/tags/{id}`
-- `GET/POST /api/v1/files` — list/upload files (multipart; writes to `CTFD_UPLOADS_DIR`)
-- `DELETE /api/v1/files/{id}` — deletes file from DB + disk
-- `POST /api/v1/topics` — upsert topic
+### Background tasks
 
-### Background expiry task
-Spawned at startup. Every 30 seconds: `get_expired_instances()` → for each, calls
-`cleanup_container(container_id)`, then `delete_instance(db, ...)`.
+**Expiry task** — every 30 s:
+- `get_expired_instances()` → for each: `cleanup_container(id, runner_ssh)` + `delete_instance()` + `delete_flag(ctfd_flag_id)`
+- Orphan cleanup: `list_ctf_projects()` (compose) → stop any not in DB
+
+**CTFd sync task** — every `CTFD_DB_SYNC_INTERVAL` s (default 30):
+- `ctfd_db::sync_solves()` — full-replace `ctfd_solves` SQLite cache from MariaDB `submissions`; reverts solved instances where submission was deleted; removes stale `is_correct=1` flag_attempts
+- `ctfd_db::sync_users_and_teams()` — full-replace `ctfd_teams` + `ctfd_users` caches
 
 ### `check_monitor_auth(headers, expected_token) → bool`
 Checks `Authorization: Token <value>` header. Used for all admin and plugin routes.
 
-### `validate_ctfd_token(client, ctfd_url, token) → Option<i64>`
-Calls CTFd `GET /api/v1/users/me` with the token; extracts `team_id` from response.
+### `validate_ctfd_token(pool, token) → Option<i64>`
+Direct MariaDB query on `users` table (`SELECT team_id FROM users WHERE token = ? AND banned = 0 AND hidden = 0`).
 Returns `None` if invalid/no team. Used for player routes.
 
 ---
@@ -439,13 +447,13 @@ CREATE TABLE instances (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     challenge_name  TEXT NOT NULL,
     team_id         INTEGER NOT NULL,
-    user_id         INTEGER,          -- CTFd user who requested (nullable; added via migration)
+    user_id         INTEGER,          -- CTFd user who requested
     container_id    TEXT,             -- docker ID, compose project name, or LXC name
     host            TEXT NOT NULL,
     port            INTEGER NOT NULL,
     connection_type TEXT NOT NULL,
-    status          TEXT NOT NULL,    -- "running"|"stopped"|"error"
-    flag            TEXT,             -- per-instance random flag (nullable for static)
+    status          TEXT NOT NULL,    -- "running"|"provisioning"|"solved"
+    flag            TEXT,             -- per-team random flag (null for static)
     ctfd_flag_id    INTEGER,          -- CTFd flag ID for cleanup on stop/expire
     renewals_used   INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now')),
@@ -459,35 +467,51 @@ CREATE TABLE flag_attempts (
     team_id         INTEGER NOT NULL,
     user_id         INTEGER NOT NULL,
     submitted_flag  TEXT NOT NULL,
-    is_correct      INTEGER NOT NULL DEFAULT 0,   -- 0|1 boolean
-    is_flag_sharing INTEGER NOT NULL DEFAULT 0,   -- 1 = flag belonged to a different team
-    owner_team_id   INTEGER,          -- team whose instance owns this flag (if sharing)
+    is_correct      INTEGER NOT NULL DEFAULT 0,    -- 0|1 boolean
+    is_flag_sharing INTEGER NOT NULL DEFAULT 0,    -- 1 = flag belonged to a different team
+    owner_team_id   INTEGER,           -- team whose instance generated this flag (if sharing)
     timestamp       TEXT DEFAULT (datetime('now'))
 );
+
+-- Permanent flag history for sharing detection (never deleted on instance stop)
+CREATE TABLE team_flags (
+    challenge_name  TEXT NOT NULL,
+    team_id         INTEGER NOT NULL,
+    flag            TEXT NOT NULL,
+    created_at      TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (challenge_name, team_id, flag)
+);
+
+-- Read-only cache of correct solves synced from CTFd MariaDB submissions
+CREATE TABLE ctfd_solves (
+    challenge_name  TEXT NOT NULL,
+    team_id         INTEGER NOT NULL,
+    user_id         INTEGER,
+    solved_at       TEXT,
+    PRIMARY KEY (challenge_name, team_id)
+);
+
+-- Cached team/user names from CTFd for display
+CREATE TABLE ctfd_teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE ctfd_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, team_id INTEGER);
 ```
 
-`Db = Arc<Mutex<Connection>>`. WAL mode enabled.
-Migrations run on every `open()` (idempotent — errors from existing columns are ignored):
-- `ALTER TABLE instances ADD COLUMN flag TEXT`
-- `ALTER TABLE instances ADD COLUMN ctfd_flag_id INTEGER`
-- `ALTER TABLE instances ADD COLUMN user_id INTEGER`
+`Db = Arc<Mutex<Connection>>`. WAL mode enabled. Migrations are run on every `open()`.
 
 Key functions:
-- `upsert_config` — INSERT OR UPDATE instance_configs
-- `get_config(db, name) → Option<String>` — returns config_json
-- `get_image_tag / update_image_tag`
-- `insert_instance(db, challenge_name, team_id, user_id, container_id, host, port, conn_type, expires_at, flag, ctfd_flag_id)` — UPSERT (resets renewals_used=0 on conflict)
-- `get_instance(db, name, team_id) → Option<InstanceRow>`
-- `delete_instance → Option<(container_id, ctfd_flag_id)>` — returns IDs for cleanup
-- `delete_all_instances_for_challenge → Vec<(container_id, ctfd_flag_id)>` — used on challenge delete
-- `get_used_ports → HashSet<u16>` — all ports of running instances
-- `get_expired_instances → Vec<(challenge_name, container_id, team_id, ctfd_flag_id)>`
-- `list_all_instances → Vec<Value>` — all instances as JSON (for admin dashboard)
-- `insert_flag_attempt(db, challenge_name, team_id, user_id, submitted_flag, is_correct, is_flag_sharing, owner_team_id)`
-- `list_flag_attempts(db, limit: i64) → Vec<Value>` — most recent N attempts
-- `list_sharing_alerts(db) → Vec<Value>` — all rows where `is_flag_sharing = 1`
-- `find_flag_owner(db, challenge_name, submitted_flag, submitting_team_id) → Option<i64>` —
-  queries `instances` table; returns `Some(owner_team_id)` if flag belongs to a different team
+- `upsert_config / get_config / get_image_tag / update_image_tag / list_configs`
+- `insert_provisioning_stub` — INSERT OR IGNORE placeholder row (`status='provisioning'`)
+- `insert_instance` — UPSERT (resets `renewals_used=0`); also writes to `team_flags`
+- `get_instance / delete_instance / mark_instance_solved`
+- `delete_all_instances_for_challenge` — used on challenge delete
+- `get_used_ports → HashSet<u16>` / `get_expired_instances` / `list_all_instances`
+- `insert_flag_attempt / list_flag_attempts(limit) / list_sharing_alerts`
+- `find_flag_owner` — queries `team_flags` (permanent); returns `Some(owner_team_id)` if flag sharing
+- `replace_ctfd_solves` — full DELETE + INSERT cycle (so deleted submissions are reflected)
+- `revert_unsolved_instances` — sets `status='running'` where `status='solved'` but no ctfd_solve entry
+- `delete_stale_correct_attempts` — removes `is_correct=1` flag_attempts with no matching ctfd_solve
+- `replace_ctfd_teams_and_users` — full-replace name caches
+- `has_correct_solve / list_correct_solves`
 
 ---
 
@@ -495,47 +519,40 @@ Key functions:
 
 ### `mod.rs` — central dispatch
 
-`provision(db, challenge_name, team_id, user_id: Option<i64>, config: &Value, public_host) → (host, port, conn_type, expires_at)`
+`provision(db, challenge_name, team_id, user_id, config, public_host, ctfd_pool, runner_ssh) → (host, port, conn_type, expires_at)`
 
-Dispatches on `config["backend"]`. For all backends:
-- `generate_flag(config)` → `Option<String>` — returns `None` for `flag_mode != "random"`;
-  otherwise generates `<prefix><N random alphanumeric chars><suffix>`
-- `sanitize_name(name)` — lowercase, non-alphanumeric/hyphen → hyphen, trim hyphens
-- `container_name(challenge, team_id)` → `"ctf-<sanitized>-t<team_id>"`
-- `expires_at_string(minutes)` → `"YYYY-MM-DD HH:MM:SS"` UTC string (no chrono dep; manual Gregorian calc)
+- `generate_flag(config)` → `Option<String>` — `None` unless `flag_mode = "random"`; generates `<prefix><N chars><suffix>`
+- `sanitize_name(name)` — lowercase, non-alphanumeric/hyphen → hyphen, trim
+- container naming: `ctf-<sanitized>-t<team_id>`
+- `expires_at_string(minutes)` → `"YYYY-MM-DD HH:MM:SS"` UTC (no chrono dep)
+- `cleanup_container(container_id, runner_ssh: Option<&str>)` — tries compose::down, lxc::delete, docker::remove_container
 
-`cleanup_container(container_id)`:
-- If id starts with `"ctf-"` and len < 80: tries `compose::down()` and `lxc::delete()` first
-- Always tries `docker::remove_container()` after
+All docker/compose/lxc functions accept `runner_ssh: Option<&str>`. When set, commands are
+executed on the runner via `ssh -o BatchMode=yes <target> <cmd>`.
 
 ### `docker.rs`
-- `pick_free_port(used_ports: &HashSet<u16>) → Result<u16>` — random in 40000–50000
-- `run_container(image, name, host_port, internal_port, command, env_vars) → Result<String>`
-  → `docker run -d --name <name> -p <host>:<internal> [--env ...] [cmd] <image>`
-- `remove_container(id)` → `docker rm -f <id>`
-- `build_image(context_tar_gz: Bytes, image_tag) → Result<()>`
-  → writes to tempfile, runs `docker build -t <tag> -f- <tempdir>` with tar on stdin
+- `pick_free_port(used_ports) → u16` — random in 40000–50000
+- `run_container(..., runner_ssh) → String` — `docker run -d -p host:internal ...`
+- `remove_container(id, runner_ssh)` — `docker rm -f`
+- `build_image(context_tar_path, image_tag, runner_ssh)` — `docker build -t <tag>`
 
 ### `compose.rs`
-- `compose_cmd()` → probes `docker compose version`; falls back to `docker-compose` binary
-- `up(compose_file, project_name, internal_port, service, used_ports, flag, flag_delivery, flag_file_path, flag_service) → Result<(u16, String)>`
-  - Writes per-instance override file: `<project_name>.override.yml` in compose dir
-  - Override maps `host_port:internal_port` for the service
-  - `flag_delivery = "env"` (default): injects `FLAG=<value>` as env var to `docker compose up`
-    so `${FLAG}` substitution works in the challenge's docker-compose.yml
-  - `flag_delivery = "file"`: writes flag to `<project_name>.flag` in compose dir and adds
-    a bind-mount `<host_path>:<container_path>:ro` into the override for `flag_service`
-  - Runs: `docker compose -f <compose_file> -f <override> -p <project_name> up -d --force-recreate`
-- `down(project_name)` → `docker compose -p <project_name> down -v`
+- `up(..., runner_ssh) → (u16, String)`
+  - Writes `<project_name>.override.yml` (port mapping + optional flag file bind-mount)
+  - In split-machine mode: writes files to runner via `ssh mkdir -p && cat > file`
+  - `flag_delivery = "env"`: injects `FLAG=<value>` env var; challenge compose uses `${FLAG}`
+  - `flag_delivery = "file"`: writes `<project_name>.flag` + bind-mount override for `flag_service`
+  - Runs: `DOCKER_BUILDKIT=1 docker compose -f <compose_file> -f <override> -p <project_name> up -d --force-recreate`
+- `down(project_name, runner_ssh?)` — `docker compose -p <name> down -v`
+- `build(compose_file, runner_ssh?)` — `docker compose -f <file> build`
+- `list_ctf_projects()` — lists running `ctf-*` compose projects (for orphan cleanup)
 
 ### `lxc.rs`
-- `launch(lxc_image, container_name, host_port, internal_port, flag)` — full implementation:
-  `lxc launch` → `lxc wait --state=Running` → `lxc config device add` (proxy port) →
-  `lxc exec` flag injection to `/challenge/flag`
-- `delete(container_name)` → `lxc stop --force` + `lxc delete --force`
+- `launch(lxc_image, name, host_port, internal_port, flag)` — `lxc launch` → wait → proxy port → flag injection
+- `delete(name)` — `lxc stop --force` + `lxc delete --force`
 
 ### `vagrant.rs`
-- `up(vagrantfile_dir, vm_name, internal_port)` — stub, returns error
+- `up(...)` — stub, returns error
 
 ---
 

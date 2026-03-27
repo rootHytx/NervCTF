@@ -92,6 +92,9 @@ Output format:
 | `instance.internal_port` | Missing or 0 | Error |
 | `instance.connection` | Missing or empty | Error |
 | `instance.flag_mode: random` | `flags:` list also present (conflict) | Warning |
+| `instance.backend: docker` | `image` missing or empty | Error |
+| `instance.backend: lxc` | `lxc_image` missing or empty | Error |
+| `instance.backend: vagrant` | `vagrantfile` missing or empty | Error |
 | `instance.backend: compose` | No `compose_service` set | Warning |
 | `instance.flag_delivery: file` | `flag_file_path` not set | Warning |
 

@@ -109,14 +109,40 @@ Without `extra:`, the challenge is deployed as `standard` type with the given `v
 
 When `nervctf deploy` processes a `type: instance` challenge:
 
-1. Create/update the challenge on CTFd as `standard` or `dynamic`
-2. If `backend: docker` and `image` is a local path:
-   - Pack the challenge directory as tar.gz
-   - `POST /api/v1/instance/build` → monitor extracts and runs `docker build`
-3. If `backend: compose` and `compose_file` is a relative path:
-   - Pack the challenge directory as tar.gz
-   - `POST /api/v1/instance/build-compose` → monitor extracts and runs `docker compose build`
-4. `POST /api/v1/instance/register` — register `InstanceConfig` on the monitor
+1. Create/update the challenge in CTFd (direct MariaDB write)
+2. Build step — depends on backend and mode:
+
+**Single-machine** (no `runner_ip` in `.nervctf.yml`):
+
+| Backend | Action |
+|---------|--------|
+| `docker` (local path) | Pack challenge dir as tar.gz → `POST /api/v1/instance/build` → monitor runs `docker build` |
+| `compose` (relative path) | Pack challenge dir as tar.gz → `POST /api/v1/instance/build-compose` → monitor runs `docker compose build` |
+| `docker` (registry ref) | No build step — image is pulled at provision time |
+
+**Split-machine** (`runner_ip` set in `.nervctf.yml`):
+
+| Backend | Action |
+|---------|--------|
+| `docker` (local path) | rsync challenge dir to runner → `POST /api/v1/instance/build` |
+| `compose` (relative path) | rsync challenge dir to runner → `POST /api/v1/instance/build-compose-remote` → monitor SSHes to runner and runs `docker compose build` |
+
+3. `POST /api/v1/instance/register` — register `InstanceConfig` on the monitor
+
+### Split-machine mode
+
+When `runner_ip` is set in `.nervctf.yml`, challenge containers run on a separate worker node
+instead of the CTFd host. The CLI rsyncs challenge files directly to the runner; the monitor
+executes all Docker/Compose commands on the runner via SSH (`RUNNER_SSH_TARGET`).
+
+```yaml
+# .nervctf.yml
+runner_ip: 192.168.1.50
+runner_user: docker   # default: docker
+```
+
+Bind mount paths in `docker-compose.yml` must use the path as seen on the **runner** filesystem
+(not the monitor container). The runner stores challenge files at the same path used during rsync.
 
 ---
 

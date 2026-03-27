@@ -4,29 +4,16 @@
 
 ---
 
-## Table of Contents
-
-- [Features](#features)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Directory Structure](#directory-structure)
-- [Usage](#usage)
-- [Challenge Specification](#challenge-specification)
-- [Instance Challenges](#instance-challenges)
-- [Remote Monitor](#remote-monitor)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
-
----
-
 ## Features
 
-- Scan local `challenge.yml` files and deploy/sync to CTFd
+- Scan local `challenge.yml` files and deploy/sync to CTFd via direct MariaDB writes
 - Full ctfcli spec: simple and detailed flags, hints, requirements (name/ID/advanced)
 - Pre-deploy validation with errors (blocking) and warnings (advisory)
-- Dependency-ordered deployment (topological sort via Kahn's algorithm)
+- Dependency-ordered deployment (topological sort)
 - Smart sync — only updates challenges where fields actually changed
 - `type: instance` challenges with ephemeral per-team containers (Docker, Compose, LXC)
+- Split-machine mode: challenge containers run on a separate worker node
+- Flag-sharing detection: alerts when a team submits another team's instance flag
 - `nervctf fix` — interactive YAML patcher for missing fields
 - `nervctf setup` — one-command server provisioning via embedded Ansible playbook
 
@@ -36,41 +23,33 @@
 
 ### With Nix (recommended)
 
-Uses `flake.nix` — all deps (Rust, pkg-config, OpenSSL, Ansible) are provided:
-
 ```sh
 nix develop .# --command cargo build --release
+# or
+make release-nix     # builds both binaries
+make release-musl    # static Linux x86_64 binary
 ```
 
-Or use `make`:
-
-```sh
-nix develop .# --command make release-nix   # builds both binaries
-```
+`nix develop .#` provides Rust, pkg-config, OpenSSL, and Ansible. Run `make help` for all targets.
 
 ### Without Nix
 
 ```sh
 # Debian/Ubuntu
-sudo apt install curl build-essential pkg-config libssl-dev
+sudo apt install build-essential pkg-config libssl-dev
 curl https://sh.rustup.rs -sSf | sh
 cargo build --release
-
-# macOS
-cargo build --release  # Xcode tools + rustup required
 ```
 
-### Cross-compilation targets
-
-Run `make help` for all targets. Notable:
+### Cross-compilation targets (from Linux via Nix)
 
 | Target | Command |
 |--------|---------|
 | Linux x86_64 musl (static) | `make release-musl` |
-| Linux aarch64 | `make release-arm64` |
-| Windows x86_64 | `make release-windows` |
+| Linux aarch64 CLI | `make release-arm64` |
+| Windows x86_64 CLI | `make release-windows` |
 
-macOS targets require a macOS machine (Apple SDK is non-redistributable).
+`remote-monitor` is Linux x86_64 only. macOS targets require a macOS machine.
 
 ---
 
@@ -78,24 +57,24 @@ macOS targets require a macOS machine (Apple SDK is non-redistributable).
 
 Priority (highest wins): CLI flags → env vars → `.nervctf.yml`
 
-### Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `MONITOR_URL` | Remote monitor URL |
-| `MONITOR_TOKEN` | Monitor authentication token |
+| CLI flag | Env var | Description |
+|----------|---------|-------------|
+| `--monitor-url` | `MONITOR_URL` | Remote monitor URL |
+| `--monitor-token` | `MONITOR_TOKEN` | Monitor authentication token |
 
 ### `.nervctf.yml`
 
-Searched upward from `--base-dir`. Created by `nervctf setup`.
+Searched upward from `--challenges-dir`. Created by `nervctf setup`.
 
 ```yaml
 monitor_url: http://server:33133
 monitor_token: mysecret
-base_dir: ./challenges
-```
+challenges_dir: ./challenges
 
-See `docs/` for full config reference including setup/deployment fields.
+# Split-machine mode (containers run on a separate worker node)
+runner_ip: 192.168.1.50
+runner_user: docker
+```
 
 ---
 
@@ -106,14 +85,15 @@ See `docs/` for full config reference including setup/deployment fields.
 ├── .nervctf.yml
 └── challenges/
     ├── web/
-    │   └── my-challenge/
+    │   └── sqli/
     │       ├── challenge.yml
     │       └── dist/source.py
     └── pwn/
-        └── ...
+        └── overflow/
+            └── challenge.yml
 ```
 
-Each challenge must have a `challenge.yml` in its own subdirectory under a category directory.
+Challenge files are found recursively (max depth 5). Supported filenames: `challenge.yml`, `challenge.yaml`, or any `*challenge*.yml`.
 
 ---
 
@@ -123,55 +103,43 @@ Each challenge must have a `challenge.yml` in its own subdirectory under a categ
 
 ```sh
 nervctf validate
-nervctf validate --base-dir ./challenges
+nervctf validate --debug    # full field-by-field view
 ```
 
-Runs automatically before every `deploy`. Exits 1 on errors. See `docs/validator.md` for all checks.
+Runs automatically before every `deploy`. Exits 1 on errors.
 
 ### Deploy
 
 ```sh
-nervctf deploy
-nervctf deploy --dry-run
+nervctf deploy              # create new + update changed challenges
+nervctf deploy --dry-run    # show diff only
+nervctf deploy --recreate   # force re-deploy all challenges (re-syncs files, rebuilds images)
 ```
 
-Creates new challenges and updates changed ones. Phases: cores+flags+tags+hints → files → requirements → next pointers.
-
-### Sync
-
-```sh
-nervctf sync           # show diff + confirm before applying
-nervctf sync --diff    # show diff only
-```
+Four phases: (1) cores + flags + tags + hints → (2) files → (3) requirements → (4) next pointers.
 
 ### List / Scan
 
 ```sh
-nervctf list
+nervctf list           # list local challenges
+nervctf scan           # scan + print statistics
 ```
 
 ### Fix
 
 ```sh
-nervctf fix              # patch missing state/author/version fields interactively
+nervctf fix            # patch missing state/author/version fields interactively
 nervctf fix --dry-run
 ```
 
 ### Setup
 
 ```sh
-nervctf setup
+nervctf setup          # provision server (Docker, CTFd, plugin, monitor) via Ansible
+nervctf setup --upgrade  # push updated plugin + binary, rebuild, restart
 ```
 
-Provisions a remote server with Docker, CTFd, the NervCTF CTFd plugin, and the remote-monitor service via Ansible. Prompts for target IP, SSH user, CTFd path, and monitor token. Requires `ansible` (included in `nix develop`).
-
-### Export
-
-```sh
-nervctf export --output ./exported
-```
-
-Dumps all CTFd challenges to local YAML files.
+Prompts for target IP, SSH user, CTFd remote path, and monitor token. Requires `ansible` (included in `nix develop .#`).
 
 ---
 
@@ -184,14 +152,11 @@ name: My Challenge
 category: web
 value: 100
 type: standard
-version: '0.3'
-author: Author Name
-state: visible
 flags:
   - flag{example}
 ```
 
-### With all optional fields
+### Full example
 
 ```yaml
 name: Advanced Challenge
@@ -223,7 +188,6 @@ requirements:
   - "Warmup"
 
 next: "Follow-up Challenge"
-version: "0.3"
 ```
 
 ### Dynamic scoring
@@ -244,7 +208,7 @@ extra:
 
 ## Instance Challenges
 
-`type: instance` challenges provision an ephemeral container or VM for each team. Requires the remote-monitor service and the CTFd plugin.
+`type: instance` challenges provision an ephemeral container for each team. Requires the remote-monitor service and the CTFd plugin (both deployed by `nervctf setup`).
 
 See `docs/instance-challenges.md` for the full reference.
 
@@ -260,10 +224,10 @@ extra:
   minimum: 100
 
 instance:
-  backend: docker       # docker | compose | lxc | vagrant
-  image: .              # local path or registry image
+  backend: docker         # docker | compose | lxc
+  image: .                # local path (".") or registry image
   internal_port: 1337
-  connection: nc
+  connection: nc          # nc | http | ssh
   flag_mode: random
   flag_prefix: "CTF{"
   flag_suffix: "}"
@@ -271,55 +235,68 @@ instance:
   max_renewals: 3
 ```
 
+ctfcli-compatible format (fields under `extra:`) is also accepted:
+
+```yaml
+type: instance
+extra:
+  backend: docker
+  image: myimage:latest
+  internal_port: 1337
+  connection: nc
+```
+
 ---
 
 ## Remote Monitor
 
-The `remote-monitor` runs on the CTFd host. It is the sole point of contact with CTFd — writing directly to the MariaDB database — and manages instance lifecycle.
+The `remote-monitor` runs on the CTFd host. It is the **sole point of contact with CTFd** — writing directly to the MariaDB database — and manages instance lifecycle.
 
 ```
 CLI  ──Token<monitor>──▶  remote-monitor:33133  ──SQL──▶  CTFd MariaDB
-                                │
+                                │                    └──▶  CTFd uploads dir
                           instance manager
-                       (docker/compose/lxc/vagrant)
+                    ┌──────────┴──────────┐
+                 local              split-machine
+            (docker daemon)   (SSH to runner node)
 ```
 
 Deployed automatically by `nervctf setup`. For manual details see `docs/remote-monitor.md`.
 
-### Admin dashboard
+### Split-machine mode
 
-Open in a browser — no extra tools needed:
+When `runner_ip` is set in `.nervctf.yml`, the CLI rsyncs challenge files directly to the runner node. The monitor executes all Docker/Compose commands on the runner via SSH (`RUNNER_SSH_TARGET` env var).
+
+### Admin dashboard
 
 ```
 http://<monitor-host>:33133/admin?token=<MONITOR_TOKEN>
 ```
 
-The token is the `monitor_token` value in your `.nervctf.yml` (written there by `nervctf setup`).
-
-The dashboard shows three auto-refreshing tables:
-- **Flag Sharing Alerts** — submissions where the flag belonged to a *different* team's instance (refreshes every 15 s)
-- **Active Instances** — all running containers with host/port and expiry (refreshes every 15 s)
-- **Recent Flag Attempts** — last 200 submissions across all teams (refreshes every 30 s)
+Three auto-refreshing tables: **Flag Sharing Alerts** · **Active Instances** · **Recent Flag Attempts**
 
 ### Key routes
 
 | Auth | Path | Description |
 |------|------|-------------|
 | None | `GET /health` | Liveness check |
-| `?token=` or header | `GET /admin` | Admin dashboard HTML |
+| `?token=` or header | `GET /admin` | Admin dashboard |
 | None | `GET /instance/:name` | Player instance UI |
 | Admin | `POST /api/v1/instance/build` | Upload Docker build context |
-| Admin | `POST /api/v1/instance/build-compose` | Upload Compose challenge context |
+| Admin | `POST /api/v1/instance/build-compose` | Upload Compose context (single-machine) |
+| Admin | `POST /api/v1/instance/build-compose-remote` | Trigger remote build (split-machine) |
 | Admin | `POST /api/v1/instance/register` | Register challenge config |
-| Admin | `GET/POST/PATCH/DELETE /api/v1/challenges[/{id}]` | Challenge CRUD via SQL |
-| Admin | `GET/POST/DELETE /api/v1/flags[/{id}]` | Flag CRUD via SQL |
-| Admin | `GET/POST/DELETE /api/v1/hints[/{id}]` | Hint CRUD via SQL |
-| Admin | `GET/POST/DELETE /api/v1/tags[/{id}]` | Tag CRUD via SQL |
-| Admin | `GET/POST/DELETE /api/v1/files[/{id}]` | File CRUD via SQL + disk |
-| Admin | `POST /api/v1/topics` | Topic upsert via SQL |
-| Admin | `GET /api/v1/admin/instances` | JSON list of all active instances |
-| Admin | `GET /api/v1/admin/attempts` | JSON flag attempt log (`?alerts_only=true` for sharing only) |
-| Plugin | `POST /api/v1/plugin/attempt` | Record a flag submission + detect sharing |
+| Admin | `GET/POST /api/v1/challenges[/{id}]` | Challenge CRUD (SQL) |
+| Admin | `GET/POST/DELETE /api/v1/flags[/{id}]` | Flag CRUD (SQL) |
+| Admin | `GET/POST/DELETE /api/v1/hints[/{id}]` | Hint CRUD (SQL) |
+| Admin | `GET/POST/DELETE /api/v1/tags[/{id}]` | Tag CRUD (SQL) |
+| Admin | `GET/POST/DELETE /api/v1/files[/{id}]` | File CRUD (SQL + disk) |
+| Admin | `POST /api/v1/topics` | Topic upsert (SQL) |
+| Admin | `GET /api/v1/admin/instances` | JSON list of active instances |
+| Admin | `GET /api/v1/admin/attempts` | Flag attempt log (`?alerts_only=true`) |
+| Admin | `GET /api/v1/admin/solves` | Correct solves per team |
+| Plugin | `POST /api/v1/plugin/attempt` | Record flag submission + detect sharing |
+| Plugin | `POST /api/v1/plugin/solve` | Mark solved + tear down instance |
 | Player | `POST /api/v1/instance/request` | Provision instance |
 | Player | `POST /api/v1/instance/renew` | Extend expiry |
 | Player | `DELETE /api/v1/instance/stop` | Destroy instance |
@@ -328,33 +305,36 @@ The dashboard shows three auto-refreshing tables:
 
 ## Troubleshooting
 
-- **No challenges found** — challenges must be at `challenges/<category>/<name>/challenge.yml`
-- **File upload 500** — fix with `chown -R 1001:1001 /path/to/CTFd/.data/CTFd/uploads`
-- **`state: Field may not be null`** — run `nervctf fix` to add missing `state` fields
-- **Monitor 401** — `MONITOR_TOKEN` mismatch between CLI and server
-- **Compose file not found on monitor** — run `nervctf deploy` to upload the challenge context; see `docs/remote-monitor.md`
-- **`ansible-playbook` not found** — run inside `nix develop .#` which provides Ansible
+| Symptom | Fix |
+|---------|-----|
+| No challenges found | Files must be at `<category>/<name>/challenge.yml` |
+| File upload 500 | `chown -R 1001:1001 /path/to/CTFd/.data/CTFd/uploads` |
+| `state: Field may not be null` | Run `nervctf fix` |
+| Monitor 401 | `MONITOR_TOKEN` mismatch between CLI and server |
+| Compose file not found on runner | Run `nervctf deploy` to sync challenge files |
+| `ansible-playbook` not found | Run inside `nix develop .#` |
+| `docker build` fails on runner | Ensure Docker + BuildKit (`docker-buildx-plugin`) are installed on runner |
 
 ---
 
 ## Development
 
 ```sh
-# Build
-nix develop .# --command cargo build
-nix develop .# --command cargo build --release -p remote-monitor
-
-# Test
-nix develop .# --command cargo test -p nervctf
-
-# Format / lint
-nix develop .# --command cargo fmt
-nix develop .# --command cargo clippy
+make check          # cargo check all crates
+make test           # nervctf unit tests
+make fmt            # rustfmt
+make release-nix    # native release build (both binaries)
 ```
 
-See `ARCHITECTURE.md` for a full machine-readable reference of the entire system.
-See `docs/` for per-module documentation.
-See `docs/claude-changes.md` for a record of all architectural changes.
+Or directly:
+
+```sh
+nix develop .# --command cargo build
+nix develop .# --command cargo build --release -p remote-monitor
+nix develop .# --command cargo test -p nervctf
+```
+
+See `ARCHITECTURE.md` for a full system reference and `docs/` for per-module documentation.
 
 ---
 

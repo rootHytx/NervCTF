@@ -21,6 +21,10 @@
 
 ## Installation
 
+### Pre-compiled Binaries
+
+You can download the `nervctf` binary for your specific distro, as well as the `remote-monitor` binary for the target machine, [in the releases section](https://github.com/rootHytx/NervCTF/releases/tag/2.1.0). These 2 binaries are all you need, and `nervctf` takes care of everything from setting up the dependencies on your remote target, copying and downloading the necessary files and setting up a running instance of CTFd.
+
 ### With Nix (recommended)
 
 ```sh

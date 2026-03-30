@@ -252,6 +252,17 @@ pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Optio
     }
 }
 
+/// Count active (running + provisioning) instances for a team across all challenges.
+pub fn count_active_instances_for_team(db: &Db, team_id: i64) -> Result<i64> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM instances WHERE team_id = ?1 AND status IN ('running', 'provisioning')",
+        params![team_id],
+        |row| row.get(0),
+    )?;
+    Ok(n)
+}
+
 /// Insert a placeholder row with status='provisioning' so the info endpoint can
 /// return status immediately while compose runs in the background.
 /// Uses INSERT OR IGNORE so a concurrent retry doesn't clobber an existing row.

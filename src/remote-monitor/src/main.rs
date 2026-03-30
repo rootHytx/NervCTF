@@ -810,6 +810,19 @@ async fn instance_request_handler(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
 
+    // Enforce per-team instance cap if max_per_team is set in the challenge config.
+    if let Some(max) = config["max_per_team"].as_u64().filter(|&m| m > 0) {
+        match db::count_active_instances_for_team(&state.db, team_id) {
+            Ok(n) if n as u64 >= max => {
+                return (StatusCode::CONFLICT, Json(json!({
+                    "error": format!("Instance limit reached: your team already has {} active instance(s) (max {})", n, max)
+                }))).into_response();
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+            _ => {}
+        }
+    }
+
     match instance::provision(
         &state.db, &body.challenge_name, team_id, None, &config, &state.public_host,
         &state.ctfd_pool, state.runner_ssh_target.as_deref(),
@@ -1033,6 +1046,20 @@ async fn plugin_request_handler(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
         }
     };
+
+    // Enforce per-team instance cap if max_per_team is set in the challenge config.
+    if let Some(max) = config["max_per_team"].as_u64().filter(|&m| m > 0) {
+        match db::count_active_instances_for_team(&state.db, body.team_id) {
+            Ok(n) if n as u64 >= max => {
+                info!("plugin_request: team {} hit instance cap ({}/{}), rejecting", body.team_id, n, max);
+                return (StatusCode::CONFLICT, Json(json!({
+                    "error": format!("Instance limit reached: your team already has {} active instance(s) (max {})", n, max)
+                }))).into_response();
+            }
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+            _ => {}
+        }
+    }
 
     // Derive reasonable placeholder values for the provisioning stub
     let connection_type = config["connection"].as_str().unwrap_or("nc").to_string();

@@ -6,6 +6,7 @@
     docker_user: docker
     monitor_port: "{{ monitor_port | default('33133') }}"
     max_concurrent_provisions: "{{ max_concurrent_provisions | default('4') }}"
+    max_instances_per_team: "{{ max_instances_per_team | default('0') }}"
 
   tasks:
     # ── Docker ─────────────────────────────────────────────────────────────────
@@ -388,6 +389,7 @@
           {% endif %}
                 - CTFD_UPLOADS_DIR={{ ctfd_path }}/.data/CTFd/uploads
                 - MAX_CONCURRENT_PROVISIONS={{ max_concurrent_provisions }}
+                - MAX_INSTANCES_PER_TEAM={{ max_instances_per_team }}
               networks:
                 - default
                 - internal

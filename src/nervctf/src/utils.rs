@@ -31,6 +31,8 @@ pub struct Config {
     // Monitor tuning
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_concurrent_provisions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_instances_per_team: Option<u32>,
 
     // Split-machine mode: separate host for running challenge containers
     #[serde(skip_serializing_if = "Option::is_none")]

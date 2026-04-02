@@ -129,6 +129,7 @@ pub struct Config {
     pub ctfd_remote_path:         Option<String>,   // setup only
     pub monitor_port:             Option<String>,   // setup only
     pub max_concurrent_provisions: Option<u32>,     // monitor tuning
+    pub max_instances_per_team:   Option<u32>,     // monitor tuning (0 = unlimited)
     pub runner_ip:                Option<String>,   // split-machine mode
     pub runner_user:              Option<String>,   // split-machine mode
 }
@@ -219,7 +220,6 @@ pub struct InstanceConfig {
     pub internal_port: u32,
     pub connection: String,              // "nc" | "http" | "ssh"
     pub timeout_minutes: Option<u32>,
-    pub max_per_team: Option<u32>,
     pub max_renewals: Option<u32>,
     pub command: Option<String>,
     pub flag_mode: Option<InstanceFlagMode>,    // "static" | "random"
@@ -343,6 +343,7 @@ pub struct AppState {
     pub ctfd_uploads_dir: String,       // CTFD_UPLOADS_DIR
     pub runner_ssh_target: Option<String>,  // RUNNER_SSH_TARGET (split-machine mode)
     pub provision_sem: Arc<Semaphore>,  // MAX_CONCURRENT_PROVISIONS
+    pub max_instances_per_team: u64,   // MAX_INSTANCES_PER_TEAM (0 = unlimited)
 }
 ```
 
@@ -359,6 +360,7 @@ pub struct AppState {
 | `MONITOR_BIND` | `0.0.0.0` | TCP bind address |
 | `DB_PATH` | `./monitor.db` | SQLite file path |
 | `MAX_CONCURRENT_PROVISIONS` | `4` | Semaphore limit for concurrent docker/compose ops |
+| `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team across all challenges (0 = unlimited) |
 | `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd MariaDB → SQLite sync cycles |
 
 ### Admin dashboard
@@ -874,10 +876,9 @@ Deployment of remote-monitor:
 ## 21. KNOWN LIMITATIONS / FUTURE WORK
 
 - Vagrant backend is a stub (returns error); `lxc::destroy` not called on cleanup (only `lxc::delete`)
-- `max_per_team` field in InstanceConfig is not enforced by the monitor (stored but unused)
+- Per-team instance cap is global (`MAX_INSTANCES_PER_TEAM` env var), not per-challenge
 - `sync` command asks for confirmation interactively; not scriptable
 - No authentication on player HTML page (`GET /instance/:name`) — token entered client-side
 - Challenge requirements comparison is shallow (presence only, not prerequisite identity)
-- `nervctf delete` does not clean up monitor instance configs (only CTFd-side delete)
 - CTFd API key for dynamic scoring challenges: `extra.initial` triggers Dynamic type but
   CTFd's Dynamic plugin must be installed; base CTFd does not include it by default

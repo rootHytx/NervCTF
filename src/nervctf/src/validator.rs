@@ -683,7 +683,7 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
         "instance.flag_prefix", "instance.flag_suffix", "instance.random_flag_length",
         "instance.compose_file", "instance.compose_service",
         "instance.lxc_image", "instance.vagrantfile",
-        "instance.timeout_minutes", "instance.max_per_team", "instance.max_renewals",
+        "instance.timeout_minutes", "instance.max_renewals",
         "instance.command",
         "flags", "tags", "topics", "files", "hints", "requirements",
         "next", "state", "connection_info", "attempts", "image",

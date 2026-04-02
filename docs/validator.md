@@ -111,7 +111,7 @@ A `HashSet<&str>` of all known field paths. Any top-level YAML key not in this s
 `instance.flag_delivery`, `instance.flag_file_path`, `instance.flag_service`,
 `instance.flag_prefix`, `instance.flag_suffix`, `instance.random_flag_length`,
 `instance.compose_file`, `instance.compose_service`, `instance.lxc_image`,
-`instance.vagrantfile`, `instance.timeout_minutes`, `instance.max_per_team`,
+`instance.vagrantfile`, `instance.timeout_minutes`,
 `instance.max_renewals`, `instance.command`.
 
 ---

@@ -124,7 +124,6 @@ pub struct InstanceConfig {
     pub internal_port: u32,
     pub connection: String,
     pub timeout_minutes: Option<u32>,
-    pub max_per_team: Option<u32>,
     pub max_renewals: Option<u32>,
     pub command: Option<String>,
 

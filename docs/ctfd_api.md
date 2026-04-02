@@ -29,7 +29,6 @@ src/ctfd_api/
 | Field | Type | Description |
 |-------|------|-------------|
 | `client` | `reqwest::Client` | Async HTTP client |
-| `blocking_client` | `reqwest::blocking::Client` | Used by `post_file()` legacy callers |
 | `base_url` | `String` | Monitor URL + `/api/v1` (trailing slash stripped) |
 | `api_key` | `String` | Monitor token (used as `Authorization: Token <monitor_token>`) |
 
@@ -93,17 +92,6 @@ for part in file_parts {
 }
 client.upload_file("/files", form).await?;
 ```
-
-### `post_file` (legacy)
-
-```rust
-pub async fn post_file<T: DeserializeOwned>(
-    &self, endpoint: &str, form: Option<multipart::Form>,
-) -> Result<Option<T>>
-```
-
-Uses the blocking client. **Do not call from an async tokio context** — panics if a runtime already
-exists. Use `upload_file` for all new code.
 
 ### `request_without_body`
 

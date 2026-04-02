@@ -53,6 +53,7 @@ In split-machine mode, Docker commands run on a separate worker node via SSH
 | `MONITOR_BIND` | `0.0.0.0` | TCP bind address |
 | `DB_PATH` | `./monitor.db` | SQLite file path |
 | `MAX_CONCURRENT_PROVISIONS` | `4` | Semaphore limit for concurrent docker/compose ops |
+| `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team across all challenges (0 = unlimited) |
 | `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd MariaDB → SQLite sync cycles |
 
 ---

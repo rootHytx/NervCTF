@@ -334,6 +334,9 @@ pub fn run_setup() -> Result<()> {
     if let Some(n) = config.max_concurrent_provisions {
         evars.push(format!("max_concurrent_provisions={}", n));
     }
+    if let Some(n) = config.max_instances_per_team {
+        evars.push(format!("max_instances_per_team={}", n));
+    }
     if let Some(ref bin) = monitor_binary {
         evars.push(format!("monitor_binary={}", bin.display()));
     }
@@ -503,6 +506,9 @@ pub fn run_upgrade() -> Result<()> {
     ];
     if let Some(n) = config.max_concurrent_provisions {
         evars.push(format!("max_concurrent_provisions={}", n));
+    }
+    if let Some(n) = config.max_instances_per_team {
+        evars.push(format!("max_instances_per_team={}", n));
     }
     if let Some(ref bin) = monitor_binary {
         evars.push(format!("monitor_binary={}", bin.display()));

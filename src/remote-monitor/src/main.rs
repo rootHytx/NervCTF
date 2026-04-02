@@ -79,6 +79,9 @@ struct AppState {
     /// Limits concurrent docker/compose provision operations to prevent port-pick
     /// races and avoid overwhelming the Docker daemon socket.
     provision_sem: Arc<tokio::sync::Semaphore>,
+    /// Global cap on active instances (running + provisioning) per team across all
+    /// challenges.  0 = unlimited.
+    max_instances_per_team: u64,
 }
 
 #[tokio::main]
@@ -118,6 +121,12 @@ async fn main() -> Result<()> {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     info!("provision concurrency limit: {}", max_concurrent_provisions);
 
+    let max_instances_per_team: u64 = env::var("MAX_INSTANCES_PER_TEAM")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if max_instances_per_team > 0 {
+        info!("per-team instance cap: {}", max_instances_per_team);
+    }
+
     let state = Arc::new(AppState {
         monitor_token,
         public_host,
@@ -127,6 +136,7 @@ async fn main() -> Result<()> {
         ctfd_uploads_dir,
         runner_ssh_target,
         provision_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_provisions)),
+        max_instances_per_team,
     });
 
     // Spawn background CTFd solve sync task (read-only from MariaDB → SQLite cache)
@@ -810,12 +820,12 @@ async fn instance_request_handler(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
 
-    // Enforce per-team instance cap if max_per_team is set in the challenge config.
-    if let Some(max) = config["max_per_team"].as_u64().filter(|&m| m > 0) {
+    // Enforce global per-team instance cap.
+    if state.max_instances_per_team > 0 {
         match db::count_active_instances_for_team(&state.db, team_id) {
-            Ok(n) if n as u64 >= max => {
+            Ok(n) if n as u64 >= state.max_instances_per_team => {
                 return (StatusCode::CONFLICT, Json(json!({
-                    "error": format!("Instance limit reached: your team already has {} active instance(s) (max {})", n, max)
+                    "error": format!("Instance limit reached: your team already has {} active instance(s) (max {})", n, state.max_instances_per_team)
                 }))).into_response();
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1047,13 +1057,13 @@ async fn plugin_request_handler(
         }
     };
 
-    // Enforce per-team instance cap if max_per_team is set in the challenge config.
-    if let Some(max) = config["max_per_team"].as_u64().filter(|&m| m > 0) {
+    // Enforce global per-team instance cap.
+    if state.max_instances_per_team > 0 {
         match db::count_active_instances_for_team(&state.db, body.team_id) {
-            Ok(n) if n as u64 >= max => {
-                info!("plugin_request: team {} hit instance cap ({}/{}), rejecting", body.team_id, n, max);
+            Ok(n) if n as u64 >= state.max_instances_per_team => {
+                info!("plugin_request: team {} hit instance cap ({}/{}), rejecting", body.team_id, n, state.max_instances_per_team);
                 return (StatusCode::CONFLICT, Json(json!({
-                    "error": format!("Instance limit reached: your team already has {} active instance(s) (max {})", n, max)
+                    "error": format!("Instance limit reached: your team already has {} active instance(s) (max {})", n, state.max_instances_per_team)
                 }))).into_response();
             }
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),

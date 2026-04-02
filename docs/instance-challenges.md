@@ -48,7 +48,6 @@ instance:
   connection: nc              # nc | http | ssh
   command: null               # override container entrypoint/CMD (optional)
   timeout_minutes: 45
-  max_per_team: 1             # max concurrent instances per team (enforced by plugin)
   max_renewals: 3
 
   # ── Flag ────────────────────────────────────────────────────────────────────

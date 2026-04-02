@@ -106,7 +106,7 @@ pub enum SyncAction<'a> {
 Actions are topologically sorted by `RequirementsQueue::resolve_dependencies()` (Kahn's algorithm).
 
 **Note:** The 4-phase deploy in `main.rs` supersedes the synchronizer for the primary workflow.
-The synchronizer remains the backend for `nervctf sync`.
+The synchronizer is used internally by `deploy` for diff computation.
 
 ### Dependency Resolution (`RequirementsQueue`)
 

@@ -11,19 +11,6 @@ use crate::{find_config_path, load_config, save_config};
 const PLAYBOOK: &str = include_str!("../assets/nervctf_playbook.yml");
 const UPGRADE_PLAYBOOK: &str = include_str!("../assets/nervctf_upgrade_playbook.yml");
 
-/// Walk up from cwd until we find a flake.nix.
-fn find_flake_nix() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join("flake.nix").exists() {
-            return Some(dir.join("flake.nix"));
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -330,13 +317,9 @@ pub fn run_setup() -> Result<()> {
         format!("ctfd_path={}", ctfd_path),
         format!("monitor_token={}", monitor_token),
         format!("monitor_port={}", monitor_port),
+        format!("max_concurrent_provisions={}", config.max_concurrent_provisions.unwrap_or(4)),
+        format!("max_instances_per_team={}", config.max_instances_per_team.unwrap_or(0)),
     ];
-    if let Some(n) = config.max_concurrent_provisions {
-        evars.push(format!("max_concurrent_provisions={}", n));
-    }
-    if let Some(n) = config.max_instances_per_team {
-        evars.push(format!("max_instances_per_team={}", n));
-    }
     if let Some(ref bin) = monitor_binary {
         evars.push(format!("monitor_binary={}", bin.display()));
     }
@@ -376,7 +359,7 @@ pub fn run_setup() -> Result<()> {
 // ── Shared ansible runner ─────────────────────────────────────────────────────
 
 /// Write the playbook + inventory to a tempdir and invoke ansible-playbook.
-/// Falls back to `nix develop ... --command ansible-playbook` if not in PATH.
+/// Requires `ansible-playbook` to be present in PATH.
 fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Result<()> {
     let tmp = tempdir()?;
     let playbook_path = tmp.path().join("playbook.yml");
@@ -394,30 +377,16 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
         args.push(ev.clone());
     }
 
-    let status = match Command::new("ansible-playbook").args(&args).status() {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let flake_nix = find_flake_nix().ok_or_else(|| {
-                anyhow!(
-                    "ansible-playbook not found in PATH and no flake.nix found. \
-                     Install ansible or run inside nix develop."
-                )
-            })?;
-            let flake_dir = flake_nix.parent().unwrap();
-            println!(
-                "  (ansible-playbook not in PATH -- using nix develop at {})",
-                flake_dir.display()
-            );
-            Command::new("nix")
-                .arg("develop")
-                .arg(flake_dir.to_str().unwrap())
-                .arg("--command")
-                .arg("ansible-playbook")
-                .args(&args)
-                .status()?
-        }
-        Err(e) => return Err(e.into()),
-    };
+    let status = Command::new("ansible-playbook")
+        .args(&args)
+        .status()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow!("ansible-playbook not found in PATH. Install Ansible first:\n  pip install ansible\n  -- or --\n  apt install ansible")
+            } else {
+                e.into()
+            }
+        })?;
 
     if !status.success() {
         return Err(anyhow!(
@@ -503,13 +472,9 @@ pub fn run_upgrade() -> Result<()> {
     let mut evars: Vec<String> = vec![
         format!("ctfd_path={}", ctfd_path),
         format!("monitor_port={}", monitor_port),
+        format!("max_concurrent_provisions={}", config.max_concurrent_provisions.unwrap_or(4)),
+        format!("max_instances_per_team={}", config.max_instances_per_team.unwrap_or(0)),
     ];
-    if let Some(n) = config.max_concurrent_provisions {
-        evars.push(format!("max_concurrent_provisions={}", n));
-    }
-    if let Some(n) = config.max_instances_per_team {
-        evars.push(format!("max_instances_per_team={}", n));
-    }
     if let Some(ref bin) = monitor_binary {
         evars.push(format!("monitor_binary={}", bin.display()));
     }

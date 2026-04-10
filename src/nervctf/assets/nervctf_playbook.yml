@@ -4,9 +4,6 @@
   vars:
     ansible_python_interpreter: auto_silent
     docker_user: docker
-    monitor_port: "{{ monitor_port | default('33133') }}"
-    max_concurrent_provisions: "{{ max_concurrent_provisions | default('4') }}"
-    max_instances_per_team: "{{ max_instances_per_team | default('0') }}"
 
   tasks:
     # ── Docker ─────────────────────────────────────────────────────────────────

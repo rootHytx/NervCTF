@@ -35,7 +35,7 @@ extra:
     initial: 500
     decay: 100
     minimum: 50
-    # decay_function: logarithmic
+    # decay_function: logarithmic  # linear (default) | logarithmic
 
 tags:
     - tag1

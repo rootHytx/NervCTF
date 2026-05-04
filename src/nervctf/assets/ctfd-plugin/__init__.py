@@ -9,8 +9,10 @@ Required environment variables (set in CTFd's .env):
   NERVCTF_MONITOR_TOKEN  — Admin token for the remote-monitor
 """
 
+import json
 import logging
 import os
+import traceback
 from datetime import datetime, timezone
 
 import requests as req_lib
@@ -102,6 +104,13 @@ class InstanceChallengeType(BaseChallenge):
 
         data = request.form or request.get_json() or {}
 
+        try:
+            internal_port = int(data.get("internal_port") or 1337)
+            timeout_minutes = int(data.get("timeout_minutes") or 45)
+            max_renewals = int(data.get("max_renewals") or 3)
+        except (ValueError, TypeError) as e:
+            return {"error": f"Invalid numeric field: {e}"}, 400
+
         challenge = InstanceChallenge(
             name=data.get("name", ""),
             description=data.get("description", ""),
@@ -117,10 +126,10 @@ class InstanceChallengeType(BaseChallenge):
             compose_service=data.get("compose_service", ""),
             lxc_image=data.get("lxc_image", ""),
             vagrantfile=data.get("vagrantfile", ""),
-            internal_port=int(data.get("internal_port") or 1337),
+            internal_port=internal_port,
             connection=data.get("connection", "nc"),
-            timeout_minutes=int(data.get("timeout_minutes") or 45),
-            max_renewals=int(data.get("max_renewals") or 3),
+            timeout_minutes=timeout_minutes,
+            max_renewals=max_renewals,
             flag_mode=data.get("flag_mode", "static"),
             flag_prefix=data.get("flag_prefix", ""),
             flag_suffix=data.get("flag_suffix", ""),
@@ -196,6 +205,13 @@ class InstanceChallengeType(BaseChallenge):
 
         chall = InstanceChallenge.query.filter_by(id=challenge.id).first()
         if chall:
+            try:
+                internal_port = int(data.get("internal_port") or chall.internal_port)
+                timeout_minutes = int(data.get("timeout_minutes") or chall.timeout_minutes)
+                max_renewals = int(data.get("max_renewals") or chall.max_renewals)
+            except (ValueError, TypeError) as e:
+                return {"error": f"Invalid numeric field: {e}"}, 400
+
             chall.backend = data.get("backend", chall.backend)
             chall.image = data.get("image", chall.image)
             chall.command = data.get("command", chall.command)
@@ -203,10 +219,10 @@ class InstanceChallengeType(BaseChallenge):
             chall.compose_service = data.get("compose_service", chall.compose_service)
             chall.lxc_image = data.get("lxc_image", chall.lxc_image)
             chall.vagrantfile = data.get("vagrantfile", chall.vagrantfile)
-            chall.internal_port = int(data.get("internal_port") or chall.internal_port)
+            chall.internal_port = internal_port
             chall.connection = data.get("connection", chall.connection)
-            chall.timeout_minutes = int(data.get("timeout_minutes") or chall.timeout_minutes)
-            chall.max_renewals = int(data.get("max_renewals") or chall.max_renewals)
+            chall.timeout_minutes = timeout_minutes
+            chall.max_renewals = max_renewals
             chall.flag_mode = data.get("flag_mode", chall.flag_mode)
             chall.flag_prefix = data.get("flag_prefix", chall.flag_prefix)
             chall.flag_suffix = data.get("flag_suffix", chall.flag_suffix)
@@ -314,7 +330,6 @@ def _register_with_monitor(challenge):
     m = _monitor()
     if not m:
         return
-    import json
 
     config = {
         "backend": getattr(challenge, "backend", "docker"),
@@ -362,8 +377,8 @@ def _stop_all_instances(challenge):
             json={"challenge_name": challenge.name},
             timeout=5,
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error("Failed to stop instance: %s", e)
 
 
 # ── Blueprint — player-facing routes ─────────────────────────────────────────
@@ -379,6 +394,9 @@ def get_instance_info(challenge_id):
     challenge = InstanceChallenge.query.filter_by(id=challenge_id).first()
     if not challenge:
         return {"status": "not_found"}, 200
+
+    if challenge.state != "visible":
+        return {"error": "Challenge not available"}, 403
 
     team_id = _team_id()
     if not team_id:
@@ -401,6 +419,9 @@ def get_instance_info(challenge_id):
             timeout=10,
             allow_redirects=False,
         )
+        if resp.status_code >= 500:
+            logger.error("Monitor returned %s for info: %s", resp.status_code, resp.text[:500])
+            return {"error": "Internal server error"}, 500
         data = _monitor_json(resp)
         status = data.get("status", "")
         if status == "running":
@@ -416,7 +437,8 @@ def get_instance_info(challenge_id):
             }, 200
         return data, resp.status_code
     except Exception as e:
-        return {"error": str(e)}, 500
+        logger.error("Route error: %s", e)
+        return {"error": "Internal server error"}, 500
 
 
 @bp.route("/api/v1/containers/request", methods=["POST"])
@@ -429,6 +451,9 @@ def request_instance():
     challenge = InstanceChallenge.query.filter_by(id=challenge_id).first()
     if not challenge:
         return {"error": "Challenge not found"}, 404
+
+    if challenge.state != "visible":
+        return {"error": "Challenge not available"}, 403
 
     team_id = _team_id()
     if not team_id:
@@ -452,6 +477,9 @@ def request_instance():
             timeout=15,
             allow_redirects=False,
         )
+        if resp.status_code >= 500:
+            logger.error("Monitor returned %s for request: %s", resp.status_code, resp.text[:500])
+            return {"error": "Internal server error"}, 500
         data = _monitor_json(resp)
         if resp.ok and not data.get("error"):
             if data.get("status") == "provisioning":
@@ -465,7 +493,8 @@ def request_instance():
             }, 200
         return data, resp.status_code
     except Exception as e:
-        return {"error": str(e)}, 500
+        logger.error("Route error: %s", e)
+        return {"error": "Internal server error"}, 500
 
 
 @bp.route("/api/v1/containers/renew", methods=["POST"])
@@ -478,6 +507,9 @@ def renew_instance():
     challenge = InstanceChallenge.query.filter_by(id=challenge_id).first()
     if not challenge:
         return {"error": "Challenge not found"}, 404
+
+    if challenge.state != "visible":
+        return {"error": "Challenge not available"}, 403
 
     team_id = _team_id()
     if not team_id:
@@ -495,6 +527,9 @@ def renew_instance():
             timeout=10,
             allow_redirects=False,
         )
+        if resp.status_code >= 500:
+            logger.error("Monitor returned %s for renew: %s", resp.status_code, resp.text[:500])
+            return {"error": "Internal server error"}, 500
         data = _monitor_json(resp)
         if resp.ok and not data.get("error"):
             return {
@@ -503,7 +538,8 @@ def renew_instance():
             }, 200
         return data, resp.status_code
     except Exception as e:
-        return {"error": str(e)}, 500
+        logger.error("Route error: %s", e)
+        return {"error": "Internal server error"}, 500
 
 
 @bp.route("/api/v1/containers/stop", methods=["POST"])
@@ -516,6 +552,9 @@ def stop_instance():
     challenge = InstanceChallenge.query.filter_by(id=challenge_id).first()
     if not challenge:
         return {"error": "Challenge not found"}, 404
+
+    if challenge.state != "visible":
+        return {"error": "Challenge not available"}, 403
 
     team_id = _team_id()
     if not team_id:
@@ -533,10 +572,14 @@ def stop_instance():
             timeout=30,
             allow_redirects=False,
         )
+        if resp.status_code >= 500:
+            logger.error("Monitor returned %s for stop: %s", resp.status_code, resp.text[:500])
+            return {"error": "Internal server error"}, 500
         data = _monitor_json(resp)
         return data, resp.status_code
     except Exception as e:
-        return {"error": str(e)}, 500
+        logger.error("Route error: %s", e)
+        return {"error": "Internal server error"}, 500
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

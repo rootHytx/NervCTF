@@ -73,6 +73,25 @@ pub struct Extra {
     pub initial: Option<u32>,
     pub decay: Option<u32>,
     pub minimum: Option<u32>,
+    pub decay_function: Option<String>,
+}
+
+impl FlagType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlagType::Static => "static",
+            FlagType::Regex => "regex",
+        }
+    }
+}
+
+impl FlagData {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FlagData::CaseSensitive => "case_sensitive",
+            FlagData::CaseInsensitive => "case_insensitive",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -154,7 +173,7 @@ pub enum State {
 #[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct File {
     pub location: String,
-    pub sha1sum: String,
+    pub sha1sum: Option<String>,
     pub id: Option<u32>,
     #[serde(rename = "type")]
     pub file_type: String,

@@ -15,9 +15,9 @@ instance:
     internal_port: 4000
     connection: nc
 
-    # Random per-team flag — the Vagrant backend does not yet inject FLAG
-    # automatically. When implemented, the flag will be passed via vagrant ssh
-    # or a provisioning trigger. See instance/vagrant.rs for extension points.
+    # WARNING: The vagrant backend does not yet inject flags into VMs.
+    # Random flags will be generated and registered in CTFd but will NOT
+    # reach the VM. Use flag_mode: static with a hardcoded flag instead.
     flag_mode: random
     flag_prefix: "CTF{"
     flag_suffix: "}"

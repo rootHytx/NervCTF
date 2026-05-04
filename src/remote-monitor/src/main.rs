@@ -43,10 +43,11 @@ mod db;
 mod instance;
 
 use anyhow::Result;
+use subtle::ConstantTimeEq;
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, post},
@@ -185,7 +186,7 @@ async fn main() -> Result<()> {
             for project in projects {
                 if !tracked.contains(&project) {
                     info!("orphan: stopping untracked compose project {}", project);
-                    let _ = instance::compose::down(&project).await;
+                    let _ = instance::compose::down(&project, expiry_state.runner_ssh_target.as_deref(), None).await;
                 }
             }
         }
@@ -244,7 +245,8 @@ async fn main() -> Result<()> {
         .route("/api/v1/instance/info", get(instance_info_handler))
         .route("/api/v1/instance/renew", post(instance_renew_handler))
         .route("/api/v1/instance/stop", delete(instance_stop_handler))
-        .with_state(Arc::clone(&state));
+        .with_state(Arc::clone(&state))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -259,7 +261,7 @@ fn check_monitor_auth(headers: &HeaderMap, expected_token: &str) -> bool {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Token "))
-        .map(|t| t == expected_token)
+        .map(|t| t.as_bytes().ct_eq(expected_token.as_bytes()).into())
         .unwrap_or(false)
 }
 
@@ -796,15 +798,19 @@ async fn instance_request_handler(
         None => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid CTFd token or not in a team"}))).into_response(),
     };
 
-    // Check for existing running instance
+    // Check for existing running or provisioning instance
     if let Ok(Some(inst)) = db::get_instance(&state.db, &body.challenge_name, team_id) {
         if inst.status == "running" {
             return Json(json!({
+                "status": "running",
                 "host": inst.host,
                 "port": inst.port,
                 "connection_type": inst.connection_type,
                 "expires_at": inst.expires_at,
             })).into_response();
+        }
+        if inst.status == "provisioning" {
+            return (StatusCode::CONFLICT, Json(json!({"error": "Already provisioning", "status": "provisioning"}))).into_response();
         }
     }
 
@@ -833,18 +839,63 @@ async fn instance_request_handler(
         }
     }
 
-    match instance::provision(
-        &state.db, &body.challenge_name, team_id, None, &config, &state.public_host,
-        &state.ctfd_pool, state.runner_ssh_target.as_deref(),
-    ).await {
-        Ok((host, port, conn, expires_at)) => Json(json!({
-            "host": host,
-            "port": port,
-            "connection_type": conn,
-            "expires_at": expires_at,
-        })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    // Derive placeholder values for the provisioning stub
+    let connection_type = config["connection"].as_str().unwrap_or("nc").to_string();
+    let timeout_minutes = config["timeout_minutes"].as_u64().unwrap_or(45);
+    let expires_at = instance::expires_at_string(timeout_minutes);
+
+    // Insert provisioning stub before spawning; UNIQUE constraint means a concurrent
+    // request racing past the check above will hit INSERT OR IGNORE and we return 409.
+    match db::insert_provisioning_stub(
+        &state.db, &body.challenge_name, team_id, None,
+        &state.public_host, &connection_type, &expires_at,
+    ) {
+        Ok(()) => {}
+        Err(e) => {
+            // If a row already exists (race), treat as 409
+            let msg = e.to_string();
+            if msg.contains("UNIQUE") || msg.contains("unique") {
+                return (StatusCode::CONFLICT, Json(json!({"error": "Already provisioning", "status": "provisioning"}))).into_response();
+            }
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": msg}))).into_response();
+        }
     }
+
+    // Provision in background — compose up can take 30-60 s.
+    let state_bg = Arc::clone(&state);
+    let challenge_name_bg = body.challenge_name.clone();
+    tokio::spawn(async move {
+        let _permit = match state_bg.provision_sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => {
+                error!("provision_bg (player): semaphore closed for '{}' team {}", challenge_name_bg, team_id);
+                let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id);
+                return;
+            }
+        };
+        info!("provision_bg (player): starting '{}' team {}", challenge_name_bg, team_id);
+        match instance::provision(
+            &state_bg.db, &challenge_name_bg, team_id, None,
+            &config, &state_bg.public_host, &state_bg.ctfd_pool,
+            state_bg.runner_ssh_target.as_deref(),
+        ).await {
+            Ok((host, port, conn, _exp)) => {
+                info!("provision_bg (player): done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id);
+            }
+            Err(e) => {
+                error!("provision_bg (player): '{}' team {} error: {}", challenge_name_bg, team_id, e);
+                let _ = db::delete_instance(&state_bg.db, &challenge_name_bg, team_id);
+            }
+        }
+    });
+
+    Json(json!({
+        "status": "provisioning",
+        "host": state.public_host,
+        "port": 0,
+        "connection_type": connection_type,
+        "expires_at": expires_at,
+    })).into_response()
 }
 
 // ── Player: get instance info ─────────────────────────────────────────────────
@@ -1261,14 +1312,20 @@ async fn plugin_stop_all_handler(
     }
     match db::delete_all_instances_for_challenge(&state.db, &body.challenge_name) {
         Ok(pairs) => {
-            for (container_id, ctfd_flag_id) in pairs {
-                if let Some(cid) = container_id {
-                    instance::cleanup_container(&cid, state.runner_ssh_target.as_deref()).await;
+            // Tear down containers and delete CTFd flags in background so the
+            // HTTP response is not blocked by potentially slow compose-down calls.
+            let ssh = state.runner_ssh_target.clone();
+            let pool = state.ctfd_pool.clone();
+            tokio::spawn(async move {
+                for (container_id, ctfd_flag_id) in pairs {
+                    if let Some(cid) = container_id {
+                        instance::cleanup_container(&cid, ssh.as_deref()).await;
+                    }
+                    if let Some(flag_id) = ctfd_flag_id {
+                        let _ = ctfd_db::delete_flag(&pool, flag_id).await;
+                    }
                 }
-                if let Some(flag_id) = ctfd_flag_id {
-                    ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
-                }
-            }
+            });
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
@@ -1333,7 +1390,11 @@ async fn admin_dashboard_handler(
 ) -> impl IntoResponse {
     // Accept token via ?token= query param or Authorization: Token <x> header
     let token_from_query = params.get("token").map(|s| s.as_str()).unwrap_or("");
-    let authed = token_from_query == state.monitor_token
+    let query_token_valid: bool = token_from_query.as_bytes().ct_eq(state.monitor_token.as_bytes()).into();
+    if query_token_valid && !token_from_query.is_empty() {
+        eprintln!("warning: passing monitor token via URL query parameter is deprecated; use Authorization header instead");
+    }
+    let authed = query_token_valid && !token_from_query.is_empty()
         || check_monitor_auth(&headers, &state.monitor_token);
 
     if !authed {
@@ -1837,5 +1898,61 @@ async fn ctfd_topic_create(
     match ctfd_db::create_topic(&state.ctfd_pool, &body).await {
         Ok(v) => ctfd_ok(v),
         Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn make_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn check_monitor_auth_valid_token() {
+        let headers = make_headers("Token secret123");
+        assert!(check_monitor_auth(&headers, "secret123"));
+    }
+
+    #[test]
+    fn check_monitor_auth_wrong_token() {
+        let headers = make_headers("Token wrongtoken");
+        assert!(!check_monitor_auth(&headers, "secret123"));
+    }
+
+    #[test]
+    fn check_monitor_auth_missing_header() {
+        let headers = HeaderMap::new();
+        assert!(!check_monitor_auth(&headers, "secret123"));
+    }
+
+    #[test]
+    fn check_monitor_auth_wrong_scheme() {
+        // "Bearer" instead of "Token" should fail
+        let headers = make_headers("Bearer secret123");
+        assert!(!check_monitor_auth(&headers, "secret123"));
+    }
+
+    #[test]
+    fn check_monitor_auth_empty_token() {
+        let headers = make_headers("Token ");
+        // An empty submitted token should not match a non-empty expected token
+        assert!(!check_monitor_auth(&headers, "secret123"));
+    }
+
+    #[test]
+    fn check_monitor_auth_constant_time_empty_expected() {
+        // Even if expected is empty, a non-empty submission should fail
+        let headers = make_headers("Token notempty");
+        assert!(!check_monitor_auth(&headers, ""));
     }
 }

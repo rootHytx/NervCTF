@@ -90,9 +90,22 @@ function formatExpiry(timestampMs) {
 }
 
 var _pollTimer = null;
+var _pollRetries = 0;
+var _POLL_MAX_RETRIES = 60;
+
+var _inFlight = false;
 
 function _pollUntilRunning(challenge_id, alert) {
   if (_pollTimer) clearTimeout(_pollTimer);
+  if (_pollRetries >= _POLL_MAX_RETRIES) {
+    _pollRetries = 0;
+    _setAlertText(alert, "Instance is taking too long to start. Please try again later.");
+    alert.classList.add("alert-danger");
+    showCreateBtn();
+    enableButtons();
+    return;
+  }
+  _pollRetries += 1;
   _pollTimer = setTimeout(function () {
     _pollTimer = null;
     fetch("/api/v1/containers/info/" + challenge_id, {
@@ -104,6 +117,7 @@ function _pollUntilRunning(challenge_id, alert) {
         if (data.status === "provisioning") {
           _pollUntilRunning(challenge_id, alert);
         } else {
+          _pollRetries = 0;
           view_container_info(challenge_id);
         }
       })
@@ -293,6 +307,8 @@ function view_container_info(challenge_id) {
 }
 
 function container_request(challenge_id) {
+  if (_inFlight) return;
+  _inFlight = true;
   var alert = resetAlert();
   // Replace spinner with static text — compose startup can take >10s and a
   // spinning wheel adds visual noise for something that is expected to be slow.
@@ -342,10 +358,12 @@ function container_request(challenge_id) {
       _setAlertText(alert, "Error requesting instance.");
       alert.classList.add("alert-danger");
     })
-    .finally(enableButtons);
+    .finally(function () { _inFlight = false; enableButtons(); });
 }
 
 function container_renew(challenge_id) {
+  if (_inFlight) return;
+  _inFlight = true;
   var alert = resetAlert();
 
   fetch("/api/v1/containers/renew", {
@@ -374,10 +392,12 @@ function container_renew(challenge_id) {
       alert.classList.add("alert-danger");
       console.error("[Instance] Renew error:", err);
     })
-    .finally(enableButtons);
+    .finally(function () { _inFlight = false; enableButtons(); });
 }
 
 function container_stop(challenge_id) {
+  if (_inFlight) return;
+  _inFlight = true;
   var alert = resetAlert();
 
   fetch("/api/v1/containers/stop", {
@@ -408,7 +428,7 @@ function container_stop(challenge_id) {
       _setAlertText(alert, "Error stopping instance.");
       alert.classList.add("alert-danger");
     })
-    .finally(enableButtons);
+    .finally(function () { _inFlight = false; enableButtons(); });
 }
 
 // ── Init: inject UI if template block didn't render ──────────────────────────

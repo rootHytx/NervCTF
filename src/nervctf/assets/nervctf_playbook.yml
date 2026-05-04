@@ -109,7 +109,7 @@
       git:
         repo: https://github.com/CTFd/CTFd.git
         dest: "{{ ctfd_path }}"
-        version: master
+        version: "3.7.3"
         depth: 1
       become_user: "{{ docker_user }}"
       when: not ctfd_cloned.stat.exists
@@ -251,6 +251,7 @@
         mode: "0755"
       when: monitor_binary is defined
 
+    # NOTE: This Dockerfile is duplicated in nervctf_upgrade_playbook.yml / nervctf_playbook.yml — keep them in sync.
     - name: Write remote-monitor Dockerfile
       copy:
         content: |
@@ -358,6 +359,25 @@
         group: docker
         mode: "0644"
 
+    # ── Resolve runner hostname → IP (for monitor container, which lacks Tailscale
+    #    search domains and cannot resolve bare hostnames like "remote-instances") ─
+    - name: Resolve runner hostname to IP on CTFd host
+      when: runner_ip is defined
+      command: "getent hosts {{ runner_ip }}"
+      register: runner_getent
+      changed_when: false
+      failed_when: false
+
+    - name: Set runner_resolved_ip fact
+      when: runner_ip is defined
+      set_fact:
+        runner_resolved_ip: >-
+          {{
+            (runner_getent.stdout.split() | first)
+            if (runner_getent is defined and (runner_getent.rc | int) == 0 and runner_getent.stdout != '')
+            else runner_ip
+          }}
+
     # ── docker-compose override (monitor service + CTFd env) ───────────────────
     - name: Write docker-compose override
       when: monitor_token is defined
@@ -380,7 +400,7 @@
                 - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
           {% if runner_ip is defined %}
                 - CHALLENGES_BASE_DIR=/home/docker/challenges
-                - RUNNER_SSH_TARGET=docker@{{ runner_ip }}
+                - RUNNER_SSH_TARGET=docker@{{ runner_resolved_ip | default(runner_ip) }}
           {% else %}
                 - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
           {% endif %}
@@ -404,7 +424,7 @@
         dest: "{{ ctfd_path }}/docker-compose.override.yml"
         owner: "{{ docker_user }}"
         group: docker
-        mode: "0644"
+        mode: "0640"
 
     - name: Apply docker-compose override (recreate CTFd, start monitor)
       command:
@@ -412,6 +432,20 @@
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: plugin_src is defined or monitor_token is defined
+
+    - name: Wait for monitor health endpoint
+      uri:
+        url: "http://localhost:{{ monitor_port | default('33133') }}/health"
+        status_code: 200
+      register: health_result
+      until: health_result.status == 200
+      retries: 30
+      delay: 2
+      ignore_errors: yes
+
+    - name: Report health check result
+      debug:
+        msg: "{{ 'Monitor is healthy!' if health_result.status == 200 else 'WARNING: Monitor health check failed after 60s. Check docker logs.' }}"
 
 # ── Runner: separate machine for challenge containers (split-machine mode) ────
 - hosts: runner

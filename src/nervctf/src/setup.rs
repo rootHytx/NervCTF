@@ -359,6 +359,8 @@ pub fn run_setup() -> Result<()> {
 // ── Shared ansible runner ─────────────────────────────────────────────────────
 
 /// Write the playbook + inventory to a tempdir and invoke ansible-playbook.
+/// Extra vars are serialised to a JSON file and passed via `-e @<path>` so
+/// that values containing spaces or special characters are handled correctly.
 /// Requires `ansible-playbook` to be present in PATH.
 fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Result<()> {
     let tmp = tempdir()?;
@@ -367,15 +369,25 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
     fs::write(&playbook_path, playbook)?;
     fs::write(&inventory_path, inventory)?;
 
-    let mut args: Vec<String> = vec![
+    // Build a JSON object from "key=value" strings and write it to a temp file.
+    // ansible-playbook accepts `-e @/path/to/file.json` for structured vars.
+    let mut json_map = serde_json::Map::new();
+    for ev in evars {
+        if let Some((key, value)) = ev.split_once('=') {
+            json_map.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        }
+    }
+    let evars_json = serde_json::to_string(&serde_json::Value::Object(json_map))?;
+    let evars_path = tmp.path().join("evars.json");
+    fs::write(&evars_path, &evars_json)?;
+
+    let args: Vec<String> = vec![
         "-i".to_string(),
         inventory_path.to_str().unwrap().to_string(),
         playbook_path.to_str().unwrap().to_string(),
+        "-e".to_string(),
+        format!("@{}", evars_path.to_str().unwrap()),
     ];
-    for ev in evars {
-        args.push("-e".to_string());
-        args.push(ev.clone());
-    }
 
     let status = Command::new("ansible-playbook")
         .args(&args)

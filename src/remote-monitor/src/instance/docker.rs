@@ -5,6 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use rand::Rng;
+use tokio::io::AsyncWriteExt as _;
 
 /// Find a free TCP port in the ephemeral range, avoiding ports already used by running instances.
 ///
@@ -42,7 +43,50 @@ async fn ssh_output(target: &str, cmd: &str) -> std::io::Result<std::process::Ou
         .await
 }
 
-/// Start a Docker container and return its ID.
+/// Write `flag_value` to `flag_host_path` on the runner (split mode) or locally (single mode).
+///
+/// The parent directory is created automatically. This is used when `flag_delivery = "file"`
+/// to write the per-team flag to a bind-mount source path before `docker run`.
+pub async fn write_flag_file(flag_host_path: &str, flag_value: &str, runner_ssh: Option<&str>) -> Result<()> {
+    if let Some(target) = runner_ssh {
+        let parent = std::path::Path::new(flag_host_path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or("/tmp");
+        let mut child = tokio::process::Command::new("ssh")
+            .args([
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "BatchMode=yes",
+                target,
+                &format!("mkdir -p '{}' && cat > '{}'", parent, flag_host_path),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow!("ssh write flag file: {}", e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(flag_value.as_bytes()).await?;
+            stdin.shutdown().await?;
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(anyhow!("ssh write flag file to {} failed", flag_host_path));
+        }
+    } else {
+        if let Some(parent) = std::path::Path::new(flag_host_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow!("create flag dir: {}", e))?;
+        }
+        std::fs::write(flag_host_path, flag_value.as_bytes())
+            .map_err(|e| anyhow!("write flag file {}: {}", flag_host_path, e))?;
+    }
+    Ok(())
+}
+
+/// Start a Docker container and return its **name** (not the Docker hex ID).
+///
+/// `volumes` — list of `(host_path, container_path)` bind mounts; each is added as
+/// `-v host_path:container_path:ro`.  Used for file-based flag delivery.
 pub async fn run_container(
     image_tag: &str,
     container_name: &str,
@@ -50,6 +94,7 @@ pub async fn run_container(
     internal_port: u32,
     command: Option<&str>,
     env_vars: &[(String, String)],
+    volumes: &[(String, String)],
     runner_ssh: Option<&str>,
 ) -> Result<String> {
     let mut docker_args = vec![
@@ -64,6 +109,10 @@ pub async fn run_container(
     for (k, v) in env_vars {
         docker_args.push("-e".to_string());
         docker_args.push(format!("{}={}", k, v));
+    }
+    for (host_path, container_path) in volumes {
+        docker_args.push("-v".to_string());
+        docker_args.push(format!("{}:{}:ro", host_path, container_path));
     }
     docker_args.push(image_tag.to_string());
     if let Some(cmd) = command {
@@ -90,12 +139,27 @@ pub async fn run_container(
         ));
     }
 
-    let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(container_id)
+    // Return the container name rather than the Docker hex ID so that callers
+    // and cleanup routines can derive the flag file path without a separate lookup.
+    Ok(container_name.to_string())
 }
 
-/// Stop and remove a Docker container.
+/// Stop and remove a Docker container, and clean up any flag file written for it.
+///
+/// `container_id` may be a Docker hex ID or a container name (the latter is stored
+/// by `run_container` now).  Both are accepted by `docker stop/rm`.
+///
+/// If a flag file exists at `/tmp/ctf-flags/{container_id}.flag` (written during
+/// file-delivery provisioning) it is removed as a best-effort cleanup.
 pub async fn remove_container(container_id: &str, runner_ssh: Option<&str>) -> Result<()> {
+    // Best-effort flag file cleanup (no-op if file does not exist).
+    let flag_path = format!("/tmp/ctf-flags/{}.flag", container_id);
+    if let Some(target) = runner_ssh {
+        let _ = ssh_output(target, &format!("rm -f '{}'", flag_path)).await;
+    } else {
+        let _ = std::fs::remove_file(&flag_path);
+    }
+
     if let Some(target) = runner_ssh {
         // Stop + remove on runner
         let _ = ssh_output(target, &format!("docker stop --time 3 '{}'", container_id)).await;

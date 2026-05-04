@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "nervctf")]
-#[command(version = "2.2.1")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Minimalistic CTFd Challenge Management CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -57,6 +57,9 @@ enum Commands {
         /// Force re-deploy all challenges even if up to date (re-syncs files to runner, rebuilds images)
         #[arg(long)]
         recreate: bool,
+        /// Delete remote challenges that no longer exist locally
+        #[arg(long)]
+        prune: bool,
     },
 
     /// List all challenges found locally
@@ -205,8 +208,8 @@ async fn main() -> Result<()> {
     let scanner = DirectoryScanner::new();
 
     match cli.command {
-        Commands::Deploy { dry_run, recreate } => {
-            deploy_challenges(&client, &monitor_url, &scanner, &effective_base_dir, dry_run, recreate, runner_target.as_ref()).await?;
+        Commands::Deploy { dry_run, recreate, prune } => {
+            deploy_challenges(&client, &scanner, &effective_base_dir, dry_run, recreate, prune, runner_target.as_ref()).await?;
         }
         Commands::List { detailed } => {
             list_challenges(&scanner, &effective_base_dir, detailed).await?;
@@ -260,17 +263,28 @@ fn validate_command(base_dir: &PathBuf, debug: bool) -> Result<()> {
 
 async fn deploy_challenges(
     client: &CtfdClient,
-    monitor_url: &str,
     scanner: &DirectoryScanner,
     base_dir: &PathBuf,
     dry_run: bool,
     recreate: bool,
+    prune: bool,
     runner: Option<&RunnerTarget>,
 ) -> Result<()> {
     use std::path::Path;
 
-    let local_challenges = scanner.scan_directory(base_dir)?;
-    if local_challenges.is_empty() {
+    let (local_challenges, failures) = scanner.scan_directory_full(base_dir, false)?;
+    if !failures.is_empty() {
+        eprintln!("\n[!] {} challenge file(s) failed to parse:", failures.len());
+        for f in &failures {
+            eprintln!("    - {}: {}", f.path.display(), f.error);
+        }
+        if dry_run {
+            eprintln!("[x] aborting dry run due to parse failures.");
+            return Ok(());
+        }
+        eprintln!("[!] continuing deploy with successfully parsed challenges only.\n");
+    }
+    if local_challenges.is_empty() && failures.is_empty() {
         println!("note: no challenge files found in {}", base_dir.display());
         return Ok(());
     }
@@ -315,6 +329,14 @@ async fn deploy_challenges(
         }
     }
 
+    // Compute orphans: remote challenges not present in local set
+    let local_names: std::collections::HashSet<&str> =
+        local_challenges.iter().map(|c| c.name.as_str()).collect();
+    let orphans: Vec<&Challenge> = remote_challenges
+        .iter()
+        .filter(|c| !local_names.contains(c.name.as_str()))
+        .collect();
+
     println!("\ndiff:");
     println!("{}", "=".repeat(50));
     if !to_create.is_empty() {
@@ -328,6 +350,14 @@ async fn deploy_challenges(
     if !up_to_date_names.is_empty() {
         println!("[=] UP-TO-DATE ({}):", up_to_date_names.len());
         for name in &up_to_date_names { println!("    - {}", name); }
+    }
+    if !orphans.is_empty() {
+        if prune {
+            println!("[-] PRUNE ({}):", orphans.len());
+        } else {
+            println!("[!] ORPHAN ({}) (use --prune to delete):", orphans.len());
+        }
+        for c in &orphans { println!("    - {}", c.name); }
     }
     println!("{}", "=".repeat(50));
 
@@ -458,12 +488,18 @@ async fn deploy_challenges(
         }
     }
 
+    let needs_name_to_id = !req_jobs.is_empty() || !next_jobs.is_empty();
+    let post_phase_remote: Vec<Challenge> = if needs_name_to_id {
+        client.get_challenges().await?.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let name_to_id: HashMap<String, u32> = post_phase_remote.iter()
+        .filter_map(|c| c.id.map(|id| (c.name.clone(), id)))
+        .collect();
+
     if !req_jobs.is_empty() {
         println!("\n-- phase 3: patching requirements");
-        let all_remote = client.get_challenges().await?.unwrap_or_default();
-        let name_to_id: HashMap<String, u32> = all_remote.iter()
-            .filter_map(|c| c.id.map(|id| (c.name.clone(), id)))
-            .collect();
         for job in &req_jobs {
             let mut prereq_ids: Vec<u32> = Vec::new();
             for req in &job.prereq_names {
@@ -488,10 +524,6 @@ async fn deploy_challenges(
 
     if !next_jobs.is_empty() {
         println!("\n-- phase 4: patching next pointers");
-        let all_remote = client.get_challenges().await?.unwrap_or_default();
-        let name_to_id: HashMap<String, u32> = all_remote.iter()
-            .filter_map(|c| c.id.map(|id| (c.name.clone(), id)))
-            .collect();
         for job in &next_jobs {
             if let Some(&next_id) = name_to_id.get(job.next_name.as_str()) {
                 let next_data = serde_json::json!({ "next_id": next_id });
@@ -505,12 +537,31 @@ async fn deploy_challenges(
         }
     }
 
+    if prune && !orphans.is_empty() {
+        println!("\n-- phase 5: pruning orphaned challenges");
+        for orphan in &orphans {
+            if let Some(id) = orphan.id {
+                match client.delete_challenge(id).await {
+                    Ok(_) => println!("  [-] deleted '{}' (ID {})", orphan.name, id),
+                    Err(e) => eprintln!("  [x] failed to delete '{}' (ID {}): {}", orphan.name, id, e),
+                }
+            } else {
+                eprintln!("  [!] orphan '{}' has no ID, skipping", orphan.name);
+            }
+        }
+    }
+
     println!("\ndone.");
     println!("   Created:    {}", created);
     println!("   Updated:    {}", updated);
     println!("   Up-to-date: {}", up_to_date_names.len());
-
-    let _ = monitor_url; // used only for logging if needed
+    if !orphans.is_empty() {
+        if prune {
+            println!("   Pruned:     {}", orphans.len());
+        } else {
+            println!("   Orphaned:   {} (run with --prune to delete)", orphans.len());
+        }
+    }
     Ok(())
 }
 
@@ -545,10 +596,7 @@ fn merge_extra_fields(payload: &mut serde_json::Value, extra: &nervctf::ctfd_api
 
 /// Determine the CTFd challenge type string and description for a challenge.
 /// Instance challenges are deployed as `"instance"` (requires the nervctf_instance CTFd plugin).
-fn resolve_challenge_type_and_description(
-    challenge: &Challenge,
-    _monitor_url: &Option<String>,
-) -> (String, String) {
+fn resolve_challenge_type_and_description(challenge: &Challenge) -> (String, String) {
     let base_desc = challenge.description.as_deref().unwrap_or("").to_string();
     match challenge.challenge_type {
         ChallengeType::Instance => ("instance".to_string(), base_desc),
@@ -612,10 +660,37 @@ async fn deploy_instance(
 
                 if let Some(rt) = runner {
                     // Split-machine mode: rsync to runner, then tell monitor to build on runner
+
+                    // Verify the compose file exists locally before attempting the sync.
+                    let local_compose = context_dir.join(cf);
+                    if !local_compose.exists() {
+                        eprintln!(
+                            "   [!] compose file not found locally for '{}': {} (skipping sync)",
+                            challenge.name,
+                            local_compose.display()
+                        );
+                    } else {
                     let remote_dir = format!("{}/{}", rt.challenges_dir.trim_end_matches('/'), sanitized);
+
+                    // Pre-create the remote directory via SSH so rsync never needs
+                    // --mkpath, which requires rsync ≥ 3.2.3 on the runner.
+                    let mkdir_status = tokio::process::Command::new("ssh")
+                        .args([
+                            "-o", "StrictHostKeyChecking=no",
+                            "-o", "UserKnownHostsFile=/dev/null",
+                            "-o", "BatchMode=yes",
+                            &rt.ssh_target,
+                            &format!("mkdir -p '{}'", remote_dir),
+                        ])
+                        .status()
+                        .await;
+                    if !matches!(mkdir_status, Ok(s) if s.success()) {
+                        eprintln!("   [!] failed to create remote dir on runner: {}", remote_dir);
+                    }
+
                     let status = tokio::process::Command::new("rsync")
                         .args([
-                            "-az", "--delete", "--mkpath",
+                            "-az", "--delete",
                             &format!("{}/", context_dir.display()),
                             &format!("{}:{}/", rt.ssh_target, remote_dir),
                         ])
@@ -645,6 +720,7 @@ async fn deploy_instance(
                         Ok(s) => eprintln!("   [!] rsync to runner failed (exit {})", s.code().unwrap_or(-1)),
                         Err(e) => eprintln!("   [!] rsync spawn failed: {}", e),
                     }
+                    } // end local compose exists
                 } else {
                     // Single-machine mode: tar+upload to monitor
                     match tokio::process::Command::new("tar")
@@ -747,7 +823,7 @@ async fn create_challenge_phase1(
     };
 
     // Resolve the CTFd challenge type and description for instance challenges
-    let (ctfd_type, description) = resolve_challenge_type_and_description(challenge, &None);
+    let (ctfd_type, description) = resolve_challenge_type_and_description(challenge);
 
     let mut payload = json!({
         "name":        challenge.name,
@@ -819,7 +895,7 @@ async fn update_challenge_phase1(
         State::Hidden => "hidden",
     };
 
-    let (_ctfd_type, description) = resolve_challenge_type_and_description(challenge, &None);
+    let (_ctfd_type, description) = resolve_challenge_type_and_description(challenge);
 
     let mut payload = json!({
         "name":        challenge.name,
@@ -850,7 +926,7 @@ async fn update_challenge_phase1(
     // e.g. when Challenge Visibility is set to Private in CTFd Admin → Config)
     replace_flags(client, challenge_id, &challenge.flags).await?;
     replace_tags(client, challenge_id, &challenge.tags).await?;
-    post_topics(client, challenge_id, &challenge.topics).await?;
+    replace_topics(client, challenge_id, &challenge.topics).await?;
     replace_hints(client, challenge_id, &challenge.hints).await?;
     let has_files = sync_files(client, challenge_id, &challenge.files).await;
     let has_reqs = challenge.requirements.is_some();
@@ -980,6 +1056,75 @@ async fn replace_hints(
     Ok(())
 }
 
+async fn replace_topics(
+    client: &CtfdClient,
+    challenge_id: u32,
+    topics: &Option<Vec<String>>,
+) -> Result<()> {
+    use reqwest::Method;
+
+    let existing_val = client
+        .execute::<serde_json::Value, serde_json::Value>(
+            Method::GET,
+            &format!("/topics?challenge_id={}", challenge_id),
+            None,
+        )
+        .await;
+
+    match existing_val {
+        Ok(Some(resp)) => {
+            // parse_response already extracted the "data" field, so resp IS the data array
+            let arr = resp.as_array().cloned().unwrap_or_default();
+
+            let mut remote: Vec<String> = arr.iter()
+                .filter_map(|t| t.get("value").and_then(|v| v.as_str()).map(|s| s.to_string()))
+                .collect();
+            remote.sort();
+            let mut local: Vec<String> = topics.as_ref()
+                .map(|ts| ts.clone())
+                .unwrap_or_default();
+            local.sort();
+
+            if remote == local {
+                return Ok(());
+            }
+
+            // Delete extras (topics present remotely but not locally)
+            let local_set: std::collections::HashSet<&str> =
+                local.iter().map(|s| s.as_str()).collect();
+            for entry in &arr {
+                let val = entry.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                if !local_set.contains(val) {
+                    if let Some(id) = entry.get("id").and_then(|v| v.as_u64()) {
+                        let _ = client.request_without_body(
+                            Method::DELETE,
+                            &format!("/topics/{}", id),
+                            None::<&serde_json::Value>,
+                        ).await;
+                    }
+                }
+            }
+
+            // Add missing (topics present locally but not remotely)
+            let remote_set: std::collections::HashSet<&str> =
+                remote.iter().map(|s| s.as_str()).collect();
+            let to_add: Option<Vec<String>> = {
+                let missing: Vec<String> = topics.as_ref()
+                    .map(|ts| ts.iter().filter(|t| !remote_set.contains(t.as_str())).cloned().collect())
+                    .unwrap_or_default();
+                if missing.is_empty() { None } else { Some(missing) }
+            };
+            post_topics(client, challenge_id, &to_add).await?;
+        }
+        Ok(None) => post_topics(client, challenge_id, topics).await?,
+        Err(e) if is_html_or_redirect(&e) => {
+            eprintln!("  [!] challenge {}: topics endpoint unavailable -- topics not updated.", challenge_id);
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// Compare remote filenames with local file list. If identical, return false (no re-upload needed).
 /// If different, delete remote files and return true so phase 2 re-uploads the local set.
 /// On endpoint error (CTFd Private mode), prints a warning and returns false to avoid duplicates.
@@ -1028,7 +1173,7 @@ async fn sync_files(
             eprintln!("  [!] challenge {}: files endpoint unavailable -- files not synced.", challenge_id);
             false // don't re-upload blindly if we can't delete first
         }
-        Err(_) => false,
+        Err(e) => { eprintln!("   [!] failed to check files: {}", e); true }
     }
 }
 

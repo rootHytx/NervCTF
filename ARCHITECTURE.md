@@ -533,7 +533,7 @@ All docker/compose/lxc functions accept `runner_ssh: Option<&str>`. When set, co
 executed on the runner via `ssh -o BatchMode=yes <target> <cmd>`.
 
 ### `docker.rs`
-- `pick_free_port(used_ports) → u16` — random in 40000–50000
+- `pick_free_port(used_ports) → u16` — random in 40000–60000
 - `run_container(..., runner_ssh) → String` — `docker run -d -p host:internal ...`
 - `remove_container(id, runner_ssh)` — `docker rm -f`
 - `build_image(context_tar_path, image_tag, runner_ssh)` — `docker build -t <tag>`

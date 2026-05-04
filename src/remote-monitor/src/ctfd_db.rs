@@ -37,19 +37,14 @@ pub async fn create_flag(pool: &Pool, challenge_id: i64, content: &str) -> Optio
     }
 }
 
-/// DELETE a flag by id. Errors are logged and swallowed.
-pub async fn delete_flag(pool: &Pool, flag_id: i64) {
-    let mut conn = match pool.get_conn().await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("ctfd_db: delete_flag: connection error: {}", e);
-            return;
-        }
-    };
-    match conn.exec_drop("DELETE FROM flags WHERE id = ?", (flag_id,)).await {
-        Ok(()) => info!("ctfd_db: deleted flag {}", flag_id),
-        Err(e) => warn!("ctfd_db: delete_flag {} failed: {}", flag_id, e),
-    }
+/// DELETE a flag by id. Returns an error if the operation fails.
+pub async fn delete_flag(pool: &Pool, flag_id: i64) -> Result<()> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: delete_flag: connection error: {}", e))?;
+    conn.exec_drop("DELETE FROM flags WHERE id = ?", (flag_id,)).await
+        .map_err(|e| anyhow!("ctfd_db: delete_flag {}: {}", flag_id, e))?;
+    info!("ctfd_db: deleted flag {}", flag_id);
+    Ok(())
 }
 
 /// Validate a CTFd API token and return team_id, or None if invalid/banned/hidden/teamless.
@@ -398,7 +393,7 @@ pub async fn update_challenge(pool: &Pool, id: i64, body: &Value) -> Result<Valu
     }
 
     let type_ = body["type"].as_str().unwrap_or("");
-    if type_ == "dynamic" || body["initial"].is_i64() || body["decay"].is_i64() {
+    if type_ == "dynamic" {
         let di = body["initial"].as_i64().unwrap_or(0);
         let dm = body["minimum"].as_i64().unwrap_or(1);
         let dd = body["decay"].as_i64().unwrap_or(50);
@@ -521,11 +516,10 @@ pub async fn create_flag_full(pool: &Pool, body: &Value) -> Result<Value> {
     Ok(json!({"id": id, "challenge_id": challenge_id, "type": type_, "content": content, "data": data}))
 }
 
+/// Alias kept for call sites that use the `_by_id` name; delegates to `delete_flag`.
+#[inline]
 pub async fn delete_flag_by_id(pool: &Pool, id: i64) -> Result<()> {
-    let mut conn = pool.get_conn().await
-        .map_err(|e| anyhow!("ctfd_db: delete_flag_by_id: {}", e))?;
-    conn.exec_drop("DELETE FROM flags WHERE id = ?", (id,)).await
-        .map_err(|e| anyhow!("ctfd_db: delete_flag_by_id {}: {}", id, e))
+    delete_flag(pool, id).await
 }
 
 // ── Hints ─────────────────────────────────────────────────────────────────────

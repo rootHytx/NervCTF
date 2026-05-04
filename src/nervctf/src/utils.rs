@@ -67,8 +67,14 @@ pub fn load_config(start_dir: &Path) -> (Config, Option<PathBuf>) {
             match serde_yaml::from_str::<Config>(&content) {
                 Ok(cfg) => return (cfg, Some(path)),
                 Err(e) => {
-                    eprintln!("[!] {}: failed to parse: {}", path.display(), e);
-                    return (Config::default(), None);
+                    eprintln!();
+                    eprintln!("######################################################");
+                    eprintln!("[ERROR] Failed to parse config file: {}", path.display());
+                    eprintln!("[ERROR] Parse error: {}", e);
+                    eprintln!("######################################################");
+                    eprintln!();
+                    eprintln!("Fix or delete the file above, then re-run nervctf.");
+                    std::process::exit(1);
                 }
             }
         }

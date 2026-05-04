@@ -23,6 +23,28 @@ instance:
   connection: nc        # nc | http | ssh
 ```
 
+### Top-level fields
+
+```yaml
+name: "Challenge Name"
+author: "author"
+category: pwn
+description: |
+  Describe the challenge.
+value: 0
+type: instance
+state: visible
+version: "0.3"
+topics: [topic1, topic2]    # optional; freeform topic labels (not CTFd tags)
+
+# Dynamic scoring (optional — see Scoring section)
+extra:
+  initial: 500
+  decay: 50
+  minimum: 100
+  decay_function: linear    # linear (default) | logarithmic
+```
+
 ### Full reference
 
 ```yaml
@@ -59,12 +81,18 @@ instance:
   # How the per-instance flag reaches the container:
   flag_delivery: env          # env (default) | file
 
-  # "env": FLAG is set as an environment variable.
-  # Challenge's docker-compose.yml can use ${FLAG} in any service environment block.
+  # "env": FLAG is injected as an environment variable named FLAG.
+  #   docker backend  — passed via `docker run -e FLAG=<value>`
+  #   compose backend — set in the shell before `docker compose up`; use ${FLAG} in docker-compose.yml
 
-  # "file": flag is written to a bind-mounted file inside the container.
-  flag_file_path: /challenge/flag    # required for flag_delivery: file
-  flag_service: app                  # compose service receiving the file (defaults to compose_service)
+  # "file": flag is written to a bind-mounted read-only file inside the container.
+  #   docker backend  — written to /tmp/ctf-flags/<container_name>.flag on the runner/host,
+  #                     then mounted at flag_file_path inside the container.
+  #   compose backend — written to <project_name>.flag in the challenge dir on the runner/host,
+  #                     then mounted at flag_file_path inside the target service.
+  flag_file_path: /challenge/flag    # required for flag_delivery: file (both backends)
+  flag_service: app                  # compose only: service that receives the file mount
+                                     # (defaults to compose_service; ignored for docker backend)
 ```
 
 ### Static flags
@@ -147,19 +175,45 @@ Bind mount paths in `docker-compose.yml` must use the path as seen on the **runn
 
 ## Docker Backend
 
-The `docker` backend runs a single container per team:
+The `docker` backend runs a single container per team.
+
+**`flag_delivery: env`** (default):
 
 ```
 docker run -d \
-  --name ctf-<challenge>-t<team_id> \
+  --name ctf-<challenge>-<random6> \
   -p <host_port>:<internal_port> \
-  [-e FLAG=<random_flag>] \
-  [--entrypoint <command>] \
-  <image_tag>
+  -e FLAG=<random_flag> \
+  <image_tag> [command]
 ```
 
-- Port is picked randomly in range 40000–50000 (avoiding ports already in use)
-- Container name: `ctf-<sanitized_challenge_name>-t<team_id>`
+Read the flag inside the container via the `FLAG` environment variable.
+
+**`flag_delivery: file`**:
+
+```
+docker run -d \
+  --name ctf-<challenge>-<random6> \
+  -p <host_port>:<internal_port> \
+  -v /tmp/ctf-flags/<name>.flag:<flag_file_path>:ro \
+  <image_tag> [command]
+```
+
+The flag is written to `/tmp/ctf-flags/<container_name>.flag` on the runner/host before
+the container starts, then bind-mounted read-only at `flag_file_path` inside the container.
+The file is deleted when the instance is stopped or expires.
+
+```yaml
+instance:
+  backend: docker
+  flag_delivery: file
+  flag_file_path: /challenge/flag
+```
+
+**Common:**
+
+- Port is picked randomly in range 40000–60000 (avoiding ports already in use)
+- Container name: `ctf-<sanitized_challenge_name>-<6 random chars>` (unique per provision)
 - Image is built once during `nervctf deploy` and reused for all teams
 
 ### `image` field
@@ -179,7 +233,7 @@ The `compose` backend manages a `docker compose` project per team:
 - Challenge files are stored on the monitor at `/data/challenges/<sanitized_name>/`
 - A per-team override file (`<project_name>.override.yml`) is written next to the compose file
 - The override maps `host_port:internal_port` and optionally injects the flag
-- Project name: `ctf-<sanitized_challenge_name>-t<team_id>`
+- Project name: `ctf-<sanitized_challenge_name>-<6 random chars>`
 
 ### Flag delivery for compose
 

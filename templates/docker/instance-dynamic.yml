@@ -15,12 +15,25 @@ instance:
     internal_port: 4000
     connection: nc  # nc | http | ssh
 
+    # NOTE: flag_mode: random and dynamic scoring are independent concepts.
+    # flag_mode controls how per-team flags are generated (one per container).
+    # Dynamic scoring controls how the point value decreases as teams solve it.
+    # Both can be used together.
     flag_mode: random
     flag_prefix: "CTF{"
     flag_suffix: "}"
     random_flag_length: 16
 
+    # ── Flag delivery ────────────────────────────────────────────────────────────
+    # Option A — env (default): write to disk and clear from environment.
+    # IMPORTANT: use `unset FLAG`, NOT `unset $FLAG`.
+    flag_delivery: env
     command: "/bin/sh -c 'echo $FLAG > /challenge/flag && unset FLAG && exec /challenge/binary'"
+
+    # Option B — file: bind-mounted read-only, no environment exposure.
+    # flag_delivery: file
+    # flag_file_path: /challenge/flag
+    # command: null
 
     timeout_minutes: 45
     # max_renewals: 3

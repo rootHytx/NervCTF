@@ -23,10 +23,11 @@ src/validator.rs
 
 ## Public API
 
-### `validate_challenges(base_dir: &Path, fix_mode: bool) -> Result<()>`
+### `validate_challenges(challenges: &[Challenge]) -> ValidationReport`
 
-Scans `base_dir` via `DirectoryScanner`, validates all found challenges, prints the report,
-and returns `Err` if any errors are present.
+Validates the provided slice of `Challenge` structs, runs all per-challenge and
+cross-challenge checks, and returns a `ValidationReport`. Callers (e.g. `deploy`,
+`validate_command`) are responsible for printing the report and deciding whether to abort.
 
 ```sh
 nervctf validate --base-dir ./challenges

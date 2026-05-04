@@ -15,17 +15,25 @@ instance:
     internal_port: 4000
     connection: nc  # nc | http | ssh
 
-    # Random per-team flag: the monitor generates a unique flag and passes it
-    # to the container as the FLAG environment variable.
+    # Random per-team flag: the monitor generates a unique flag per team.
     flag_mode: random
     flag_prefix: "CTF{"
     flag_suffix: "}"
     random_flag_length: 16  # length of the random alphanumeric part
 
-    # Write FLAG to disk then clear it from the environment.
-    # IMPORTANT: use `unset FLAG`, NOT `unset $FLAG`.
-    # `unset $FLAG` expands the flag value as a variable name — almost certainly a no-op.
+    # ── Flag delivery ────────────────────────────────────────────────────────────
+    # Option A — env (default): FLAG is injected as an environment variable.
+    # Write it to disk and clear it from the environment so it isn't readable via
+    # /proc/<pid>/environ. IMPORTANT: use `unset FLAG`, NOT `unset $FLAG`.
+    # (`unset $FLAG` expands the flag as a variable name — almost certainly a no-op.)
+    flag_delivery: env
     command: "/bin/sh -c 'echo $FLAG > /challenge/flag && unset FLAG && exec /challenge/binary'"
+
+    # Option B — file: the monitor writes the flag to a bind-mounted read-only file.
+    # No command trick needed — the flag never touches the environment.
+    # flag_delivery: file
+    # flag_file_path: /challenge/flag   # path inside the container
+    # command: null                     # or remove the command field entirely
 
     timeout_minutes: 45
     # max_renewals: 3

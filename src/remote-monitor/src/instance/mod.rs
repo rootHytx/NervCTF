@@ -3,6 +3,7 @@
 pub mod compose;
 pub mod docker;
 pub mod lxc;
+pub mod ssh;
 pub mod vagrant;
 
 use anyhow::{anyhow, Result};
@@ -60,7 +61,7 @@ pub fn container_name(challenge_name: &str) -> String {
 pub async fn cleanup_container(container_id: &str, runner_ssh: Option<&str>) {
     // Compose project names and LXC/Docker container names all start with "ctf-"
     if container_id.starts_with("ctf-") && container_id.len() < 80 {
-        let _ = compose::down(container_id).await;
+        let _ = compose::down(container_id, runner_ssh, None).await;
         let _ = lxc::delete(container_id).await;
     }
     // Always also try docker remove (no-op if not a container ID)
@@ -106,9 +107,26 @@ pub async fn provision(
             let cname = container_name(challenge_name);
 
             let flag = generate_flag(config);
-            let env_vars: Vec<(String, String)> = flag.as_deref()
-                .map(|f| vec![("FLAG".to_string(), f.to_string())])
-                .unwrap_or_default();
+            let flag_delivery = config["flag_delivery"].as_str().unwrap_or("env");
+            let flag_file_path = config["flag_file_path"].as_str();
+
+            let mut env_vars: Vec<(String, String)> = Vec::new();
+            let mut volumes: Vec<(String, String)> = Vec::new();
+
+            if let Some(f) = flag.as_deref() {
+                if flag_delivery == "file" {
+                    if let Some(container_path) = flag_file_path {
+                        // Write the flag to a deterministic host path so remove_container
+                        // can clean it up without a separate DB lookup.
+                        let flag_host_path = format!("/tmp/ctf-flags/{}.flag", cname);
+                        docker::write_flag_file(&flag_host_path, f, runner_ssh).await
+                            .map_err(|e| anyhow!("write flag file for {}: {}", cname, e))?;
+                        volumes.push((flag_host_path, container_path.to_string()));
+                    }
+                } else {
+                    env_vars.push(("FLAG".to_string(), f.to_string()));
+                }
+            }
 
             let container_id = docker::run_container(
                 &image_tag,
@@ -117,6 +135,7 @@ pub async fn provision(
                 internal_port,
                 command,
                 &env_vars,
+                &volumes,
                 runner_ssh,
             ).await?;
 
@@ -167,6 +186,7 @@ pub async fn provision(
                 flag_delivery,
                 flag_file_path,
                 flag_service,
+                runner_ssh,
             ).await?;
 
             let ctfd_flag_id = match (&flag, ctfd_id) {

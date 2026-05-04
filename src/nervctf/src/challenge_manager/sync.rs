@@ -1,4 +1,4 @@
-use crate::ctfd_api::models::{Challenge, FlagContent};
+use crate::ctfd_api::models::{Challenge, FlagContent, HintContent};
 
 /// Returns true if the remote challenge needs to be updated to match local.
 pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
@@ -27,25 +27,21 @@ pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
         return true;
     }
 
-    // Flags, tags, hints: the CTFd list endpoint never returns these fields,
-    // so remote.* is always None when called from deploy. Only compare when
-    // both sides have data (e.g. after fetching per-challenge detail).
+    // Fix 1: Compare flags by (content, type_str, data_str) tuples
     if let (Some(rf_list), Some(lf_list)) = (&remote.flags, &local.flags) {
-        let mut rf: Vec<String> = rf_list
-            .iter()
-            .map(|f| match f {
-                FlagContent::Simple(s) => s.clone(),
-                FlagContent::Detailed { content, .. } => content.clone(),
-            })
-            .collect();
+        let flag_key = |f: &FlagContent| -> (String, &'static str, &'static str) {
+            match f {
+                FlagContent::Simple(s) => (s.clone(), "static", ""),
+                FlagContent::Detailed { content, type_, data, .. } => (
+                    content.clone(),
+                    type_.as_str(),
+                    data.as_ref().map(|d| d.as_str()).unwrap_or(""),
+                ),
+            }
+        };
+        let mut rf: Vec<_> = rf_list.iter().map(flag_key).collect();
         rf.sort();
-        let mut lf: Vec<String> = lf_list
-            .iter()
-            .map(|f| match f {
-                FlagContent::Simple(s) => s.clone(),
-                FlagContent::Detailed { content, .. } => content.clone(),
-            })
-            .collect();
+        let mut lf: Vec<_> = lf_list.iter().map(flag_key).collect();
         lf.sort();
         if rf != lf {
             return true;
@@ -68,24 +64,44 @@ pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
         }
     }
 
+    // Fix 2: Compare hints by (content, cost) tuples
     if let (Some(rh_list), Some(lh_list)) = (&remote.hints, &local.hints) {
-        let mut rh: Vec<String> = rh_list
-            .iter()
-            .map(|h| h.content_str().to_string())
-            .collect();
+        let hint_key = |h: &HintContent| -> (String, u32) {
+            match h {
+                HintContent::Simple(s) => (s.clone(), 0),
+                HintContent::Detailed { content, cost, .. } => {
+                    (content.clone(), cost.unwrap_or(0))
+                }
+            }
+        };
+        let mut rh: Vec<_> = rh_list.iter().map(hint_key).collect();
         rh.sort();
-        let mut lh: Vec<String> = lh_list
-            .iter()
-            .map(|h| h.content_str().to_string())
-            .collect();
+        let mut lh: Vec<_> = lh_list.iter().map(hint_key).collect();
         lh.sort();
         if rh != lh {
             return true;
         }
     }
 
-    // Requirements: detect presence change (cannot compare IDs vs names directly)
-    if remote.requirements.is_some() != local.requirements.is_some() {
+    // Fix 3: Compare requirements by sorted prerequisite name vectors
+    match (&remote.requirements, &local.requirements) {
+        (None, None) => {}
+        (Some(_), None) | (None, Some(_)) => return true,
+        (Some(r), Some(l)) => {
+            let mut rn = r.prerequisite_names();
+            rn.sort();
+            let mut ln = l.prerequisite_names();
+            ln.sort();
+            if rn != ln {
+                return true;
+            }
+        }
+    }
+
+    // Fix 4: Compare instance configs by JSON value
+    let remote_instance = serde_json::to_value(&remote.instance).unwrap_or_default();
+    let local_instance = serde_json::to_value(&local.instance).unwrap_or_default();
+    if remote_instance != local_instance {
         return true;
     }
 
@@ -98,7 +114,8 @@ pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
 mod tests {
     use super::*;
     use crate::ctfd_api::models::{
-        ChallengeType, Extra, FlagContent, HintContent, State, Tag,
+        ChallengeType, Extra, FlagContent, FlagData, FlagType, HintContent, InstanceBackend,
+        InstanceConfig, Requirements, State, Tag,
     };
 
     fn base() -> Challenge {
@@ -134,6 +151,29 @@ mod tests {
             version: "0.1".to_string(),
             source_path: String::new(),
             unknown_yaml_keys: Vec::new(),
+        }
+    }
+
+    fn base_instance_config() -> InstanceConfig {
+        InstanceConfig {
+            backend: InstanceBackend::Docker,
+            image: Some("nginx:latest".to_string()),
+            compose_file: None,
+            compose_service: None,
+            lxc_image: None,
+            vagrantfile: None,
+            internal_port: 80,
+            connection: "http://{host}:{port}".to_string(),
+            timeout_minutes: Some(30),
+            max_renewals: None,
+            command: None,
+            flag_mode: None,
+            flag_prefix: None,
+            flag_suffix: None,
+            random_flag_length: None,
+            flag_delivery: None,
+            flag_file_path: None,
+            flag_service: None,
         }
     }
 
@@ -272,9 +312,9 @@ mod tests {
         assert!(!needs_update(&remote, &local));
     }
 
+    // Fix 1: detailed flag with same content but different type triggers update
     #[test]
-    fn detailed_flag_same_content_as_simple_no_update() {
-        use crate::ctfd_api::models::FlagType;
+    fn flag_type_change_triggers_update() {
         let mut remote = base();
         remote.flags = Some(vec![FlagContent::Detailed {
             id: None,
@@ -283,7 +323,52 @@ mod tests {
             content: "flag{x}".to_string(),
             data: None,
         }]);
-        // local has the same content as a Simple flag — needs_update only compares content
+        let mut local = base();
+        local.flags = Some(vec![FlagContent::Detailed {
+            id: None,
+            challenge_id: None,
+            type_: FlagType::Regex,
+            content: "flag{x}".to_string(),
+            data: None,
+        }]);
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix 1: detailed flag with same content but different data triggers update
+    #[test]
+    fn flag_data_change_triggers_update() {
+        let mut remote = base();
+        remote.flags = Some(vec![FlagContent::Detailed {
+            id: None,
+            challenge_id: None,
+            type_: FlagType::Static,
+            content: "flag{x}".to_string(),
+            data: Some(FlagData::CaseSensitive),
+        }]);
+        let mut local = base();
+        local.flags = Some(vec![FlagContent::Detailed {
+            id: None,
+            challenge_id: None,
+            type_: FlagType::Static,
+            content: "flag{x}".to_string(),
+            data: Some(FlagData::CaseInsensitive),
+        }]);
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix 1: simple flag and detailed flag with same content are equivalent (no type/data diff)
+    #[test]
+    fn detailed_flag_same_content_as_simple_no_update() {
+        let mut remote = base();
+        remote.flags = Some(vec![FlagContent::Detailed {
+            id: None,
+            challenge_id: None,
+            type_: FlagType::Static,
+            content: "flag{x}".to_string(),
+            data: None,
+        }]);
+        // local has same content as Simple; Simple maps to ("flag{x}", "static", "")
+        // Detailed with Static + no data maps to ("flag{x}", "static", "") — no diff
         assert!(!needs_update(&remote, &base()));
     }
 
@@ -335,8 +420,9 @@ mod tests {
         assert!(!needs_update(&remote, &local));
     }
 
+    // Fix 2: hint cost change now IS detected
     #[test]
-    fn detailed_hint_content_compared_correctly() {
+    fn hint_cost_change_triggers_update() {
         let mut remote = base();
         remote.hints = Some(vec![HintContent::Detailed {
             content: "look closer".to_string(),
@@ -346,9 +432,95 @@ mod tests {
         let mut local = base();
         local.hints = Some(vec![HintContent::Detailed {
             content: "look closer".to_string(),
-            cost: Some(100), // cost differs — but needs_update only compares content
+            cost: Some(100),
+            title: None,
+        }]);
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix 2: same hint content and cost — no update
+    #[test]
+    fn detailed_hint_same_content_and_cost_no_update() {
+        let mut remote = base();
+        remote.hints = Some(vec![HintContent::Detailed {
+            content: "look closer".to_string(),
+            cost: Some(50),
+            title: None,
+        }]);
+        let mut local = base();
+        local.hints = Some(vec![HintContent::Detailed {
+            content: "look closer".to_string(),
+            cost: Some(50),
             title: None,
         }]);
         assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix 3: requirements content change triggers update
+    #[test]
+    fn requirements_content_change_triggers_update() {
+        let mut remote = base();
+        remote.requirements = Some(Requirements::Simple(vec![
+            serde_json::Value::String("Warmup".to_string()),
+        ]));
+        let mut local = base();
+        local.requirements = Some(Requirements::Simple(vec![
+            serde_json::Value::String("Warmup".to_string()),
+            serde_json::Value::String("Easy".to_string()),
+        ]));
+        assert!(needs_update(&remote, &local));
+    }
+
+    #[test]
+    fn requirements_same_content_no_update() {
+        let reqs = Some(Requirements::Simple(vec![
+            serde_json::Value::String("Warmup".to_string()),
+        ]));
+        let mut remote = base();
+        remote.requirements = reqs.clone();
+        let mut local = base();
+        local.requirements = reqs;
+        assert!(!needs_update(&remote, &local));
+    }
+
+    #[test]
+    fn requirements_none_vs_some_triggers_update() {
+        let mut remote = base();
+        remote.requirements = None;
+        let mut local = base();
+        local.requirements = Some(Requirements::Simple(vec![
+            serde_json::Value::String("Warmup".to_string()),
+        ]));
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix 4: instance config change triggers update
+    #[test]
+    fn instance_config_change_triggers_update() {
+        let mut remote = base();
+        remote.instance = Some(base_instance_config());
+        let mut local = base();
+        let mut cfg = base_instance_config();
+        cfg.internal_port = 8080;
+        local.instance = Some(cfg);
+        assert!(needs_update(&remote, &local));
+    }
+
+    #[test]
+    fn instance_config_same_no_update() {
+        let mut remote = base();
+        remote.instance = Some(base_instance_config());
+        let mut local = base();
+        local.instance = Some(base_instance_config());
+        assert!(!needs_update(&remote, &local));
+    }
+
+    #[test]
+    fn instance_config_none_vs_some_triggers_update() {
+        let mut remote = base();
+        remote.instance = None;
+        let mut local = base();
+        local.instance = Some(base_instance_config());
+        assert!(needs_update(&remote, &local));
     }
 }

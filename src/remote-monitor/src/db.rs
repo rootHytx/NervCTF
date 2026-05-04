@@ -10,6 +10,7 @@ pub type Db = Arc<Mutex<Connection>>;
 pub fn open(path: &str) -> Result<Db> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
     init_schema(&conn)?;
     Ok(Arc::new(Mutex::new(conn)))
 }
@@ -87,6 +88,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
             name    TEXT NOT NULL,
             team_id INTEGER
         );
+
+        CREATE INDEX IF NOT EXISTS idx_instances_status_expires ON instances(status, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_instances_team ON instances(team_id, status);
+        CREATE INDEX IF NOT EXISTS idx_team_flags_lookup ON team_flags(challenge_name, flag);
+        CREATE INDEX IF NOT EXISTS idx_flag_attempts_challenge ON flag_attempts(challenge_name, team_id);
         "#,
     )?;
     // Migrations for existing databases.
@@ -216,6 +222,7 @@ pub struct InstanceRow {
     pub id: i64,
     pub challenge_name: String,
     pub team_id: i64,
+    pub user_id: Option<i64>,
     pub container_id: Option<String>,
     pub host: String,
     pub port: i64,
@@ -229,7 +236,7 @@ pub struct InstanceRow {
 pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<InstanceRow>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT id, challenge_name, team_id, container_id, host, port, connection_type, status, renewals_used, expires_at, flag
+        "SELECT id, challenge_name, team_id, user_id, container_id, host, port, connection_type, status, renewals_used, expires_at, flag
          FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
     )?;
     let mut rows = stmt.query(params![challenge_name, team_id])?;
@@ -238,14 +245,15 @@ pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Optio
             id: row.get(0)?,
             challenge_name: row.get(1)?,
             team_id: row.get(2)?,
-            container_id: row.get(3)?,
-            host: row.get(4)?,
-            port: row.get(5)?,
-            connection_type: row.get(6)?,
-            status: row.get(7)?,
-            renewals_used: row.get(8)?,
-            expires_at: row.get(9)?,
-            flag: row.get(10)?,
+            user_id: row.get(3)?,
+            container_id: row.get(4)?,
+            host: row.get(5)?,
+            port: row.get(6)?,
+            connection_type: row.get(7)?,
+            status: row.get(8)?,
+            renewals_used: row.get(9)?,
+            expires_at: row.get(10)?,
+            flag: row.get(11)?,
         }))
     } else {
         Ok(None)
@@ -387,7 +395,7 @@ pub fn mark_instance_solved(db: &Db, challenge_name: &str, team_id: i64) -> Resu
 pub fn get_used_ports(db: &Db) -> Result<std::collections::HashSet<u16>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT port FROM instances WHERE status = 'running'",
+        "SELECT port FROM instances WHERE status = 'running' OR (status = 'provisioning' AND port > 0)",
     )?;
     let ports = stmt
         .query_map([], |row| row.get::<_, i64>(0))?
@@ -401,7 +409,9 @@ pub fn get_used_ports(db: &Db) -> Result<std::collections::HashSet<u16>> {
 pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64, Option<i64>)>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT challenge_name, container_id, team_id, ctfd_flag_id FROM instances WHERE expires_at < datetime('now') AND status = 'running'",
+        "SELECT challenge_name, container_id, team_id, ctfd_flag_id FROM instances \
+         WHERE (expires_at < datetime('now') AND status = 'running') \
+            OR (status = 'provisioning' AND expires_at < datetime('now', '+30 minutes'))",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -710,24 +720,28 @@ pub fn find_flag_owner(db: &Db, challenge_name: &str, submitted_flag: &str, subm
 
 /// Delete all instances for a challenge and return `(container_id, ctfd_flag_id)` pairs for cleanup.
 pub fn delete_all_instances_for_challenge(db: &Db, challenge_name: &str) -> Result<Vec<(Option<String>, Option<i64>)>> {
-    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
-    let mut stmt = conn.prepare(
-        "SELECT container_id, ctfd_flag_id FROM instances WHERE challenge_name = ?1",
-    )?;
-    let pairs: Vec<(Option<String>, Option<i64>)> = stmt
-        .query_map(params![challenge_name], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    conn.execute(
+    let mut conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let pairs: Vec<(Option<String>, Option<i64>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT container_id, ctfd_flag_id FROM instances WHERE challenge_name = ?1",
+        )?;
+        let rows: Vec<_> = stmt.query_map(params![challenge_name], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        rows
+    };
+    let tx = conn.transaction()?;
+    tx.execute(
         "DELETE FROM instances WHERE challenge_name = ?1",
         params![challenge_name],
     )?;
     // Purge incorrect, non-sharing attempts for all teams on this challenge.
-    conn.execute(
+    tx.execute(
         "DELETE FROM flag_attempts WHERE challenge_name = ?1 AND is_correct = 0 AND is_flag_sharing = 0",
         params![challenge_name],
     )?;
+    tx.commit()?;
     Ok(pairs)
 }

@@ -15,7 +15,8 @@
 //!   DELETE     /api/v1/tags/{id}         — delete tag (monitor token)
 //!   GET/POST   /api/v1/files             — list / upload files (monitor token)
 //!   DELETE     /api/v1/files/{id}        — delete file (monitor token)
-//!   POST       /api/v1/topics            — create topic (monitor token)
+//!   GET/POST   /api/v1/topics             — list (?challenge_id=N) / create topics (monitor token)
+//!   DELETE     /api/v1/topics/:id         — delete topic link (monitor token)
 //!   POST /api/v1/instance/build          — build Docker image (monitor token)
 //!   POST /api/v1/instance/build-compose  — upload+extract compose dir + pre-build images (monitor token)
 //!   POST /api/v1/instance/register       — register instance config (monitor token)
@@ -204,25 +205,26 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/admin", get(admin_dashboard_handler))
-        .route("/instance/{name}", get(instance_page_handler))
+        .route("/instance/:name", get(instance_page_handler))
         .route("/api/v1/diff", get(diff_handler).post(diff_handler).patch(diff_handler).delete(diff_handler))
         // CTFd challenge CRUD (monitor token — used by nervctf CLI)
         .route("/api/v1/challenges", get(ctfd_challenges_list).post(ctfd_challenge_create))
-        .route("/api/v1/challenges/{id}", get(ctfd_challenge_get).patch(ctfd_challenge_update).delete(ctfd_challenge_delete))
+        .route("/api/v1/challenges/:id", get(ctfd_challenge_get).patch(ctfd_challenge_update).delete(ctfd_challenge_delete))
         // Flags
         .route("/api/v1/flags", get(ctfd_flags_list).post(ctfd_flag_create))
-        .route("/api/v1/flags/{id}", delete(ctfd_flag_delete))
+        .route("/api/v1/flags/:id", delete(ctfd_flag_delete))
         // Hints
         .route("/api/v1/hints", get(ctfd_hints_list).post(ctfd_hint_create))
-        .route("/api/v1/hints/{id}", delete(ctfd_hint_delete))
+        .route("/api/v1/hints/:id", delete(ctfd_hint_delete))
         // Tags
         .route("/api/v1/tags", get(ctfd_tags_list).post(ctfd_tag_create))
-        .route("/api/v1/tags/{id}", delete(ctfd_tag_delete))
+        .route("/api/v1/tags/:id", delete(ctfd_tag_delete))
         // Files
         .route("/api/v1/files", get(ctfd_files_list).post(ctfd_files_upload))
-        .route("/api/v1/files/{id}", delete(ctfd_file_delete))
+        .route("/api/v1/files/:id", delete(ctfd_file_delete))
         // Topics
-        .route("/api/v1/topics", post(ctfd_topic_create))
+        .route("/api/v1/topics", get(ctfd_topics_list).post(ctfd_topic_create))
+        .route("/api/v1/topics/:id", delete(ctfd_topic_delete))
         // Admin routes (monitor token)
         .route("/api/v1/instance/build", post(instance_build_handler))
         .route("/api/v1/instance/build-compose", post(build_compose_handler))
@@ -844,11 +846,16 @@ async fn instance_request_handler(
     let timeout_minutes = config["timeout_minutes"].as_u64().unwrap_or(45);
     let expires_at = instance::expires_at_string(timeout_minutes);
 
+    // Pre-generate the container/project name so the orphan checker sees it as tracked
+    // immediately (before compose::up returns and updates the row).
+    let pre_container_name = instance::container_name(&body.challenge_name);
+
     // Insert provisioning stub before spawning; UNIQUE constraint means a concurrent
     // request racing past the check above will hit INSERT OR IGNORE and we return 409.
     match db::insert_provisioning_stub(
         &state.db, &body.challenge_name, team_id, None,
         &state.public_host, &connection_type, &expires_at,
+        Some(&pre_container_name),
     ) {
         Ok(()) => {}
         Err(e) => {
@@ -864,6 +871,7 @@ async fn instance_request_handler(
     // Provision in background — compose up can take 30-60 s.
     let state_bg = Arc::clone(&state);
     let challenge_name_bg = body.challenge_name.clone();
+    let container_name_bg = pre_container_name;
     tokio::spawn(async move {
         let _permit = match state_bg.provision_sem.acquire().await {
             Ok(p) => p,
@@ -878,6 +886,7 @@ async fn instance_request_handler(
             &state_bg.db, &challenge_name_bg, team_id, None,
             &config, &state_bg.public_host, &state_bg.ctfd_pool,
             state_bg.runner_ssh_target.as_deref(),
+            Some(container_name_bg),
         ).await {
             Ok((host, port, conn, _exp)) => {
                 info!("provision_bg (player): done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id);
@@ -1127,10 +1136,15 @@ async fn plugin_request_handler(
     let timeout_minutes = config["timeout_minutes"].as_u64().unwrap_or(45);
     let expires_at = instance::expires_at_string(timeout_minutes);
 
+    // Pre-generate the container/project name so the orphan checker sees it as tracked
+    // immediately (before compose::up returns and updates the row).
+    let pre_container_name = instance::container_name(&body.challenge_name);
+
     // Insert stub immediately so the client can poll for status
     if let Err(e) = db::insert_provisioning_stub(
         &state.db, &body.challenge_name, body.team_id, body.user_id,
         &state.public_host, &connection_type, &expires_at,
+        Some(&pre_container_name),
     ) {
         error!("plugin_request: failed to insert provisioning stub: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
@@ -1143,6 +1157,7 @@ async fn plugin_request_handler(
     let challenge_name_bg = body.challenge_name.clone();
     let team_id_bg = body.team_id;
     let user_id_bg = body.user_id;
+    let container_name_bg = pre_container_name;
     tokio::spawn(async move {
         let _permit = match state_bg.provision_sem.acquire().await {
             Ok(p) => p,
@@ -1157,6 +1172,7 @@ async fn plugin_request_handler(
             &state_bg.db, &challenge_name_bg, team_id_bg, user_id_bg,
             &config, &state_bg.public_host, &state_bg.ctfd_pool,
             state_bg.runner_ssh_target.as_deref(),
+            Some(container_name_bg),
         ).await {
             Ok((host, port, conn, _exp)) => {
                 info!("provision_bg: done {}:{} ({}) for '{}' team {}", host, port, conn, challenge_name_bg, team_id_bg);
@@ -1887,6 +1903,24 @@ async fn ctfd_file_delete(
 
 // ── Topics ────────────────────────────────────────────────────────────────────
 
+async fn ctfd_topics_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<ChallengeIdQuery>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let cid = match params.challenge_id {
+        Some(id) => id,
+        None => return ctfd_err(StatusCode::BAD_REQUEST, "missing challenge_id"),
+    };
+    match ctfd_db::list_topics(&state.ctfd_pool, cid).await {
+        Ok(list) => ctfd_list(list),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 async fn ctfd_topic_create(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1897,6 +1931,20 @@ async fn ctfd_topic_create(
     }
     match ctfd_db::create_topic(&state.ctfd_pool, &body).await {
         Ok(v) => ctfd_ok(v),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+async fn ctfd_topic_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_monitor_auth(&headers, &state.monitor_token) {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::delete_topic(&state.ctfd_pool, id).await {
+        Ok(()) => ctfd_deleted(),
         Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }

@@ -1,10 +1,12 @@
 .env
 .envrc
+.nervctf.yml
 
 target
 /challenges/
-.nervctf.yml
 todo
 docs-extra
 ctfd-stress-tester
 dist/
+.claude
+CLAUDE.md

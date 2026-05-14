@@ -143,8 +143,8 @@
                 - MONITOR_PORT={{ monitor_port }}
                 - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
           {% if runner_ip is defined %}
-                - CHALLENGES_BASE_DIR=/home/docker/challenges
-                - RUNNER_SSH_TARGET=docker@{{ runner_resolved_ip | default(runner_ip) }}
+                - CHALLENGES_BASE_DIR=/home/{{ runner_user | default('docker') }}/challenges
+                - RUNNER_SSH_TARGET={{ runner_user | default('docker') }}@{{ runner_resolved_ip | default(runner_ip) }}
           {% else %}
                 - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
           {% endif %}
@@ -165,6 +165,12 @@
                 - {{ ctfd_path }}/.data/CTFd/uploads:{{ ctfd_path }}/.data/CTFd/uploads
               ports:
                 - "{{ monitor_port }}:{{ monitor_port }}"
+
+          # Explicitly declare the networks used by remote-monitor so Docker Compose
+          # correctly joins it to the existing project networks (not creating new ones).
+          networks:
+            default: {}
+            internal: {}
         dest: "{{ ctfd_path }}/docker-compose.override.yml"
         owner: "{{ docker_user }}"
         group: docker

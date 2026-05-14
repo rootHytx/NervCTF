@@ -59,8 +59,8 @@ fn generate_token() -> Result<String> {
     Ok(buf.iter().map(|b| format!("{:02x}", b)).collect())
 }
 
-fn find_workspace_root() -> Option<PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
+fn workspace_root_from(start: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
     loop {
         let toml = dir.join("Cargo.toml");
         if toml.exists() {
@@ -76,17 +76,49 @@ fn find_workspace_root() -> Option<PathBuf> {
     }
 }
 
-fn find_monitor_binary() -> Option<PathBuf> {
+fn find_workspace_root() -> Option<PathBuf> {
+    // Try from the current working directory first (normal dev workflow).
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(root) = workspace_root_from(&cwd) {
+            return Some(root);
+        }
+    }
+    // Fall back to walking up from the nervctf executable's location
+    // (covers the case where the user runs dist/nervctf-* from outside the repo).
     if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("remote-monitor");
-            if candidate.exists() {
-                return Some(candidate);
+        if let Some(exe_dir) = exe.parent() {
+            if let Some(root) = workspace_root_from(exe_dir) {
+                return Some(root);
             }
         }
     }
+    None
+}
+
+fn find_monitor_binary() -> Option<PathBuf> {
+    // Names to search for, in preference order (musl static first — no interpreter issues)
+    const NAMES: &[&str] = &[
+        "remote-monitor",
+        "remote-monitor-linux-x86_64-static",
+        "remote-monitor-linux-x86_64",
+        "remote-monitor-linux-aarch64-static",
+        "remote-monitor-linux-aarch64",
+    ];
+
+    // 1. Next to the running nervctf exe (covers dist/ when user runs dist/nervctf-*)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for name in NAMES {
+                let candidate = dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // 2. Cargo build output (covers dev workflow where user runs from workspace root)
     if let Some(root) = find_workspace_root() {
-        // Prefer musl static builds (portable, no NixOS interpreter path issues)
         let targets = [
             "x86_64-unknown-linux-musl",
             "aarch64-unknown-linux-musl",
@@ -105,6 +137,7 @@ fn find_monitor_binary() -> Option<PathBuf> {
             }
         }
     }
+
     None
 }
 
@@ -132,6 +165,34 @@ fn find_plugin_src() -> Option<PathBuf> {
     None
 }
 
+
+/// Resolve a hostname to an IP address using the CLI machine's DNS stack.
+/// Returns the original string unchanged if it is already an IP or resolution fails.
+fn resolve_host_to_ip(host: &str) -> String {
+    use std::net::{IpAddr, ToSocketAddrs};
+    if host.parse::<IpAddr>().is_ok() {
+        return host.to_string();
+    }
+    match format!("{}:22", host).to_socket_addrs() {
+        Ok(mut addrs) => addrs
+            .next()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "  [!] DNS lookup for '{}' returned no addresses — using hostname as-is",
+                    host
+                );
+                host.to_string()
+            }),
+        Err(e) => {
+            eprintln!(
+                "  [!] Could not resolve '{}': {} — using hostname as-is (may fail inside Docker)",
+                host, e
+            );
+            host.to_string()
+        }
+    }
+}
 
 fn prompt_with_default(prompt: &str, default: Option<&str>) -> Result<String> {
     let mut builder = Input::new().with_prompt(prompt);
@@ -162,11 +223,11 @@ pub fn run_setup() -> Result<()> {
     }
     println!();
 
-    // ── CHALLENGES BASE_DIR ────────────────────────────────────────────────────
+    // ── CHALLENGES_PATH ────────────────────────────────────────────────────────
     let base_dir = loop {
         let input = prompt_with_default(
             "Local challenges directory",
-            Some(config.challenges_dir.as_deref().unwrap_or(".")),
+            Some(config.challenges_path.as_deref().unwrap_or(".")),
         )?;
         let p = std::path::Path::new(&input);
         if p == std::path::Path::new(".") || p.is_dir() {
@@ -175,23 +236,23 @@ pub fn run_setup() -> Result<()> {
         println!("  [!] '{}' is not an existing directory. Try again.", input);
     };
 
-    // ── TARGET_IP ──────────────────────────────────────────────────────────────
-    let target_ip = {
-        let default = config.target_ip.as_deref();
+    // ── MONITOR_IP ────────────────────────────────────────────────────────────
+    let monitor_ip = {
+        let default = config.monitor_ip.as_deref();
         if let Some(ip) = default {
-            println!("Target IP [{}]: ", ip);
+            println!("Monitor IP [{}]: ", ip);
         }
-        let ip = prompt_with_default("Target machine IP address", default)?;
+        let ip = prompt_with_default("CTFd/monitor machine IP address", default)?;
         if ip.trim().is_empty() {
             return Err(anyhow!("IP address is required"));
         }
         ip
     };
 
-    // ── TARGET_USER ────────────────────────────────────────────────────────────
-    let target_user = prompt_with_default(
+    // ── MONITOR_USER ──────────────────────────────────────────────────────────
+    let monitor_user = prompt_with_default(
         "Remote sudo user",
-        Some(config.target_user.as_deref().unwrap_or("root")),
+        Some(config.monitor_user.as_deref().unwrap_or("root")),
     )?;
 
     // ── RUNNER (split-machine mode, optional) ─────────────────────────────────
@@ -204,29 +265,36 @@ pub fn run_setup() -> Result<()> {
             "Runner sudo user",
             Some(config.runner_user.as_deref().unwrap_or("root")),
         )?;
-        (Some(runner_ip_input), Some(ru))
+        // Resolve hostname → IP on the CLI machine now.
+        // The CTFd host's Docker container won't have Tailscale / split-DNS and
+        // therefore cannot resolve Tailscale hostnames like "remote-instances".
+        let resolved = resolve_host_to_ip(&runner_ip_input);
+        if resolved != runner_ip_input {
+            println!("  [ok] '{}' resolved to {} (IP will be stored in config)", runner_ip_input, resolved);
+        }
+        (Some(resolved), Some(ru))
     } else {
         (None, None)
     };
 
-    // ── CTFD_REMOTE_PATH ───────────────────────────────────────────────────────
+    // ── MONITOR_CTFD_PATH ─────────────────────────────────────────────────────
     let ctfd_path = prompt_with_default(
         "CTFd installation path on remote",
         Some(
             config
-                .ctfd_remote_path
+                .monitor_ctfd_path
                 .as_deref()
                 .unwrap_or("/home/docker/CTFd"),
         ),
     )?;
 
-    // ── MONITOR_PORT ───────────────────────────────────────────────────────────
+    // ── MONITOR_PORT ──────────────────────────────────────────────────────────
     let monitor_port = prompt_with_default(
         "Remote Monitor port",
         Some(config.monitor_port.as_deref().unwrap_or("33133")),
     )?;
 
-    // ── MONITOR_TOKEN ──────────────────────────────────────────────────────────
+    // ── MONITOR_TOKEN ─────────────────────────────────────────────────────────
     let monitor_token = if let Some(ref token) = config.monitor_token {
         println!(
             "Using existing monitor token ({}...)",
@@ -238,8 +306,8 @@ pub fn run_setup() -> Result<()> {
         generate_token()?
     };
 
-    // ── SSH key ────────────────────────────────────────────────────────────────
-    let ssh_pubkey_path = if let Some(ref key) = config.ssh_pubkey_path {
+    // ── SSH_KEY_PATH ──────────────────────────────────────────────────────────
+    let ssh_key_path = if let Some(ref key) = config.ssh_key_path {
         println!("Using existing SSH public key: {}", key);
         key.clone()
     } else {
@@ -274,17 +342,15 @@ pub fn run_setup() -> Result<()> {
     };
 
     // ── Save config before deployment ─────────────────────────────────────────
-    config.challenges_dir = Some(base_dir.clone());
-    config.target_ip = Some(target_ip.clone());
-    config.target_user = Some(target_user.clone());
+    config.challenges_path = Some(base_dir.clone());
+    config.monitor_ip = Some(monitor_ip.clone());
+    config.monitor_user = Some(monitor_user.clone());
     config.runner_ip = runner_ip.clone();
     config.runner_user = runner_user.clone();
-    config.ctfd_remote_path = Some(ctfd_path.clone());
+    config.monitor_ctfd_path = Some(ctfd_path.clone());
     config.monitor_port = Some(monitor_port.clone());
     config.monitor_token = Some(monitor_token.clone());
-    config.ssh_pubkey_path = Some(ssh_pubkey_path.clone());
-    let monitor_url = format!("http://{}:{}", target_ip, monitor_port);
-    config.monitor_url = Some(monitor_url.clone());
+    config.ssh_key_path = Some(ssh_key_path.clone());
 
     save_config(&config, &config_path)?;
     println!("  [ok] config saved to {}", config_path.display());
@@ -313,7 +379,7 @@ pub fn run_setup() -> Result<()> {
 
     // ── Build ansible extra-vars ───────────────────────────────────────────────
     let mut evars: Vec<String> = vec![
-        format!("ssh_key={}", ssh_pubkey_path),
+        format!("ssh_key={}", ssh_key_path),
         format!("ctfd_path={}", ctfd_path),
         format!("monitor_token={}", monitor_token),
         format!("monitor_port={}", monitor_port),
@@ -329,9 +395,12 @@ pub fn run_setup() -> Result<()> {
     if let Some(ref rip) = runner_ip {
         evars.push(format!("runner_ip={}", rip));
     }
+    if let Some(ref ruser) = runner_user {
+        evars.push(format!("runner_user={}", ruser));
+    }
     let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
-        target_ip, target_user
+        monitor_ip, monitor_user
     );
     if let (Some(ref rip), Some(ref ruser)) = (&runner_ip, &runner_user) {
         inventory.push_str(&format!(
@@ -343,6 +412,7 @@ pub fn run_setup() -> Result<()> {
     println!("\nRunning Ansible playbook...");
     run_ansible_playbook(PLAYBOOK, &inventory, &evars)?;
 
+    let monitor_url = format!("http://{}:{}", monitor_ip, monitor_port);
     println!("\nNervCTF setup complete!");
     println!("  Monitor URL:   {}", monitor_url);
     println!("  Monitor Token: {}", monitor_token);
@@ -437,12 +507,12 @@ pub fn run_upgrade() -> Result<()> {
     })?;
     println!("Using config: {}", config_file.display());
 
-    let target_ip = config.target_ip.as_deref().ok_or_else(|| {
-        anyhow!("target_ip not set in .nervctf.yml — run `nervctf setup` to fix.")
+    let monitor_ip = config.monitor_ip.as_deref().ok_or_else(|| {
+        anyhow!("monitor_ip not set in .nervctf.yml — run `nervctf setup` to fix.")
     })?;
-    let target_user = config.target_user.as_deref().unwrap_or("root");
+    let monitor_user = config.monitor_user.as_deref().unwrap_or("root");
     let ctfd_path = config
-        .ctfd_remote_path
+        .monitor_ctfd_path
         .as_deref()
         .unwrap_or("/home/docker/CTFd");
     let monitor_port = config.monitor_port.as_deref().unwrap_or("33133");
@@ -459,7 +529,7 @@ pub fn run_upgrade() -> Result<()> {
         ));
     }
 
-    println!("Target:   {}@{}", target_user, target_ip);
+    println!("Target:   {}@{}", monitor_user, monitor_ip);
     println!("CTFd dir: {}", ctfd_path);
     match &monitor_binary {
         Some(p) => println!("Monitor binary: {}", p.display()),
@@ -493,16 +563,31 @@ pub fn run_upgrade() -> Result<()> {
     if let Some(ref plugin) = plugin_src {
         evars.push(format!("plugin_src={}", plugin.display()));
     }
+    // Pass runner vars so the upgrade playbook can write the correct
+    // RUNNER_SSH_TARGET / CHALLENGES_BASE_DIR into the docker-compose override.
+    if let Some(ref rip) = config.runner_ip {
+        if !rip.is_empty() {
+            evars.push(format!("runner_ip={}", rip));
+        }
+    }
+    if let Some(ref ruser) = config.runner_user {
+        if !ruser.is_empty() {
+            evars.push(format!("runner_user={}", ruser));
+        }
+    }
+    if let Some(ref token) = config.monitor_token {
+        evars.push(format!("monitor_token={}", token));
+    }
 
     let inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
-        target_ip, target_user
+        monitor_ip, monitor_user
     );
 
     println!("\nRunning upgrade playbook...");
     run_ansible_playbook(UPGRADE_PLAYBOOK, &inventory, &evars)?;
 
-    let monitor_url = config.monitor_url.as_deref().unwrap_or("-");
+    let monitor_url = format!("http://{}:{}", monitor_ip, monitor_port);
     let monitor_token = config.monitor_token.as_deref().unwrap_or("-");
     println!("\nUpgrade complete!");
     println!("  Monitor URL:  {}", monitor_url);

@@ -125,6 +125,42 @@ impl CtfdClient {
         }
     }
 
+    /// Like `execute` but overrides the per-request timeout (for long-running build operations).
+    pub async fn execute_long<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        method: Method,
+        endpoint: &str,
+        body: Option<&B>,
+        timeout: Duration,
+    ) -> Result<Option<T>> {
+        let url = format!("{}{}{}", self.base_url, BASE_PATH, endpoint);
+        let mut builder = self.client.request(method.clone(), &url).timeout(timeout);
+
+        if let Some(body) = body {
+            builder = builder.json(body);
+        }
+
+        let response = builder.send().await?;
+        let status = response.status();
+
+        if status.is_success() {
+            if method != Method::DELETE {
+                let parsed = Self::parse_response(response).await?;
+                Ok(Some(parsed))
+            } else {
+                Ok(None)
+            }
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+            let detail = if error_text.is_empty() {
+                format!("HTTP {}", status)
+            } else {
+                error_text
+            };
+            Err(anyhow!("API error ({} {}): {}", method, endpoint, detail))
+        }
+    }
+
     /// Upload a file using the async client (safe to call from within tokio).
     pub async fn upload_file(&self, endpoint: &str, form: reqwest::multipart::Form) -> Result<()> {
         let url = format!("{}{}{}", self.base_url, BASE_PATH, endpoint);

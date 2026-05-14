@@ -143,14 +143,14 @@ async fn main() -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| cli.challenges_dir.clone());
     let (file_config, config_path) = load_config(&cwd);
 
-    // Resolve effective challenges_dir: CLI flag > .nervctf.yml > "."
+    // Resolve effective challenges_path: CLI flag > .nervctf.yml > "."
     // We treat the clap default (".") as "not explicitly set", so the config
     // file can override it.
     let effective_base_dir: PathBuf = if cli.challenges_dir != PathBuf::from(".") {
         cli.challenges_dir.clone() // explicitly passed by the user
     } else {
         file_config
-            .challenges_dir
+            .challenges_path
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or(cli.challenges_dir.clone())
@@ -165,11 +165,16 @@ async fn main() -> Result<()> {
     }
 
     // Resolve monitor config: CLI flag > env var > config file (required)
+    // monitor_url is derived from monitor_ip + monitor_port (not stored in file).
     let monitor_url = cli
         .monitor_url
         .or_else(|| env::var("MONITOR_URL").ok())
-        .or_else(|| file_config.monitor_url.clone())
-        .ok_or_else(|| anyhow!("MONITOR_URL is required (set via --monitor-url, MONITOR_URL env var, or .nervctf.yml)"))?;
+        .or_else(|| {
+            let ip = file_config.monitor_ip.as_deref()?;
+            let port = file_config.monitor_port.as_deref().unwrap_or("33133");
+            Some(format!("http://{}:{}", ip, port))
+        })
+        .ok_or_else(|| anyhow!("monitor_ip (or --monitor-url / MONITOR_URL) is required in .nervctf.yml"))?;
 
     let monitor_token = cli
         .monitor_token
@@ -200,7 +205,7 @@ async fn main() -> Result<()> {
     let runner_target = match (&file_config.runner_ip, &file_config.runner_user) {
         (Some(ip), Some(user)) if !ip.is_empty() => Some(RunnerTarget {
             ssh_target: format!("{}@{}", user, ip),
-            challenges_dir: "/home/docker/challenges".to_string(),
+            challenges_dir: format!("/home/{}/challenges", user),
         }),
         _ => None,
     };
@@ -706,10 +711,11 @@ async fn deploy_instance(
                                 "challenges_dir": rt.challenges_dir,
                             });
                             match monitor_client
-                                .execute::<serde_json::Value, _>(
+                                .execute_long::<serde_json::Value, _>(
                                     Method::POST,
                                     "/instance/build-compose-remote",
                                     Some(&build_payload),
+                                    std::time::Duration::from_secs(1200), // 20 min: compose builds can be slow
                                 )
                                 .await
                             {
@@ -895,12 +901,13 @@ async fn update_challenge_phase1(
         State::Hidden => "hidden",
     };
 
-    let (_ctfd_type, description) = resolve_challenge_type_and_description(challenge);
+    let (ctfd_type, description) = resolve_challenge_type_and_description(challenge);
 
     let mut payload = json!({
         "name":        challenge.name,
         "category":    challenge.category,
         "description": description,
+        "type":        ctfd_type,
         "value":       challenge.value,
         "state":       state_str,
     });

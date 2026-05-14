@@ -274,6 +274,9 @@ pub fn count_active_instances_for_team(db: &Db, team_id: i64) -> Result<i64> {
 /// Insert a placeholder row with status='provisioning' so the info endpoint can
 /// return status immediately while compose runs in the background.
 /// Uses INSERT OR IGNORE so a concurrent retry doesn't clobber an existing row.
+///
+/// `container_id` should be the pre-generated project/container name so that the
+/// background orphan cleanup sees it as a tracked instance before compose::up returns.
 pub fn insert_provisioning_stub(
     db: &Db,
     challenge_name: &str,
@@ -282,12 +285,13 @@ pub fn insert_provisioning_stub(
     host: &str,
     connection_type: &str,
     expires_at: &str,
+    container_id: Option<&str>,
 ) -> Result<()> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     conn.execute(
-        "INSERT OR IGNORE INTO instances (challenge_name, team_id, user_id, host, port, connection_type, status, expires_at)
-         VALUES (?1, ?2, ?3, ?4, 0, ?5, 'provisioning', ?6)",
-        params![challenge_name, team_id, user_id, host, connection_type, expires_at],
+        "INSERT OR IGNORE INTO instances (challenge_name, team_id, user_id, container_id, host, port, connection_type, status, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, 'provisioning', ?7)",
+        params![challenge_name, team_id, user_id, container_id, host, connection_type, expires_at],
     )?;
     Ok(())
 }

@@ -99,7 +99,7 @@
         state: present
         key: "{{ lookup('file', ssh_key) }}"
 
-    # ── CTFd ───────────────────────────────────────────────────────────────────
+    # ── CTFd clone ─────────────────────────────────────────────────────────────
     - name: Check if CTFd is already cloned
       stat:
         path: "{{ ctfd_path }}/requirements.txt"
@@ -113,20 +113,6 @@
         depth: 1
       become_user: "{{ docker_user }}"
       when: not ctfd_cloned.stat.exists
-
-    - name: Check if CTFd containers are running
-      shell: docker compose -f {{ ctfd_path }}/docker-compose.yml ps --status running 2>/dev/null | grep -q ctfd
-      register: ctfd_running
-      changed_when: false
-      ignore_errors: yes
-      become_user: "{{ docker_user }}"
-
-    - name: Start CTFd
-      command:
-        cmd: docker compose up --build --detach --no-recreate
-        chdir: "{{ ctfd_path }}"
-      become_user: "{{ docker_user }}"
-      when: ctfd_running.rc != 0
 
     # ── LXC / LXD ──────────────────────────────────────────────────────────────
     - name: Check if LXD is installed
@@ -233,6 +219,10 @@
               - "--chown={{ docker_user }}:docker"
 
     # ── Remote Monitor Docker image ────────────────────────────────────────────
+    # NOTE: Build the image BEFORE starting CTFd so that if a previous
+    # docker-compose.override.yml is already on disk (reinstall scenario),
+    # docker compose up doesn't fail trying to pull nervctf-monitor:latest
+    # from Docker Hub.
     - name: Ensure remote-monitor directory exists
       file:
         path: "{{ ctfd_path }}/remote-monitor"
@@ -399,8 +389,8 @@
                 - MONITOR_PORT={{ monitor_port }}
                 - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
           {% if runner_ip is defined %}
-                - CHALLENGES_BASE_DIR=/home/docker/challenges
-                - RUNNER_SSH_TARGET=docker@{{ runner_resolved_ip | default(runner_ip) }}
+                - CHALLENGES_BASE_DIR=/home/{{ runner_user | default('docker') }}/challenges
+                - RUNNER_SSH_TARGET={{ runner_user | default('docker') }}@{{ runner_resolved_ip | default(runner_ip) }}
           {% else %}
                 - CHALLENGES_BASE_DIR={{ ctfd_path }}/remote-monitor/data/challenges
           {% endif %}
@@ -421,10 +411,35 @@
                 - {{ ctfd_path }}/.data/CTFd/uploads:{{ ctfd_path }}/.data/CTFd/uploads
               ports:
                 - "{{ monitor_port }}:{{ monitor_port }}"
+
+          # Explicitly declare the networks used by remote-monitor so Docker Compose
+          # correctly joins it to the existing project networks (not creating new ones).
+          # Without this, a service added only in an override may not be attached to
+          # networks defined solely in the base docker-compose.yml.
+          networks:
+            default: {}
+            internal: {}
         dest: "{{ ctfd_path }}/docker-compose.override.yml"
         owner: "{{ docker_user }}"
         group: docker
         mode: "0640"
+
+    # ── CTFd start (first-run only) ────────────────────────────────────────────
+    # By this point the nervctf-monitor:latest image is already built and the
+    # override file is written, so docker compose will not try to pull the image.
+    - name: Check if CTFd containers are running
+      shell: docker compose -f {{ ctfd_path }}/docker-compose.yml ps --status running 2>/dev/null | grep -q ctfd
+      register: ctfd_running
+      changed_when: false
+      ignore_errors: yes
+      become_user: "{{ docker_user }}"
+
+    - name: Start CTFd
+      command:
+        cmd: docker compose up --build --detach --no-recreate
+        chdir: "{{ ctfd_path }}"
+      become_user: "{{ docker_user }}"
+      when: ctfd_running.rc != 0
 
     - name: Apply docker-compose override (recreate CTFd, start monitor)
       command:
@@ -432,6 +447,32 @@
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: plugin_src is defined or monitor_token is defined
+
+    # Wait for CTFd's gunicorn workers to finish db.create_all() / Alembic migrations.
+    # A non-502/503 response from nginx means at least one gunicorn worker has completed
+    # its create_app() call and the schema is ready. Checking port 80 (nginx) is reliable
+    # because nginx only starts after the ctfd container, and only forwards once gunicorn
+    # accepts connections (which happens after schema init).
+    - name: Wait for CTFd to finish database initialization
+      uri:
+        url: "http://localhost/"
+        status_code: [200, 301, 302, 401, 403]
+        follow_redirects: no
+        timeout: 10
+      register: ctfd_init_result
+      until: ctfd_init_result.status is defined and ctfd_init_result.status in [200, 301, 302, 401, 403]
+      retries: 60
+      delay: 5
+      ignore_errors: yes
+
+    - name: Report CTFd initialization result
+      debug:
+        msg: >-
+          {{
+            'CTFd is ready (HTTP ' ~ ctfd_init_result.status ~ ').'
+            if (ctfd_init_result.status is defined and ctfd_init_result.status in [200, 301, 302, 401, 403])
+            else 'WARNING: CTFd did not respond in time. If nervctf deploy fails with a database error, wait a moment and retry.'
+          }}
 
     - name: Wait for monitor health endpoint
       uri:
@@ -551,18 +592,27 @@
         state: started
         enabled: yes
 
+    # ── Ensure runner SSH user can run Docker ─────────────────────────────────
+    # root already has full access; for other users, docker group membership is required.
+    - name: Ensure runner_user is in docker group
+      user:
+        name: "{{ runner_user | default(docker_user) }}"
+        groups: docker
+        append: yes
+      when: (runner_user | default(docker_user)) != 'root'
+
     # ── Authorize remote-monitor's SSH public key ──────────────────────────────
     - name: Authorize remote-monitor SSH public key
       authorized_key:
-        user: "{{ docker_user }}"
+        user: "{{ runner_user | default(docker_user) }}"
         state: present
         key: "{{ hostvars[groups['ctfd'][0]]['monitor_pubkey'] }}"
 
     # ── Challenges directory (where compose challenge sources are stored) ──────
     - name: Create challenges directory on runner
       file:
-        path: /home/docker/challenges
+        path: /home/{{ runner_user | default(docker_user) }}/challenges
         state: directory
-        owner: "{{ docker_user }}"
+        owner: "{{ runner_user | default(docker_user) }}"
         group: docker
         mode: "0755"

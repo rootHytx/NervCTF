@@ -6,27 +6,29 @@ use std::path::{Path, PathBuf};
 /// Configuration loaded from `.nervctf.yml` (merged with env vars and CLI flags).
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Config {
-    // Remote monitor
+    // CTFd/monitor host
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub monitor_url: Option<String>,
+    pub monitor_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_port: Option<String>,
+    // monitor_url is derived at runtime as http://{monitor_ip}:{monitor_port}
+    // and is no longer persisted to file.
+
+    // Authentication
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitor_token: Option<String>,
 
-    // Challenge base directory
+    // Deployment credentials
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub challenges_dir: Option<String>,
+    pub monitor_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor_ctfd_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_key_path: Option<String>,
 
-    // Setup / deployment fields
+    // Local challenge directory
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_ip: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target_user: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_pubkey_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctfd_remote_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub monitor_port: Option<String>,
+    pub challenges_path: Option<String>,
 
     // Monitor tuning
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -109,10 +109,55 @@ async fn has_instance_table(conn: &mut mysql_async::Conn) -> bool {
     ).await.ok().flatten().is_some()
 }
 
+/// Which optional columns exist in the `challenges` table (varies by CTFd version).
+struct ChallengesSchema {
+    has_attribution: bool,
+    has_logic: bool,
+    has_position: bool,
+    /// true  = initial/minimum/decay/function are inline in `challenges` (newer CTFd)
+    /// false = they live in the separate `dynamic_challenge` join table (older CTFd)
+    dynamic_in_challenges: bool,
+}
+
+async fn detect_challenges_schema(conn: &mut mysql_async::Conn) -> ChallengesSchema {
+    let cols: Vec<String> = conn
+        .exec(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'challenges'",
+            (),
+        )
+        .await
+        .unwrap_or_default();
+    let col_set: std::collections::HashSet<String> = cols.into_iter().collect();
+    ChallengesSchema {
+        has_attribution:       col_set.contains("attribution"),
+        has_logic:             col_set.contains("logic"),
+        has_position:          col_set.contains("position"),
+        dynamic_in_challenges: col_set.contains("initial"),
+    }
+}
+
 /// Build the full-challenge SELECT query.
-/// `initial/minimum/decay/function` live directly in `challenges` in this CTFd version.
 /// Column count and order always match `row_to_value` (NULL placeholders keep indices stable).
-fn build_full_query(has_instance: bool) -> String {
+fn build_full_query(has_instance: bool, schema: &ChallengesSchema) -> String {
+    // Optional newer columns — NULL placeholder keeps row_to_value indices stable
+    let attr_col  = if schema.has_attribution { "c.attribution" } else { "NULL" };
+    let logic_col = if schema.has_logic       { "c.logic" }       else { "NULL" };
+    let pos_col   = if schema.has_position    { "c.position" }    else { "NULL" };
+
+    // Dynamic scoring: inline in challenges (newer) or LEFT JOIN dynamic_challenge (older)
+    let (dyn_cols, dyn_join) = if schema.dynamic_in_challenges {
+        (
+            "c.initial, c.minimum, c.decay, c.`function`".to_string(),
+            String::new(),
+        )
+    } else {
+        (
+            "d.initial, d.minimum, d.decay, d.`function`".to_string(),
+            "LEFT JOIN dynamic_challenge d ON d.id = c.id".to_string(),
+        )
+    };
+
     let icols = if has_instance {
         "i.backend, i.image, i.command, i.compose_file, i.compose_service, \
          i.lxc_image, i.vagrantfile, \
@@ -130,10 +175,10 @@ fn build_full_query(has_instance: bool) -> String {
     format!(
         "SELECT c.id, c.name, c.description, c.category, c.value, c.`type`, c.state, \
                 c.max_attempts, c.connection_info, c.requirements, c.next_id, \
-                c.attribution, c.logic, c.position, \
-                c.initial, c.minimum, c.decay, c.`function`, \
+                {attr_col}, {logic_col}, {pos_col}, \
+                {dyn_cols}, \
                 {icols} \
-         FROM challenges c {ijoin}"
+         FROM challenges c {dyn_join} {ijoin}"
     )
 }
 
@@ -249,7 +294,9 @@ fn row_to_value(row: &mysql_async::Row) -> Value {
 pub async fn list_challenges_full(pool: &Pool) -> Result<Vec<Value>> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: list_challenges_full: {}", e))?;
-    let query = build_full_query(has_instance_table(&mut conn).await);
+    let schema = detect_challenges_schema(&mut conn).await;
+    let has_inst = has_instance_table(&mut conn).await;
+    let query = build_full_query(has_inst, &schema);
     let rows: Vec<mysql_async::Row> = conn.exec(&query, ()).await
         .map_err(|e| anyhow!("ctfd_db: list_challenges_full query: {}", e))?;
     Ok(rows.iter().map(row_to_value).collect())
@@ -258,7 +305,9 @@ pub async fn list_challenges_full(pool: &Pool) -> Result<Vec<Value>> {
 pub async fn get_challenge_full(pool: &Pool, id: i64) -> Result<Option<Value>> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: get_challenge_full: {}", e))?;
-    let query = format!("{} WHERE c.id = ?", build_full_query(has_instance_table(&mut conn).await));
+    let schema = detect_challenges_schema(&mut conn).await;
+    let has_inst = has_instance_table(&mut conn).await;
+    let query = format!("{} WHERE c.id = ?", build_full_query(has_inst, &schema));
     let rows: Vec<mysql_async::Row> = conn.exec(&query, (id,)).await
         .map_err(|e| anyhow!("ctfd_db: get_challenge_full query: {}", e))?;
     Ok(rows.first().map(row_to_value))
@@ -267,6 +316,7 @@ pub async fn get_challenge_full(pool: &Pool, id: i64) -> Result<Option<Value>> {
 pub async fn create_challenge(pool: &Pool, body: &Value) -> Result<Value> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: create_challenge: {}", e))?;
+    let schema = detect_challenges_schema(&mut conn).await;
 
     let name = body["name"].as_str().unwrap_or("").to_string();
     let category = body["category"].as_str().unwrap_or("").to_string();
@@ -284,44 +334,57 @@ pub async fn create_challenge(pool: &Pool, body: &Value) -> Result<Value> {
         None
     };
     let next_id: Option<i64> = body["next_id"].as_i64();
-    let logic = body["logic"].as_str().unwrap_or("").to_string();
 
-    // initial/minimum/decay/function live directly in challenges in this CTFd version
-    let (initial, minimum, decay, function): (Option<i64>, Option<i64>, Option<i64>, Option<String>) =
-        if type_ == "dynamic" || type_ == "instance" {
-            let i = body["initial"].as_i64().or_else(|| body["initial_value"].as_i64());
-            let mn = body["minimum"].as_i64().or_else(|| body["minimum_value"].as_i64());
-            let d = body["decay"].as_i64().or_else(|| body["decay_value"].as_i64());
-            let f = body["function"].as_str().or_else(|| body["decay_function"].as_str()).map(|s| s.to_string());
-            (i, mn, d, f)
-        } else {
-            (None, None, None, None)
-        };
+    let is_scored = type_ == "dynamic" || type_ == "instance";
+    let initial  = if is_scored { body["initial"].as_i64().or_else(|| body["initial_value"].as_i64()) } else { None };
+    let minimum  = if is_scored { body["minimum"].as_i64().or_else(|| body["minimum_value"].as_i64()) } else { None };
+    let decay    = if is_scored { body["decay"].as_i64().or_else(|| body["decay_value"].as_i64()) } else { None };
+    let function = if is_scored { body["function"].as_str().or_else(|| body["decay_function"].as_str()).map(|s| s.to_string()) } else { None };
 
-    let sql = "INSERT INTO challenges \
-        (name, category, description, value, `type`, state, max_attempts, \
-         connection_info, requirements, next_id, logic, initial, minimum, decay, `function`) \
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    // Build INSERT dynamically: only include columns that exist in this CTFd version
+    let mut col_names: Vec<&str> = vec![
+        "name", "category", "description", "value", "`type`", "state",
+        "max_attempts", "connection_info", "requirements", "next_id",
+    ];
+    if schema.has_logic { col_names.push("logic"); }
+    if schema.dynamic_in_challenges && is_scored {
+        col_names.extend(["initial", "minimum", "decay", "`function`"]);
+    }
+    let placeholders: Vec<&str> = col_names.iter().map(|_| "?").collect();
+    let sql = format!(
+        "INSERT INTO challenges ({}) VALUES ({})",
+        col_names.join(", "),
+        placeholders.join(", "),
+    );
+
     use mysql_async::prelude::ToValue;
-    conn.exec_drop(sql, mysql_async::Params::Positional(vec![
+    let logic = body["logic"].as_str().unwrap_or("").to_string();
+    let mut params: Vec<mysql_async::Value> = vec![
         name.clone().to_value(), category.clone().to_value(), description.clone().to_value(),
         value.to_value(), type_.clone().to_value(), state.clone().to_value(),
         max_attempts.to_value(), connection_info.clone().to_value(),
         requirements.clone().to_value(), next_id.to_value(),
-        logic.to_value(), initial.to_value(), minimum.to_value(), decay.to_value(),
-        function.to_value(),
-    ])).await.map_err(|e| anyhow!("ctfd_db: insert challenge: {}", e))?;
+    ];
+    if schema.has_logic { params.push(logic.to_value()); }
+    if schema.dynamic_in_challenges && is_scored {
+        params.push(initial.to_value());
+        params.push(minimum.to_value());
+        params.push(decay.to_value());
+        params.push(function.clone().to_value());
+    }
+    conn.exec_drop(sql, mysql_async::Params::Positional(params)).await
+        .map_err(|e| anyhow!("ctfd_db: insert challenge: {}", e))?;
 
     let new_id = conn.last_insert_id().unwrap_or(0) as i64;
 
-    if type_ == "dynamic" {
-        let di = body["initial"].as_i64().unwrap_or(value);
-        let dm = body["minimum"].as_i64().unwrap_or(1);
-        let dd = body["decay"].as_i64().unwrap_or(50);
-        let df = body["function"].as_str().unwrap_or("linear").to_string();
+    // For dynamic type on older CTFd: scoring lives in dynamic_challenge (columns: initial/minimum/decay/function)
+    if type_ == "dynamic" && !schema.dynamic_in_challenges {
+        let di = initial.unwrap_or(value);
+        let dm = minimum.unwrap_or(1);
+        let dd = decay.unwrap_or(50);
+        let df = function.clone().unwrap_or_else(|| "linear".to_string());
         let sql2 = "INSERT INTO dynamic_challenge \
-            (id, dynamic_initial, dynamic_minimum, dynamic_decay, dynamic_function) \
-            VALUES (?, ?, ?, ?, ?)";
+            (id, initial, minimum, decay, `function`) VALUES (?, ?, ?, ?, ?)";
         conn.exec_drop(sql2, (new_id, di, dm, dd, df)).await
             .map_err(|e| anyhow!("ctfd_db: insert dynamic_challenge: {}", e))?;
     }
@@ -342,16 +405,22 @@ pub async fn create_challenge(pool: &Pool, body: &Value) -> Result<Value> {
 pub async fn update_challenge(pool: &Pool, id: i64, body: &Value) -> Result<Value> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: update_challenge: {}", e))?;
+    let schema = detect_challenges_schema(&mut conn).await;
 
     let mut sets: Vec<String> = Vec::new();
     let mut params: Vec<mysql_async::Value> = Vec::new();
 
-    let string_fields = [
+    // Always-present string columns
+    let mut string_fields: Vec<(&str, &str)> = vec![
         ("name", "name"), ("category", "category"), ("description", "description"),
         ("type", "`type`"), ("state", "state"), ("connection_info", "connection_info"),
-        ("logic", "logic"), ("attribution", "attribution"),
-        ("function", "`function`"),
     ];
+    // Version-gated string columns
+    if schema.has_logic       { string_fields.push(("logic", "logic")); }
+    if schema.has_attribution { string_fields.push(("attribution", "attribution")); }
+    // `function` only meaningful in challenges when inline scoring is present
+    if schema.dynamic_in_challenges { string_fields.push(("function", "`function`")); }
+
     for (json_key, col) in &string_fields {
         if let Some(s) = body[*json_key].as_str() {
             sets.push(format!("{} = ?", col));
@@ -376,12 +445,13 @@ pub async fn update_challenge(pool: &Pool, id: i64, body: &Value) -> Result<Valu
             params.push(mysql_async::Value::Bytes(s.into_bytes()));
         }
     }
-
-    // Update initial/minimum/decay directly in challenges (they live there in this CTFd version)
-    for (json_key, col) in &[("initial", "initial"), ("minimum", "minimum"), ("decay", "decay")] {
-        if let Some(v) = body[*json_key].as_i64() {
-            sets.push(format!("{} = ?", col));
-            params.push(mysql_async::Value::Int(v));
+    // Inline dynamic scoring (newer CTFd only)
+    if schema.dynamic_in_challenges {
+        for (json_key, col) in &[("initial", "initial"), ("minimum", "minimum"), ("decay", "decay")] {
+            if let Some(v) = body[*json_key].as_i64() {
+                sets.push(format!("{} = ?", col));
+                params.push(mysql_async::Value::Int(v));
+            }
         }
     }
 
@@ -393,17 +463,17 @@ pub async fn update_challenge(pool: &Pool, id: i64, body: &Value) -> Result<Valu
     }
 
     let type_ = body["type"].as_str().unwrap_or("");
-    if type_ == "dynamic" {
+    // Older CTFd: upsert dynamic_challenge join table (columns: initial/minimum/decay/function)
+    if type_ == "dynamic" && !schema.dynamic_in_challenges {
         let di = body["initial"].as_i64().unwrap_or(0);
         let dm = body["minimum"].as_i64().unwrap_or(1);
         let dd = body["decay"].as_i64().unwrap_or(50);
         let df = body["function"].as_str().unwrap_or("linear").to_string();
         let sql3 = "INSERT INTO dynamic_challenge \
-             (id, dynamic_initial, dynamic_minimum, dynamic_decay, dynamic_function) \
-             VALUES (?, ?, ?, ?, ?) \
+             (id, initial, minimum, decay, `function`) VALUES (?, ?, ?, ?, ?) \
              ON DUPLICATE KEY UPDATE \
-             dynamic_initial=VALUES(dynamic_initial), dynamic_minimum=VALUES(dynamic_minimum), \
-             dynamic_decay=VALUES(dynamic_decay), dynamic_function=VALUES(dynamic_function)";
+             initial=VALUES(initial), minimum=VALUES(minimum), \
+             decay=VALUES(decay), `function`=VALUES(`function`)";
         conn.exec_drop(sql3, (id, di, dm, dd, df)).await
             .map_err(|e| anyhow!("ctfd_db: upsert dynamic_challenge: {}", e))?;
     }
@@ -527,12 +597,12 @@ pub async fn delete_flag_by_id(pool: &Pool, id: i64) -> Result<()> {
 pub async fn list_hints(pool: &Pool, challenge_id: i64) -> Result<Vec<Value>> {
     let mut conn = pool.get_conn().await
         .map_err(|e| anyhow!("ctfd_db: list_hints: {}", e))?;
-    let rows: Vec<(i64, i64, String, i64, Option<String>)> = conn.exec(
-        "SELECT id, challenge_id, content, cost, title FROM hints WHERE challenge_id = ?",
+    let rows: Vec<(i64, i64, String, i64)> = conn.exec(
+        "SELECT id, challenge_id, content, cost FROM hints WHERE challenge_id = ?",
         (challenge_id,),
     ).await.map_err(|e| anyhow!("ctfd_db: list_hints: {}", e))?;
-    Ok(rows.into_iter().map(|(id, cid, content, cost, title)| json!({
-        "id": id, "challenge_id": cid, "content": content, "cost": cost, "title": title,
+    Ok(rows.into_iter().map(|(id, cid, content, cost)| json!({
+        "id": id, "challenge_id": cid, "content": content, "cost": cost,
     })).collect())
 }
 
@@ -543,12 +613,11 @@ pub async fn create_hint(pool: &Pool, body: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("missing challenge_id"))?;
     let content = body["content"].as_str().unwrap_or("").to_string();
     let cost = body["cost"].as_i64().unwrap_or(0);
-    let title: Option<String> = body["title"].as_str().map(|s| s.to_string());
-    let sql = "INSERT INTO hints (challenge_id, content, cost, `type`, title) VALUES (?, ?, ?, 'standard', ?)";
-    conn.exec_drop(sql, (challenge_id, content.clone(), cost, title.clone())).await
+    let sql = "INSERT INTO hints (challenge_id, content, cost, `type`) VALUES (?, ?, ?, 'standard')";
+    conn.exec_drop(sql, (challenge_id, content.clone(), cost)).await
         .map_err(|e| anyhow!("ctfd_db: create_hint: {}", e))?;
     let id = conn.last_insert_id().unwrap_or(0) as i64;
-    Ok(json!({"id": id, "challenge_id": challenge_id, "content": content, "cost": cost, "title": title}))
+    Ok(json!({"id": id, "challenge_id": challenge_id, "content": content, "cost": cost}))
 }
 
 pub async fn delete_hint(pool: &Pool, id: i64) -> Result<()> {
@@ -651,6 +720,25 @@ pub async fn create_topic(pool: &Pool, body: &Value) -> Result<Value> {
     ).await.map_err(|e| anyhow!("ctfd_db: create_topic link: {}", e))?;
 
     Ok(json!({"id": topic_id, "challenge_id": challenge_id, "value": value}))
+}
+
+pub async fn list_topics(pool: &Pool, challenge_id: i64) -> Result<Vec<Value>> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: list_topics: {}", e))?;
+    let rows: Vec<(i64, String)> = conn.exec(
+        "SELECT t.id, t.value FROM topics t \
+         JOIN challenge_topics ct ON ct.topic_id = t.id \
+         WHERE ct.challenge_id = ?",
+        (challenge_id,),
+    ).await.map_err(|e| anyhow!("ctfd_db: list_topics query: {}", e))?;
+    Ok(rows.into_iter().map(|(id, value)| json!({"id": id, "challenge_id": challenge_id, "value": value})).collect())
+}
+
+pub async fn delete_topic(pool: &Pool, topic_id: i64) -> Result<()> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: delete_topic: {}", e))?;
+    conn.exec_drop("DELETE FROM challenge_topics WHERE topic_id = ?", (topic_id,)).await
+        .map_err(|e| anyhow!("ctfd_db: delete_topic: {}", e))
 }
 
 // ── Read-only sync from CTFd submissions ──────────────────────────────────────

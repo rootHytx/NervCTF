@@ -87,6 +87,9 @@ pub async fn provision(
     public_host: &str,
     ctfd_pool: &Pool,
     runner_ssh: Option<&str>,
+    // Pre-generated name from handler so it matches the provisioning stub's container_id,
+    // preventing the orphan checker from killing the project before the DB is updated.
+    container_name_hint: Option<String>,
 ) -> Result<(String, u16, String, String)> {
     let backend = config["backend"].as_str().unwrap_or("docker");
     let internal_port = config["internal_port"].as_u64().unwrap_or(4000) as u32;
@@ -104,7 +107,7 @@ pub async fn provision(
 
             let used_ports = crate::db::get_used_ports(db)?;
             let host_port = docker::pick_free_port(&used_ports)?;
-            let cname = container_name(challenge_name);
+            let cname = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
 
             let flag = generate_flag(config);
             let flag_delivery = config["flag_delivery"].as_str().unwrap_or("env");
@@ -173,7 +176,7 @@ pub async fn provision(
             let flag_delivery = config["flag_delivery"].as_str().unwrap_or("env");
             let flag_file_path = config["flag_file_path"].as_str();
             let flag_service = config["flag_service"].as_str();
-            let project_name = container_name(challenge_name);
+            let project_name = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
             let used_ports = crate::db::get_used_ports(db)?;
             let flag = generate_flag(config);
             let (host_port, project) = compose::up(

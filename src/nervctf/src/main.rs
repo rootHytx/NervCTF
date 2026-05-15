@@ -683,6 +683,7 @@ async fn deploy_instance(
                         .args([
                             "-o", "StrictHostKeyChecking=no",
                             "-o", "UserKnownHostsFile=/dev/null",
+                            "-o", "LogLevel=ERROR",
                             "-o", "BatchMode=yes",
                             &rt.ssh_target,
                             &format!("mkdir -p '{}'", remote_dir),
@@ -696,7 +697,7 @@ async fn deploy_instance(
                     let status = tokio::process::Command::new("rsync")
                         .args([
                             "-az", "--delete",
-                            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+                            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
                             &format!("{}/", context_dir.display()),
                             &format!("{}:{}/", rt.ssh_target, remote_dir),
                         ])

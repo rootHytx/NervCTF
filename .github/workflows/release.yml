@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Linux x86_64 (musl static), aarch64, Windows ───────────────────────────
+  build-linux:
+    name: Build Linux + Windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            x86_64-unknown-linux-musl,
+            aarch64-unknown-linux-gnu,
+            x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compilers and UPX
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            musl-tools \
+            gcc-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 \
+            upx-ucl
+
+      - name: Build Linux x86_64 musl static
+        run: make release-musl NIX=""
+
+      - name: Build Linux aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+        run: make release-arm64 NIX=""
+
+      - name: Build Windows x86_64
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+        run: make release-windows NIX=""
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-windows
+          path: dist/
+          retention-days: 1
+
+  # ── macOS x86_64 + arm64 ───────────────────────────────────────────────────
+  # Must run on a real macOS runner — Apple's SDK cannot be cross-compiled.
+  # UPX intentionally omitted: UPX-packed binaries are rejected by Gatekeeper.
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build macOS x86_64
+        run: make release-macos
+
+      - name: Build macOS aarch64
+        run: make release-macos-arm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/
+          retention-days: 1
+
+  # ── Publish GitHub Release ─────────────────────────────────────────────────
+  release:
+    name: Publish release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+
+      - name: List release assets
+        run: ls -lh dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

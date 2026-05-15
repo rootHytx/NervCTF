@@ -445,8 +445,15 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
     let tmp = tempdir()?;
     let playbook_path = tmp.path().join("playbook.yml");
     let inventory_path = tmp.path().join("inventory.ini");
+    let cfg_path = tmp.path().join("ansible.cfg");
     fs::write(&playbook_path, playbook)?;
     fs::write(&inventory_path, inventory)?;
+    // Suppress deprecation/system warnings that come from Ansible's own internal
+    // modules (e.g. synchronize using deprecated _text imports) — nothing we can
+    // fix in the playbook YAML itself.
+    fs::write(&cfg_path,
+        "[defaults]\ndeprecation_warnings = False\nsystem_warnings = False\n"
+    )?;
 
     // Build a JSON object from "key=value" strings and write it to a temp file.
     // ansible-playbook accepts `-e @/path/to/file.json` for structured vars.
@@ -470,6 +477,7 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
 
     let status = Command::new("ansible-playbook")
         .args(&args)
+        .env("ANSIBLE_CONFIG", cfg_path.to_str().unwrap())
         .status()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

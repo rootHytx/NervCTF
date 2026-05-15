@@ -385,7 +385,7 @@
               environment:
                 - CTFD_DB_URL={{ ctfd_db_url }}
                 - MONITOR_TOKEN={{ monitor_token }}
-                - PUBLIC_HOST={{ runner_ip | default(ansible_host) }}
+                - PUBLIC_HOST={{ runner_domain | default(runner_ip) | default(ansible_host) }}
                 - MONITOR_PORT={{ monitor_port }}
                 - DB_PATH={{ ctfd_path }}/remote-monitor/data/monitor.db
           {% if runner_ip is defined %}

@@ -696,6 +696,7 @@ async fn deploy_instance(
                     let status = tokio::process::Command::new("rsync")
                         .args([
                             "-az", "--delete",
+                            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
                             &format!("{}/", context_dir.display()),
                             &format!("{}:{}/", rt.ssh_target, remote_dir),
                         ])

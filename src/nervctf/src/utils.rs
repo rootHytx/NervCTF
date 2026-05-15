@@ -44,6 +44,9 @@ pub struct Config {
     pub runner_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_user: Option<String>,
+    // Domain shown to players instead of the runner IP (backend still uses the IP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_domain: Option<String>,
 }
 
 /// Walk up from `start_dir` looking for `.nervctf.yml` or `.nervctf.yaml`.

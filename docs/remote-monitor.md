@@ -45,7 +45,7 @@ In split-machine mode, Docker commands run on a separate worker node via SSH
 |----------|---------|-------------|
 | `CTFD_DB_URL` | required | MariaDB URL (`mysql://user:pass@host/db`) |
 | `MONITOR_TOKEN` | required | Token required on all admin routes |
-| `PUBLIC_HOST` | required | Hostname returned to players in connection strings |
+| `PUBLIC_HOST` | required | Hostname/domain returned to players in connection strings. Set from `runner_domain` (if set) → `runner_ip` → CTFd host IP by the Ansible playbook. |
 | `CTFD_UPLOADS_DIR` | `""` | Absolute path to CTFd uploads dir (for file writes) |
 | `CHALLENGES_BASE_DIR` | `/opt/nervctf/challenges` | Root for server-side challenge files |
 | `RUNNER_SSH_TARGET` | `""` | SSH target for split-machine mode (e.g. `docker@192.168.1.50`) |
@@ -132,14 +132,28 @@ Multipart fields: `challenge_name` (text) + `context` (tar.gz file).
 
 ### `POST /api/v1/instance/build-compose`
 
-Same, but runs `docker compose -f <compose_file> build` instead.
+Same extraction as `build`, but runs:
+
+```
+docker compose -f <compose_file> -p <dir_name> build
+```
+
+`<dir_name>` is the lowercased name of the challenge directory (parent of `compose_file`).
+This causes Docker Compose to tag images as `<dir_name>-<service>` — the same prefix that
+the per-instance override file (written by `compose::up`) references in its `image:` entries.
 
 ### `POST /api/v1/instance/build-compose-remote`
 
 JSON body: `{challenge_name, compose_file?, challenges_dir?}`
 
 Used in **split-machine mode** after the CLI has rsynced files to the runner.
-The monitor SSHes to `RUNNER_SSH_TARGET` and runs `docker compose build` there.
+The monitor SSHes to `RUNNER_SSH_TARGET` and runs:
+
+```
+docker compose -f <compose_file> -p <dir_name> build
+```
+
+Same `-p <dir_name>` convention as the single-machine build.
 No file upload — the CLI handles file transfer directly via rsync.
 
 ### Placeholder directory problem
@@ -156,7 +170,12 @@ are created. A subsequent `tar -x` cannot overwrite a directory with a file.
 
 ### Expiry task (every 30 s)
 
-1. `get_expired_instances()` → for each expired running instance:
+1. `get_expired_instances()` — returns two sets:
+   - **Expired running instances**: `status = 'running'` and `expires_at < now`
+   - **Stuck provisioning instances**: `status = 'provisioning'` and `created_at < now - 30 min`
+     (uses `created_at`, not `expires_at`, so short-timeout challenges don't trigger this early)
+   
+   For each matched row:
    - `cleanup_container(id, runner_ssh)` — tries compose down, lxc delete, docker remove
    - `ctfd_db::delete_flag(ctfd_flag_id)` — removes dynamic flag from CTFd
    - `db::delete_instance()`

@@ -165,8 +165,13 @@ executes all Docker/Compose commands on the runner via SSH (`RUNNER_SSH_TARGET`)
 ```yaml
 # .nervctf.yml
 runner_ip: 192.168.1.50
-runner_user: docker   # default: docker
+runner_user: docker           # default: docker
+runner_domain: challenges.example.com  # optional
 ```
+
+`runner_domain` lets you expose a DNS name to players instead of the raw IP. The backend
+(SSH connections, `RUNNER_SSH_TARGET`) always uses `runner_ip`; only `PUBLIC_HOST` — the
+value shown in player connection strings — is replaced with the domain.
 
 Bind mount paths in `docker-compose.yml` must use the path as seen on the **runner** filesystem
 (not the monitor container). The runner stores challenge files at the same path used during rsync.
@@ -231,9 +236,29 @@ instance:
 The `compose` backend manages a `docker compose` project per team:
 
 - Challenge files are stored on the monitor at `/data/challenges/<sanitized_name>/`
-- A per-team override file (`<project_name>.override.yml`) is written next to the compose file
-- The override maps `host_port:internal_port` and optionally injects the flag
 - Project name: `ctf-<sanitized_challenge_name>-<6 random chars>`
+- A per-team override file (`<project_name>.override.yml`) is written next to the compose file
+
+The override always contains:
+
+1. **Port mapping** for the main service (`compose_service`): `host_port:internal_port`
+2. **`image:` key** for every pre-built service, referencing the image built by `nervctf deploy`
+3. **Volume mount** for `flag_delivery: file` (if applicable)
+
+### Image naming
+
+Images are built with `-p <dir_name>` where `<dir_name>` is the **lowercased name of the
+challenge directory** (the parent of `compose_file`). Docker Compose tags images as
+`<dir_name>-<service>`. The per-instance override sets `image: <dir_name>-<service>` for
+each such service so that the per-instance project name (`ctf-...-<random6>`) never bleeds
+into the image lookup.
+
+Public-image services (`postgres`, `redis`, etc.) that have their own `image:` in the base
+compose file are not overridden — only services whose image was built locally are touched.
+
+> **Example**: challenge directory `sigma-notes/` with services `app` and `sigma_admin`
+> → images tagged `sigma-notes-app` and `sigma-notes-sigma_admin`
+> → override adds `image: sigma-notes-app` / `image: sigma-notes-sigma_admin`
 
 ### Flag delivery for compose
 
@@ -301,10 +326,11 @@ playbook but the provisioning logic is not yet implemented.
 
 | Event | What happens |
 |-------|-------------|
-| Player requests instance | `provision()` called; container started; row inserted into `instances` table |
+| Player requests instance | Row inserted with `status='provisioning'`; container started; status updated to `'running'` |
 | Player renews | `expires_at` extended by `timeout_minutes`; `renewals_used` incremented |
 | Player stops | Container removed; row deleted |
 | Instance expires | Background task (30s interval) calls `cleanup_container()` and deletes row |
+| Provisioning stuck >30 min | Background task treats the row the same as expired (`created_at` is the reference, not `expires_at`) |
 | Challenge deleted | All instances stopped; challenge config removed from `instance_configs` |
 
 ---

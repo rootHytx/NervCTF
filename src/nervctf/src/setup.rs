@@ -403,13 +403,18 @@ pub fn run_setup() -> Result<()> {
             evars.push(format!("ctfd_domain={}", domain));
         }
     }
+    if let Some(ref domain) = config.runner_domain {
+        if !domain.is_empty() {
+            evars.push(format!("runner_domain={}", domain));
+        }
+    }
     let mut inventory = format!(
-        "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+        "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
         monitor_ip, monitor_user
     );
     if let (Some(ref rip), Some(ref ruser)) = (&runner_ip, &runner_user) {
         inventory.push_str(&format!(
-            "\n[runner]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+            "\n[runner]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
             rip, ruser
         ));
     }
@@ -587,15 +592,20 @@ pub fn run_upgrade() -> Result<()> {
             evars.push(format!("ctfd_domain={}", domain));
         }
     }
+    if let Some(ref domain) = config.runner_domain {
+        if !domain.is_empty() {
+            evars.push(format!("runner_domain={}", domain));
+        }
+    }
 
     let mut inventory = format!(
-        "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+        "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
         monitor_ip, monitor_user
     );
     if let (Some(ref rip), Some(ref ruser)) = (&config.runner_ip, &config.runner_user) {
         if !rip.is_empty() {
             inventory.push_str(&format!(
-                "\n[runner]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+                "\n[runner]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
                 rip, ruser
             ));
         }

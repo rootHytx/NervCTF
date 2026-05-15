@@ -228,7 +228,7 @@ pub async fn up(
         let project_name_q = ssh::shell_quote(project_name);
 
         let remote_cmd = format!(
-            "cd {} && {}DOCKER_BUILDKIT=1 docker compose -f {} -f {} -p {} up -d --no-build --force-recreate",
+            "cd {} && {}DOCKER_BUILDKIT=1 docker compose -f {} -f {} -p {} up -d --force-recreate",
             compose_dir_q,
             flag_env,
             compose_file_q,
@@ -268,7 +268,7 @@ pub async fn up(
             "-f", compose_file_str,
             "-f", override_path_str.as_str(),
             "-p", project_name,
-            "up", "-d", "--no-build", "--force-recreate",
+            "up", "-d", "--force-recreate",
         ]);
         cmd.env("DOCKER_BUILDKIT", "1");
         if flag_delivery != "file" {

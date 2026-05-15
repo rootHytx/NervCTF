@@ -68,7 +68,7 @@
           if [ -f /run/monitor_ssh_key ]; then\n\
             mkdir -p /root/.ssh && chmod 700 /root/.ssh\n\
             cp /run/monitor_ssh_key /root/.ssh/id_rsa && chmod 600 /root/.ssh/id_rsa\n\
-            printf "Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n" > /root/.ssh/config\n\
+            printf "Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile /dev/null\\n  LogLevel ERROR\\n" > /root/.ssh/config\n\
             chmod 600 /root/.ssh/config\n\
           fi\n\
           exec "$@"\n' > /entrypoint.sh && chmod +x /entrypoint.sh
@@ -123,6 +123,17 @@
             else runner_ip
           }}
 
+    - name: Read monitor SSH public key
+      when: runner_ip is defined
+      slurp:
+        src: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key.pub"
+      register: monitor_pubkey_raw
+
+    - name: Set monitor_pubkey fact
+      when: runner_ip is defined
+      set_fact:
+        monitor_pubkey: "{{ monitor_pubkey_raw.content | b64decode | trim }}"
+
     - name: Write docker-compose override
       when: monitor_token is defined
       copy:
@@ -151,6 +162,9 @@
                 - CTFD_UPLOADS_DIR={{ ctfd_path }}/.data/CTFd/uploads
                 - MAX_CONCURRENT_PROVISIONS={{ max_concurrent_provisions }}
                 - MAX_INSTANCES_PER_TEAM={{ max_instances_per_team }}
+          {% if ctfd_domain is defined and ctfd_domain %}
+                - CTFD_DOMAIN={{ ctfd_domain }}
+          {% endif %}
               networks:
                 - default
                 - internal
@@ -192,3 +206,27 @@
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: plugin_src is defined
+
+# ── Runner: re-authorize monitor SSH key ──────────────────────────────────────
+# Runs only when runner_ip is set (split-machine mode). Re-syncs the public key
+# that the monitor container uses to SSH into the runner for docker compose ops.
+# Without this, upgrades that replace the monitor container break instance builds.
+- hosts: runner
+  become: yes
+  vars:
+    ansible_python_interpreter: auto_silent
+    docker_user: docker
+  tasks:
+    - name: Authorize remote-monitor SSH public key on runner
+      when: runner_ip is defined
+      authorized_key:
+        user: "{{ runner_user | default(docker_user) }}"
+        state: present
+        key: "{{ hostvars[groups['ctfd'][0]]['monitor_pubkey'] }}"
+
+    - name: Ensure runner_user is in docker group
+      when: (runner_user | default(docker_user)) != 'root'
+      user:
+        name: "{{ runner_user | default(docker_user) }}"
+        groups: docker
+        append: yes

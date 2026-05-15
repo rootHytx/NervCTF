@@ -398,6 +398,11 @@ pub fn run_setup() -> Result<()> {
     if let Some(ref ruser) = runner_user {
         evars.push(format!("runner_user={}", ruser));
     }
+    if let Some(ref domain) = config.ctfd_domain {
+        if !domain.is_empty() {
+            evars.push(format!("ctfd_domain={}", domain));
+        }
+    }
     let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
         monitor_ip, monitor_user
@@ -414,10 +419,9 @@ pub fn run_setup() -> Result<()> {
 
     let monitor_url = format!("http://{}:{}", monitor_ip, monitor_port);
     println!("\nNervCTF setup complete!");
-    println!("  Monitor URL:   {}", monitor_url);
-    println!("  Monitor Token: {}", monitor_token);
-    println!("  Admin Panel:   {}/admin?token={}", monitor_url, monitor_token);
-    println!("  Config:        {}", config_path.display());
+    println!("  Admin Panel:  {}/admin", monitor_url);
+    println!("  Token:        {}", monitor_token);
+    println!("  Config:       {}", config_path.display());
     if monitor_binary.is_none() {
         println!("\n[!] remember to build and deploy the Remote Monitor:");
         println!("   cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor");
@@ -578,20 +582,33 @@ pub fn run_upgrade() -> Result<()> {
     if let Some(ref token) = config.monitor_token {
         evars.push(format!("monitor_token={}", token));
     }
+    if let Some(ref domain) = config.ctfd_domain {
+        if !domain.is_empty() {
+            evars.push(format!("ctfd_domain={}", domain));
+        }
+    }
 
-    let inventory = format!(
+    let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
         monitor_ip, monitor_user
     );
+    if let (Some(ref rip), Some(ref ruser)) = (&config.runner_ip, &config.runner_user) {
+        if !rip.is_empty() {
+            inventory.push_str(&format!(
+                "\n[runner]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no'\n",
+                rip, ruser
+            ));
+        }
+    }
 
     println!("\nRunning upgrade playbook...");
     run_ansible_playbook(UPGRADE_PLAYBOOK, &inventory, &evars)?;
 
     let monitor_url = format!("http://{}:{}", monitor_ip, monitor_port);
-    let monitor_token = config.monitor_token.as_deref().unwrap_or("-");
+    let upgrade_token = config.monitor_token.as_deref().unwrap_or("-");
     println!("\nUpgrade complete!");
-    println!("  Monitor URL:  {}", monitor_url);
-    println!("  Admin Panel:  {}/admin?token={}", monitor_url, monitor_token);
+    println!("  Admin Panel:  {}/admin", monitor_url);
+    println!("  Token:        {}", upgrade_token);
     Ok(())
 }
 

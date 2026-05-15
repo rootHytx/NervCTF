@@ -36,6 +36,7 @@ async fn ssh_output(target: &str, cmd: &str) -> std::io::Result<std::process::Ou
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
             target,
             cmd,
         ])

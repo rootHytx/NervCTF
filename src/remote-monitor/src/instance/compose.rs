@@ -74,45 +74,132 @@ pub async fn up(
 
     let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
 
-    // Build the per-instance override YAML.
-    let mut override_content = format!(
-        "services:\n  {svc}:\n    ports:\n      - \"{hp}:{ip}\"\n",
-        svc = svc_name,
-        hp = host_port,
-        ip = internal_port,
-    );
+    // Images were built with `-p <dir_name>`, so they are tagged `<dir_name>-<service>`.
+    // We need `image:` overrides for every such service in the per-instance override file
+    // so that Docker Compose uses the pre-built images instead of deriving a per-instance
+    // project-based name (`<project>-<service>`) that doesn't exist.
+    let challenge_dir_name = compose_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "ctf-challenge".to_string());
 
-    let flag_file_content: Option<(String, Vec<u8>)> = if flag_delivery == "file" {
-        if let (Some(flag_value), Some(container_path)) = (flag, flag_file_path) {
-            let flag_host_path = compose_dir.join(format!("{}.flag", project_name));
-            let flag_path_str = flag_host_path.display().to_string();
+    // Resolve SSH target early — needed for both the image query and the compose operations.
+    let effective_target = runner_ssh.map(|s| s.to_string()).or_else(runner_target);
 
-            let target_svc = flag_service.unwrap_or(svc_name);
-            if target_svc == svc_name {
-                override_content.push_str(&format!(
-                    "    volumes:\n      - {}:{}:ro\n",
-                    flag_path_str, container_path,
-                ));
-            } else {
-                override_content.push_str(&format!(
-                    "  {}:\n    volumes:\n      - {}:{}:ro\n",
-                    target_svc, flag_path_str, container_path,
-                ));
-            }
-            Some((flag_path_str, flag_value.as_bytes().to_vec()))
+    // Query all images on the runner/host that were pre-built for this challenge
+    // (tagged `<dir_name>-<service>`).  We only add `image:` overrides for those that
+    // actually exist, so public-image services (postgres, redis, …) are left untouched.
+    let image_prefix = format!("{}-", challenge_dir_name);
+    let pre_built_services: Vec<String> = {
+        // `docker images --format '{{.Repository}}'` lists repo names (no tag).
+        // We grep for lines starting with the challenge prefix to find all built services.
+        let img_cmd = format!(
+            "docker images --format '{{{{.Repository}}}}' | grep '^{}' | sort -u",
+            image_prefix,
+        );
+        let raw = if let Some(ref target) = effective_target {
+            ssh::output(target, &img_cmd).await.ok()
         } else {
-            None
+            tokio::process::Command::new("sh")
+                .args(["-c", &img_cmd])
+                .output()
+                .await
+                .ok()
+        };
+        raw.filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        line.trim()
+                            .strip_prefix(&image_prefix)
+                            .map(|svc| svc.to_string())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    // Determine flag file info up-front so we can embed volumes in the right service block.
+    // Returns (host_path, bytes, target_service_name, container_path).
+    let flag_info: Option<(String, Vec<u8>, String, String)> = if flag_delivery == "file" {
+        match (flag, flag_file_path) {
+            (Some(fval), Some(cpath)) => {
+                let hp = compose_dir
+                    .join(format!("{}.flag", project_name))
+                    .display()
+                    .to_string();
+                let tsvc = flag_service.unwrap_or(svc_name).to_string();
+                Some((hp, fval.as_bytes().to_vec(), tsvc, cpath.to_string()))
+            }
+            _ => None,
         }
     } else {
         None
     };
 
+    // Build the per-instance override YAML.
+    //
+    // Structure:
+    //   1. Main service (svc_name): image + ports + optional flag volume.
+    //   2. All other pre-built services: image + optional flag volume.
+    //   3. Flag-service stub if it differs from the main service and wasn't pre-built.
+    let mut override_content = String::from("services:\n");
+
+    // Helper closure — add image + optional ports/volumes for one service.
+    // (Rust closures can't mutate `override_content` from within, so we inline the logic.)
+    macro_rules! add_service {
+        ($svc:expr) => {{
+            let svc: &str = $svc;
+            override_content.push_str(&format!("  {}:\n    image: {}-{}\n", svc, challenge_dir_name, svc));
+            if svc == svc_name {
+                override_content.push_str(&format!(
+                    "    ports:\n      - \"{}:{}\"\n",
+                    host_port, internal_port
+                ));
+            }
+            if let Some((ref hp, _, ref tsvc, ref cp)) = flag_info {
+                if tsvc.as_str() == svc {
+                    override_content.push_str(&format!(
+                        "    volumes:\n      - {}:{}:ro\n",
+                        hp, cp
+                    ));
+                }
+            }
+        }};
+    }
+
+    // Main service first so any appended lines land in the right block.
+    add_service!(svc_name);
+
+    // All other pre-built services.
+    for svc in &pre_built_services {
+        if svc.as_str() == svc_name {
+            continue;
+        }
+        add_service!(svc.as_str());
+    }
+
+    // If the flag service is neither the main service nor a pre-built service,
+    // add a minimal stub that carries only the volume mount.
+    if let Some((ref hp, _, ref tsvc, ref cp)) = flag_info {
+        let tsvc_str = tsvc.as_str();
+        if tsvc_str != svc_name && !pre_built_services.iter().any(|s| s.as_str() == tsvc_str) {
+            override_content.push_str(&format!(
+                "  {}:\n    volumes:\n      - {}:{}:ro\n",
+                tsvc_str, hp, cp
+            ));
+        }
+    }
+
+    let flag_file_content: Option<(String, Vec<u8>)> =
+        flag_info.map(|(hp, bytes, _, _)| (hp, bytes));
+
     let override_path = compose_dir.join(format!("{}.override.yml", project_name));
     let compose_file_str = compose_file.to_str().unwrap();
     let override_path_str = override_path.display().to_string();
-
-    // Resolve which SSH target to use (explicit override wins).
-    let effective_target = runner_ssh.map(|s| s.to_string()).or_else(runner_target);
 
     if let Some(ref target) = effective_target {
         // ── Split-machine mode: all writes and compose commands happen on the runner ──
@@ -141,7 +228,7 @@ pub async fn up(
         let project_name_q = ssh::shell_quote(project_name);
 
         let remote_cmd = format!(
-            "cd {} && {}DOCKER_BUILDKIT=1 docker compose -f {} -f {} -p {} up -d --force-recreate",
+            "cd {} && {}DOCKER_BUILDKIT=1 docker compose -f {} -f {} -p {} up -d --no-build --force-recreate",
             compose_dir_q,
             flag_env,
             compose_file_q,
@@ -181,7 +268,7 @@ pub async fn up(
             "-f", compose_file_str,
             "-f", override_path_str.as_str(),
             "-p", project_name,
-            "up", "-d", "--force-recreate",
+            "up", "-d", "--no-build", "--force-recreate",
         ]);
         cmd.env("DOCKER_BUILDKIT", "1");
         if flag_delivery != "file" {
@@ -286,9 +373,23 @@ pub async fn down(
 pub async fn build(compose_file: &str, runner_ssh: Option<&str>) -> Result<()> {
     let effective_target = runner_ssh.map(|s| s.to_string()).or_else(runner_target);
 
+    // Derive a stable project name from the compose file's parent directory so that
+    // `docker compose build -p <name>` tags images as `<name>-<service>`, matching
+    // the `image:` reference written by `up()` into every per-instance override.
+    let project_name = Path::new(compose_file)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| "ctf-challenge".to_string());
+
     if let Some(ref target) = effective_target {
         let compose_file_q = ssh::shell_quote(compose_file);
-        let remote_cmd = format!("DOCKER_BUILDKIT=1 docker compose -f {} build", compose_file_q);
+        let project_name_q = ssh::shell_quote(&project_name);
+        let remote_cmd = format!(
+            "DOCKER_BUILDKIT=1 docker compose -f {} -p {} build",
+            compose_file_q, project_name_q,
+        );
         let out = ssh::output(target, &remote_cmd).await
             .with_context(|| "failed to ssh to runner for docker compose build")?;
         if !out.status.success() {
@@ -297,7 +398,7 @@ pub async fn build(compose_file: &str, runner_ssh: Option<&str>) -> Result<()> {
         }
     } else {
         let status = compose_cmd().await
-            .args(["-f", compose_file, "build"])
+            .args(["-f", compose_file, "-p", &project_name, "build"])
             .env("DOCKER_BUILDKIT", "1")
             .status()
             .await

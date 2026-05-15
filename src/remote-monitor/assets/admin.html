@@ -9,7 +9,6 @@
   body { font-family: monospace; background: #111; color: #ddd; margin: 0; padding: 20px; }
   h1 { color: #eee; font-size: 1.4rem; margin-bottom: 0.2rem; }
   h2 { font-size: 1.1rem; margin: 1.8rem 0 0.5rem; color: #bbb; border-bottom: 1px solid #333; padding-bottom: 4px; }
-  #token-info { font-size: 0.8rem; color: #666; margin-bottom: 0.3rem; }
   .status { font-size: 0.8rem; color: #888; margin-bottom: 0.4rem; }
   .section-hdr { display: flex; align-items: baseline; gap: 1rem; }
   .count-badge { font-size: 0.75rem; background: #333; color: #aaa; padding: 1px 6px; border-radius: 2px; }
@@ -59,26 +58,49 @@
   /* CTFd links */
   a.cl { color: #7abfff; text-decoration: none; }
   a.cl:hover { text-decoration: underline; }
+  /* Token management */
+  .token-row { display: flex; align-items: center; gap: 0.6rem; margin: 0.3rem 0; font-size: 0.82rem; }
+  .token-label { color: #ccc; flex: 1; }
+  .token-meta { color: #555; font-size: 0.75rem; }
+  .token-plaintext { background: #1a2a1a; border: 1px solid #2a4a2a; color: #7fff7f; padding: 4px 8px; font-family: monospace; width: 100%; box-sizing: border-box; margin-top: 4px; }
+  .btn-create-token { background: #1a6e3c; border: none; color: #fff; cursor: pointer; font-family: monospace; font-size: 0.82rem; padding: 3px 12px; }
+  .btn-create-token:hover { background: #2a8e4c; }
+  .btn-revoke { background: #6e1a1a; border: none; color: #ffaaaa; cursor: pointer; font-family: monospace; font-size: 0.75rem; padding: 2px 8px; }
+  .btn-revoke:hover { background: #9e2a2a; }
+  .token-form { margin: 0.5rem 0; display: none; }
+  .token-form input { background: #222; border: 1px solid #444; color: #eee; font-family: monospace; padding: 4px 8px; }
+  #tokens-section { margin-bottom: 1.2rem; }
+  .btn-logout { float: right; background: #444; border: none; color: #aaa; cursor: pointer; font-family: monospace; font-size: 0.78rem; padding: 2px 10px; margin-top: 2px; }
+  .btn-logout:hover { background: #555; color: #fff; }
   /* Toggles */
   .toggle-lbl { color: #666; cursor: pointer; user-select: none; white-space: nowrap; }
   .toggle-lbl input[type=checkbox] { cursor: pointer; accent-color: #7abfff; }
   .sep { color: #444; }
-  /* CTFd URL input */
-  #ctfd-url-input {
-    background: #1e1e1e; border: 1px solid #444; color: #aaa;
-    font-family: monospace; font-size: 0.78rem; padding: 2px 6px; width: 15rem;
-  }
-  #ctfd-url-input::placeholder { color: #555; }
 </style>
 </head>
 <body>
 
-<h1>NervCTF Monitor Admin</h1>
-<div id="token-info">Token: (loaded from ?token= param)</div>
+<h1>NervCTF Monitor Admin <button class="btn-logout" onclick="logout()">Logout</button></h1>
+
+<!-- ── Operator Tokens ─────────────────────────────────────────────────── -->
+<div id="tokens-section">
+  <div class="section-hdr">
+    <h2>Operator Tokens</h2>
+    <button class="btn-create-token" onclick="showCreateToken()">+ New Token</button>
+  </div>
+  <div id="token-create-form" class="token-form">
+    <input type="text" id="token-label-input" placeholder="Label (e.g. operator name)" maxlength="64">
+    <button class="btn-create-token" onclick="createToken()">Generate</button>
+    <button class="btn-create-token" style="background:#444" onclick="hideCreateToken()">Cancel</button>
+  </div>
+  <div id="token-new-value" style="display:none">
+    <div style="color:#aaa;font-size:.82rem;margin-top:.4rem">Token (copy now — shown only once):</div>
+    <input class="token-plaintext" id="token-new-plaintext" readonly onclick="this.select()">
+  </div>
+  <div id="tokens-list"></div>
+</div>
+
 <div class="toolbar" style="margin-bottom:0.8rem">
-  <label style="color:#666">CTFd URL:</label>
-  <input id="ctfd-url-input" type="text" placeholder="http://ctfd-host" oninput="saveCTFdUrl(this.value)">
-  <span class="sep">|</span>
   <label class="toggle-lbl"><input type="checkbox" id="links-toggle" onchange="toggleLinks(this)"> &#128279; CTFd Links</label>
 </div>
 <div class="status" id="last-refresh">Loading...</div>
@@ -164,32 +186,14 @@
 
 <script>
 (function () {
-  var token = '';
-  var match = window.location.search.match(/[?&]token=([^&]*)/);
-  if (match) {
-    token = decodeURIComponent(match[1]);
-    document.getElementById('token-info').textContent =
-      'Token: ' + (token.length > 6 ? token.slice(0, 6) + '***' : '***');
-  } else {
-    document.getElementById('token-info').textContent =
-      'No token in URL (?token=...) — API calls will fail with 401';
-  }
-
   // ── Persistent settings ───────────────────────────────────────────────────
 
-  var ctfdUrl = localStorage.getItem('ctfd_url') || '';
+  var ctfdUrl = '';
   var ctfdLinksEnabled = localStorage.getItem('ctfd_links') === '1';
   var hideSolved = localStorage.getItem('hide_solved') === '1';
 
-  document.getElementById('ctfd-url-input').value = ctfdUrl;
   document.getElementById('links-toggle').checked = ctfdLinksEnabled;
   document.getElementById('hide-solved-toggle').checked = hideSolved;
-
-  window.saveCTFdUrl = function(val) {
-    ctfdUrl = val.trim();
-    localStorage.setItem('ctfd_url', ctfdUrl);
-    rerenderAll();
-  };
 
   window.toggleLinks = function(cb) {
     ctfdLinksEnabled = cb.checked;
@@ -213,7 +217,111 @@
   // ── HTML helpers ──────────────────────────────────────────────────────────
 
   function authHeaders() {
-    return { 'Authorization': 'Token ' + token, 'Content-Type': 'application/json' };
+    return { 'Content-Type': 'application/json' };
+  }
+
+  function handleAuthError(r) {
+    if (r && (r.status === 401 || r.status === 403)) {
+      window.location.href = '/';
+      return true;
+    }
+    return false;
+  }
+
+  window.logout = function() {
+    fetch('/auth/logout', { method: 'POST', headers: authHeaders() })
+      .finally(function() { window.location.href = '/'; });
+  };
+
+  // ── Token management ──────────────────────────────────────────────────────
+
+  window.showCreateToken = function() {
+    document.getElementById('token-create-form').style.display = 'block';
+    document.getElementById('token-new-value').style.display = 'none';
+    document.getElementById('token-label-input').focus();
+  };
+
+  window.hideCreateToken = function() {
+    document.getElementById('token-create-form').style.display = 'none';
+    document.getElementById('token-new-value').style.display = 'none';
+  };
+
+  window.createToken = function() {
+    var label = document.getElementById('token-label-input').value.trim();
+    if (!label) { alert('Enter a label for the token'); return; }
+    fetch('/api/v1/admin/tokens', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ label: label })
+    }).then(function(r) {
+      if (handleAuthError(r)) return null;
+      return r.json();
+    }).then(function(d) {
+      if (!d) return;
+      document.getElementById('token-create-form').style.display = 'none';
+      document.getElementById('token-label-input').value = '';
+      var el = document.getElementById('token-new-plaintext');
+      el.value = d.token || '';
+      document.getElementById('token-new-value').style.display = 'block';
+      el.select();
+      loadTokens();
+    }).catch(function(e) { alert('Error: ' + e.message); });
+  };
+
+  window.revokeToken = function(id) {
+    if (!confirm('Revoke this token? All active sessions for this token will be invalidated.')) return;
+    fetch('/api/v1/admin/tokens/' + encodeURIComponent(id), {
+      method: 'DELETE',
+      headers: authHeaders()
+    }).then(function(r) {
+      if (handleAuthError(r)) return;
+      loadTokens();
+    }).catch(function(e) { alert('Error: ' + e.message); });
+  };
+
+  function loadTokens() {
+    fetch('/api/v1/admin/tokens', { headers: authHeaders() })
+      .then(function(r) {
+        if (handleAuthError(r)) return null;
+        return r.json();
+      })
+      .then(function(data) {
+        if (!data) return;
+        var el = document.getElementById('tokens-list');
+        while (el.firstChild) el.removeChild(el.firstChild);
+        if (!Array.isArray(data) || data.length === 0) {
+          var p = document.createElement('p');
+          p.className = 'empty';
+          p.textContent = 'No operator tokens.';
+          el.appendChild(p);
+          return;
+        }
+        data.forEach(function(t) {
+          var row = document.createElement('div');
+          row.className = 'token-row';
+
+          var lbl = document.createElement('span');
+          lbl.className = 'token-label';
+          lbl.textContent = t.label;
+          row.appendChild(lbl);
+
+          var meta = document.createElement('span');
+          meta.className = 'token-meta';
+          meta.textContent = 'created ' + t.created_at + (t.last_used_at ? ' · last used ' + t.last_used_at : '');
+          row.appendChild(meta);
+
+          var btn = document.createElement('button');
+          btn.className = 'btn-revoke';
+          btn.textContent = 'Revoke';
+          (function(id) {
+            btn.addEventListener('click', function() { revokeToken(id); });
+          }(Number(t.id)));
+          row.appendChild(btn);
+
+          el.appendChild(row);
+        });
+      })
+      .catch(function() {});
   }
 
   function escText(s) {
@@ -248,9 +356,12 @@
 
   function fetchJSON(url, cb) {
     fetch(url, { headers: authHeaders() })
-      .then(function (r) { return r.json(); })
-      .then(cb)
-      .catch(function (e) { cb(null, e); });
+      .then(function(r) {
+        if (handleAuthError(r)) return null;
+        return r.json();
+      })
+      .then(function(data) { if (data !== null) cb(data); })
+      .catch(function(e) { cb(null, e); });
   }
 
   // ── Section state ──────────────────────────────────────────────────────────
@@ -447,12 +558,16 @@
       method: 'DELETE',
       headers: authHeaders(),
       body: JSON.stringify({ challenge_name: challengeName, team_id: teamId }),
-    }).then(function (r) { return r.json(); })
-      .then(function (d) {
+    }).then(function(r) {
+        if (handleAuthError(r)) return null;
+        return r.json();
+      })
+      .then(function(d) {
+        if (!d) return;
         if (d.ok) { loadInstances(); }
         else { alert('Error: ' + (d.error || JSON.stringify(d))); }
       })
-      .catch(function (e) { alert('Network error: ' + e.message); });
+      .catch(function(e) { alert('Network error: ' + e.message); });
   };
 
   window.stopAll = function() {
@@ -480,6 +595,7 @@
         headers: authHeaders(),
         body: JSON.stringify({ challenge_name: name }),
       })
+        .then(function(r) { handleAuthError(r); })
         .catch(function () {})
         .finally(function () {
           remaining--;
@@ -579,10 +695,23 @@
 
   // ── Boot ───────────────────────────────────────────────────────────────────
 
-  loadAlerts();
-  loadInstances();
-  loadSolves();
-  loadAttempts();
+  // Fetch CTFd URL from monitor config before loading data that uses it for links.
+  fetch('/api/v1/admin/config', { headers: authHeaders() })
+    .then(function(r) {
+      if (handleAuthError(r)) return null;
+      return r.json();
+    })
+    .then(function(cfg) {
+      if (cfg && cfg.ctfd_url) ctfdUrl = cfg.ctfd_url;
+    })
+    .catch(function() {})
+    .finally(function() {
+      loadTokens();
+      loadAlerts();
+      loadInstances();
+      loadSolves();
+      loadAttempts();
+    });
 
   setInterval(loadAlerts,    15000);
   setInterval(loadInstances, 15000);

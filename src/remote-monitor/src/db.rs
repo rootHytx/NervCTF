@@ -89,10 +89,26 @@ fn init_schema(conn: &Connection) -> Result<()> {
             team_id INTEGER
         );
 
+        CREATE TABLE IF NOT EXISTS operator_tokens (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            label        TEXT NOT NULL,
+            token_hash   TEXT NOT NULL UNIQUE,
+            created_at   TEXT DEFAULT (datetime('now')),
+            last_used_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id  TEXT PRIMARY KEY,
+            operator_id INTEGER NOT NULL REFERENCES operator_tokens(id) ON DELETE CASCADE,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_instances_status_expires ON instances(status, expires_at);
         CREATE INDEX IF NOT EXISTS idx_instances_team ON instances(team_id, status);
         CREATE INDEX IF NOT EXISTS idx_team_flags_lookup ON team_flags(challenge_name, flag);
         CREATE INDEX IF NOT EXISTS idx_flag_attempts_challenge ON flag_attempts(challenge_name, team_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
         "#,
     )?;
     // Migrations for existing databases.
@@ -123,6 +139,23 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO team_flags (challenge_name, team_id, flag)
          SELECT challenge_name, team_id, flag FROM instances WHERE flag IS NOT NULL",
         [],
+    );
+    // Migrations for operator auth tables.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS operator_tokens (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            label        TEXT NOT NULL,
+            token_hash   TEXT NOT NULL UNIQUE,
+            created_at   TEXT DEFAULT (datetime('now')),
+            last_used_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id  TEXT PRIMARY KEY,
+            operator_id INTEGER NOT NULL REFERENCES operator_tokens(id) ON DELETE CASCADE,
+            created_at  TEXT DEFAULT (datetime('now')),
+            expires_at  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);"
     );
     Ok(())
 }
@@ -415,7 +448,7 @@ pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64
     let mut stmt = conn.prepare(
         "SELECT challenge_name, container_id, team_id, ctfd_flag_id FROM instances \
          WHERE (expires_at < datetime('now') AND status = 'running') \
-            OR (status = 'provisioning' AND expires_at < datetime('now', '+30 minutes'))",
+            OR (status = 'provisioning' AND created_at < datetime('now', '-30 minutes'))",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -748,4 +781,110 @@ pub fn delete_all_instances_for_challenge(db: &Db, challenge_name: &str) -> Resu
     )?;
     tx.commit()?;
     Ok(pairs)
+}
+
+// ── Operator tokens ───────────────────────────────────────────────────────────
+
+pub fn count_operator_tokens(db: &Db) -> Result<i64> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM operator_tokens", [], |r| r.get(0))?;
+    Ok(n)
+}
+
+pub fn insert_operator_token(db: &Db, label: &str, token_hash: &str) -> Result<i64> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute(
+        "INSERT INTO operator_tokens (label, token_hash) VALUES (?1, ?2)",
+        params![label, token_hash],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// INSERT OR IGNORE version for bootstrap: returns true if a new row was inserted.
+pub fn insert_operator_token_ignore(db: &Db, label: &str, token_hash: &str) -> Result<bool> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n = conn.execute(
+        "INSERT OR IGNORE INTO operator_tokens (label, token_hash) VALUES (?1, ?2)",
+        params![label, token_hash],
+    )?;
+    Ok(n > 0)
+}
+
+/// Returns the operator row id if the hash matches an existing token, else None.
+pub fn validate_token_hash(db: &Db, token_hash: &str) -> Result<Option<i64>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let result = conn.query_row(
+        "SELECT id FROM operator_tokens WHERE token_hash = ?1",
+        params![token_hash],
+        |row| row.get::<_, i64>(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn list_operator_tokens(db: &Db) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, label, created_at, last_used_at FROM operator_tokens ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "label": row.get::<_, String>(1)?,
+            "created_at": row.get::<_, String>(2)?,
+            "last_used_at": row.get::<_, Option<String>>(3)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows { result.push(r?); }
+    Ok(result)
+}
+
+/// Delete the token and all its sessions (cascades via FK). Returns true if a row was deleted.
+pub fn revoke_operator_token(db: &Db, id: i64) -> Result<bool> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n = conn.execute("DELETE FROM operator_tokens WHERE id = ?1", params![id])?;
+    Ok(n > 0)
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────────
+
+pub fn create_session(db: &Db, session_id: &str, operator_id: i64, expires_at: &str) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute(
+        "INSERT INTO sessions (session_id, operator_id, expires_at) VALUES (?1, ?2, ?3)",
+        params![session_id, operator_id, expires_at],
+    )?;
+    Ok(())
+}
+
+/// Returns the operator_id if the session exists and has not expired, else None.
+pub fn validate_session(db: &Db, session_id: &str) -> Result<Option<i64>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let result = conn.query_row(
+        "SELECT operator_id FROM sessions WHERE session_id = ?1 AND expires_at > datetime('now')",
+        params![session_id],
+        |row| row.get::<_, i64>(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn delete_session(db: &Db, session_id: &str) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn purge_expired_sessions(db: &Db) -> Result<usize> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let n = conn.execute("DELETE FROM sessions WHERE expires_at <= datetime('now')", [])?;
+    Ok(n)
 }

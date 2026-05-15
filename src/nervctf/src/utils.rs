@@ -35,6 +35,9 @@ pub struct Config {
     pub max_concurrent_provisions: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_instances_per_team: Option<u32>,
+    // Override the CTFd domain used in admin dashboard links (defaults to monitor host).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctfd_domain: Option<String>,
 
     // Split-machine mode: separate host for running challenge containers
     #[serde(skip_serializing_if = "Option::is_none")]

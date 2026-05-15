@@ -12,6 +12,7 @@ pub async fn output(target: &str, cmd: &str) -> std::io::Result<std::process::Ou
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
             target,
             cmd,
         ])
@@ -26,6 +27,7 @@ pub async fn status(target: &str, cmd: &str) -> std::io::Result<std::process::Ex
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
             target,
             cmd,
         ])
@@ -51,6 +53,7 @@ pub async fn write_file(target: &str, remote_path: &str, content: &[u8]) -> Resu
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
             target,
             &format!("mkdir -p {} && cat > {}", parent_q, path_q),
         ])

@@ -44,17 +44,18 @@ mod db;
 mod instance;
 
 use anyhow::Result;
-use subtle::ConstantTimeEq;
+use sha2::{Digest, Sha256};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use bytes::Bytes;
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -65,7 +66,6 @@ use db::Db;
 
 #[derive(Clone)]
 struct AppState {
-    monitor_token: String,
     public_host: String,
     db: Db,
     ctfd_pool: mysql_async::Pool,
@@ -74,6 +74,9 @@ struct AppState {
     challenges_base_dir: String,
     /// Path to CTFd uploads directory for file writes (empty string if not set).
     ctfd_uploads_dir: String,
+    /// CTFd base URL used in admin dashboard links (e.g. http://ctfd-host).
+    /// Defaults to http://{public_host} if CTFD_DOMAIN is not set.
+    ctfd_url: String,
     /// SSH target for split-machine mode, e.g. `docker@192.168.1.50`.
     /// When set, all Docker/compose commands are executed on the runner via SSH
     /// instead of the local Docker daemon.
@@ -95,7 +98,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let monitor_token = env::var("MONITOR_TOKEN").expect("MONITOR_TOKEN is required");
+    let monitor_token_env = env::var("MONITOR_TOKEN").ok();
     let public_host = env::var("PUBLIC_HOST").expect("PUBLIC_HOST is required");
     let port = env::var("MONITOR_PORT").unwrap_or_else(|_| "33133".to_string());
     let bind = env::var("MONITOR_BIND").unwrap_or_else(|_| "0.0.0.0".to_string());
@@ -103,6 +106,8 @@ async fn main() -> Result<()> {
     let challenges_base_dir = env::var("CHALLENGES_BASE_DIR")
         .unwrap_or_else(|_| "/opt/nervctf/challenges".to_string());
     let ctfd_uploads_dir = env::var("CTFD_UPLOADS_DIR").unwrap_or_default();
+    let ctfd_url = env::var("CTFD_DOMAIN")
+        .unwrap_or_else(|_| format!("http://{}", public_host));
 
     // Split-machine mode: parse RUNNER_SSH_TARGET (e.g. "docker@192.168.1.50")
     // or fall back to extracting the target from DOCKER_HOST=ssh://user@host.
@@ -117,6 +122,24 @@ async fn main() -> Result<()> {
     let ctfd_db_url = env::var("CTFD_DB_URL").expect("CTFD_DB_URL is required");
 
     let db = db::open(&db_path)?;
+
+    // Bootstrap: on every startup, try to insert MONITOR_TOKEN (hashed) with INSERT OR IGNORE.
+    // The UNIQUE constraint on token_hash makes this a no-op if already present, so a
+    // re-deploy with the same token is safe. A re-deploy with a new token adds it alongside
+    // any operator tokens that already exist.
+    if let Some(ref raw) = monitor_token_env {
+        let hash = hash_token(raw);
+        match db::insert_operator_token_ignore(&db, "bootstrap", &hash) {
+            Ok(true)  => info!("Bootstrapped operator token from MONITOR_TOKEN env var"),
+            Ok(false) => {}
+            Err(e)    => warn!("Failed to bootstrap operator token: {}", e),
+        }
+    }
+    match db::count_operator_tokens(&db) {
+        Ok(0) => warn!("No operator tokens in DB — admin panel is inaccessible until a token is added"),
+        _ => {}
+    }
+
     let ctfd_pool = ctfd_db::create_pool(&ctfd_db_url)?;
 
     let max_concurrent_provisions: usize = env::var("MAX_CONCURRENT_PROVISIONS")
@@ -130,12 +153,12 @@ async fn main() -> Result<()> {
     }
 
     let state = Arc::new(AppState {
-        monitor_token,
         public_host,
         db: db.clone(),
         ctfd_pool,
         challenges_base_dir,
         ctfd_uploads_dir,
+        ctfd_url,
         runner_ssh_target,
         provision_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_provisions)),
         max_instances_per_team,
@@ -204,6 +227,9 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health_handler))
+        .route("/", get(login_page_handler))
+        .route("/auth/login", post(auth_login_handler))
+        .route("/auth/logout", post(auth_logout_handler))
         .route("/admin", get(admin_dashboard_handler))
         .route("/instance/:name", get(instance_page_handler))
         .route("/api/v1/diff", get(diff_handler).post(diff_handler).patch(diff_handler).delete(diff_handler))
@@ -234,6 +260,9 @@ async fn main() -> Result<()> {
         .route("/api/v1/admin/instances", get(admin_instances_handler))
         .route("/api/v1/admin/attempts", get(admin_attempts_handler))
         .route("/api/v1/admin/solves", get(admin_solves_handler))
+        .route("/api/v1/admin/config", get(admin_config_handler))
+        .route("/api/v1/admin/tokens", get(list_tokens_handler).post(create_token_handler))
+        .route("/api/v1/admin/tokens/:id", delete(revoke_token_handler))
         // Plugin routes (monitor token + explicit team_id) — used by CTFd plugin
         .route("/api/v1/plugin/info", get(plugin_info_handler))
         .route("/api/v1/plugin/request", post(plugin_request_handler))
@@ -258,13 +287,71 @@ async fn main() -> Result<()> {
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
-fn check_monitor_auth(headers: &HeaderMap, expected_token: &str) -> bool {
+fn hash_token(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Token "))
-        .map(|t| t.as_bytes().ct_eq(expected_token.as_bytes()).into())
-        .unwrap_or(false)
+}
+
+fn extract_session_cookie(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.split(';').find_map(|part| {
+                part.trim()
+                    .strip_prefix("nervctf_session=")
+                    .map(|v| v.to_string())
+            })
+        })
+}
+
+/// Check Authorization: Token header against hashed DB entries.
+async fn check_monitor_auth(headers: &HeaderMap, db: &Db) -> bool {
+    let token = match extract_bearer(headers) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return false,
+    };
+    let hash = hash_token(&token);
+    let db = Arc::clone(db);
+    tokio::task::spawn_blocking(move || db::validate_token_hash(&db, &hash))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .is_some()
+}
+
+/// Check nervctf_session cookie against active DB sessions.
+async fn check_session_auth(headers: &HeaderMap, db: &Db) -> bool {
+    let session_id = match extract_session_cookie(headers) {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    let db = Arc::clone(db);
+    tokio::task::spawn_blocking(move || db::validate_session(&db, &session_id))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .is_some()
+}
+
+/// Accept either Authorization: Token header or session cookie.
+async fn check_any_auth(headers: &HeaderMap, db: &Db) -> bool {
+    check_monitor_auth(headers, db).await || check_session_auth(headers, db).await
+}
+
+fn session_expires_at() -> String {
+    instance::expires_at_string(60 * 24)
 }
 
 /// Validate a CTFd user token and return team_id via direct MariaDB lookup.
@@ -273,13 +360,6 @@ async fn validate_ctfd_token(
     token: &str,
 ) -> Option<i64> {
     ctfd_db::validate_token(pool, token).await
-}
-
-fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Token "))
 }
 
 // ── Basic handlers ────────────────────────────────────────────────────────────
@@ -475,7 +555,7 @@ async fn instance_register_handler(
     headers: HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::upsert_config(&state.db, &body.challenge_name, body.ctfd_id, &body.backend, &body.config_json) {
@@ -490,7 +570,7 @@ async fn instance_list_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::list_configs(&state.db) {
@@ -506,7 +586,7 @@ async fn instance_build_handler(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
@@ -563,7 +643,7 @@ async fn build_compose_handler(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
@@ -621,11 +701,14 @@ async fn build_compose_handler(
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
         }
 
-        // Wipe + create dir, extract tar, and build — all on the runner in one SSH session
+        // Wipe + create dir, extract tar, and build — all on the runner in one SSH session.
+        // -p pins the project name to the challenge directory basename so built images are
+        // tagged <sanitized>-<service>, matching the image: reference in compose::up overrides.
         let remote_cmd = format!(
-            "rm -rf '{dir}' && mkdir -p '{dir}' && tar -xzf - -C '{dir}' && DOCKER_BUILDKIT=1 docker compose -f '{compose}' build",
+            "rm -rf '{dir}' && mkdir -p '{dir}' && tar -xzf - -C '{dir}' && DOCKER_BUILDKIT=1 docker compose -f '{compose}' -p '{project}' build",
             dir = extract_dir,
             compose = compose_path,
+            project = sanitized,
         );
 
         let extract_out = tokio::process::Command::new("ssh")
@@ -735,7 +818,7 @@ async fn build_compose_remote_handler(
     headers: HeaderMap,
     Json(body): Json<BuildComposeRemoteBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
@@ -1039,7 +1122,7 @@ async fn plugin_info_handler(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     let challenge_name = match params.get("challenge_name") {
@@ -1071,7 +1154,7 @@ async fn plugin_request_handler(
     headers: HeaderMap,
     Json(body): Json<PluginTeamBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         warn!("plugin_request: unauthorized");
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
@@ -1200,7 +1283,7 @@ async fn plugin_renew_handler(
     headers: HeaderMap,
     Json(body): Json<PluginTeamBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
@@ -1244,7 +1327,7 @@ async fn plugin_stop_handler(
     headers: HeaderMap,
     Json(body): Json<PluginTeamBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
@@ -1283,7 +1366,7 @@ async fn plugin_solve_handler(
     headers: HeaderMap,
     Json(body): Json<PluginSolveBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::mark_instance_solved(&state.db, &body.challenge_name, body.team_id) {
@@ -1323,7 +1406,7 @@ async fn plugin_stop_all_handler(
     headers: HeaderMap,
     Json(body): Json<ChallengeNameOnlyBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     match db::delete_all_instances_for_challenge(&state.db, &body.challenge_name) {
@@ -1364,7 +1447,7 @@ async fn plugin_attempt_handler(
     headers: HeaderMap,
     Json(body): Json<PluginAttemptBody>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
@@ -1402,21 +1485,10 @@ async fn plugin_attempt_handler(
 async fn admin_dashboard_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    // Accept token via ?token= query param or Authorization: Token <x> header
-    let token_from_query = params.get("token").map(|s| s.as_str()).unwrap_or("");
-    let query_token_valid: bool = token_from_query.as_bytes().ct_eq(state.monitor_token.as_bytes()).into();
-    if query_token_valid && !token_from_query.is_empty() {
-        eprintln!("warning: passing monitor token via URL query parameter is deprecated; use Authorization header instead");
+    if !check_session_auth(&headers, &state.db).await {
+        return Redirect::to("/").into_response();
     }
-    let authed = query_token_valid && !token_from_query.is_empty()
-        || check_monitor_auth(&headers, &state.monitor_token);
-
-    if !authed {
-        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
-    }
-
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -1424,11 +1496,203 @@ async fn admin_dashboard_handler(
     ).into_response()
 }
 
+// ── Login page ────────────────────────────────────────────────────────────────
+
+const LOGIN_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NervCTF Monitor</title>
+  <style>
+    body{font-family:monospace;max-width:420px;margin:100px auto;padding:20px;background:#111;color:#eee}
+    h1{font-size:1.4rem;margin-bottom:1.5rem}
+    label{display:block;margin-top:1rem;font-size:.85rem;color:#aaa}
+    input[type=password]{width:100%;padding:8px;background:#222;border:1px solid #444;color:#eee;font-family:monospace;box-sizing:border-box;margin-top:4px}
+    button{margin-top:1.2rem;padding:8px 20px;background:#1a6e3c;border:none;color:#fff;cursor:pointer;font-family:monospace;width:100%;font-size:1rem}
+    button:hover{background:#2a8e4c}
+    #msg{margin-top:.8rem;color:#ff6b6b;font-size:.85rem;min-height:1rem}
+  </style>
+</head>
+<body>
+  <h1>NervCTF Monitor</h1>
+  <form id="form">
+    <label for="tok">Operator Token</label>
+    <input type="password" id="tok" autocomplete="current-password" placeholder="Enter your operator token">
+    <button type="submit">Login</button>
+  </form>
+  <div id="msg"></div>
+  <script>
+    document.getElementById('form').addEventListener('submit', async function(e) {
+      e.preventDefault();
+      var r = await fetch('/auth/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({token: document.getElementById('tok').value})
+      });
+      if (r.ok) { window.location.href = '/admin'; }
+      else {
+        var j = await r.json().catch(function(){return{};});
+        document.getElementById('msg').textContent = j.error || 'Login failed';
+      }
+    });
+  </script>
+</body>
+</html>"#;
+
+async fn login_page_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        LOGIN_HTML,
+    )
+}
+
+// ── Auth: login / logout ──────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoginBody {
+    token: String,
+}
+
+async fn auth_login_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoginBody>,
+) -> impl IntoResponse {
+    if body.token.is_empty() {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Token required"}))).into_response();
+    }
+    let hash = hash_token(&body.token);
+    let db = Arc::clone(&state.db);
+    let op_id = match tokio::task::spawn_blocking(move || db::validate_token_hash(&db, &hash)).await {
+        Ok(Ok(Some(id))) => id,
+        _ => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Invalid token"}))).into_response(),
+    };
+    let session_id: String = rand::thread_rng()
+        .sample_iter(rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let expires_at = session_expires_at();
+    let db2 = Arc::clone(&state.db);
+    let sid = session_id.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || db::create_session(&db2, &sid, op_id, &expires_at))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("spawn: {}", e)))
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
+    }
+    let cookie = format!("nervctf_session={}; HttpOnly; Path=/; SameSite=Strict; Max-Age=86400", session_id);
+    (
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(json!({"ok": true})),
+    ).into_response()
+}
+
+async fn auth_logout_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Some(session_id) = extract_session_cookie(&headers) {
+        let db = Arc::clone(&state.db);
+        let _ = tokio::task::spawn_blocking(move || db::delete_session(&db, &session_id)).await;
+    }
+    let cookie = "nervctf_session=; HttpOnly; Path=/; SameSite=Strict; Max-Age=0".to_string();
+    (
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(json!({"ok": true})),
+    ).into_response()
+}
+
+// ── Admin: token management ───────────────────────────────────────────────────
+
+async fn list_tokens_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db::list_operator_tokens(&db)).await {
+        Ok(Ok(tokens)) => Json(json!(tokens)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateTokenBody {
+    label: String,
+}
+
+async fn create_token_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CreateTokenBody>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    let label = body.label.trim().to_string();
+    if label.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "label is required"}))).into_response();
+    }
+    let plaintext: String = rand::thread_rng()
+        .sample_iter(rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+    let hash = hash_token(&plaintext);
+    let db = Arc::clone(&state.db);
+    let lbl = label.clone();
+    match tokio::task::spawn_blocking(move || db::insert_operator_token(&db, &lbl, &hash)).await {
+        Ok(Ok(id)) => (StatusCode::OK, Json(json!({
+            "id": id,
+            "label": label,
+            "token": plaintext,
+        }))).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn revoke_token_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db::revoke_operator_token(&db, id)).await {
+        Ok(Ok(true))  => Json(json!({"ok": true})).into_response(),
+        Ok(Ok(false)) => (StatusCode::NOT_FOUND, Json(json!({"error": "Token not found"}))).into_response(),
+        Ok(Err(e))    => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e)        => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+// ── Admin: dashboard data endpoints ──────────────────────────────────────────
+
+async fn admin_config_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
+    }
+    Json(json!({ "ctfd_url": state.ctfd_url })).into_response()
+}
+
 async fn admin_instances_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     let db = Arc::clone(&state.db);
@@ -1444,7 +1708,7 @@ async fn admin_attempts_handler(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     let alerts_only = params.get("alerts_only").map(|v| v == "true").unwrap_or(false);
@@ -1463,7 +1727,7 @@ async fn admin_solves_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     let db = Arc::clone(&state.db);
@@ -1481,7 +1745,7 @@ async fn diff_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
@@ -1570,7 +1834,7 @@ async fn ctfd_challenges_list(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::list_challenges_full(&state.ctfd_pool).await {
@@ -1584,7 +1848,7 @@ async fn ctfd_challenge_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::create_challenge(&state.ctfd_pool, &body).await {
@@ -1598,7 +1862,7 @@ async fn ctfd_challenge_get(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::get_challenge_full(&state.ctfd_pool, id).await {
@@ -1614,7 +1878,7 @@ async fn ctfd_challenge_update(
     Path(id): Path<i64>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::update_challenge(&state.ctfd_pool, id, &body).await {
@@ -1628,7 +1892,7 @@ async fn ctfd_challenge_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::delete_challenge(&state.ctfd_pool, id).await {
@@ -1649,7 +1913,7 @@ async fn ctfd_flags_list(
     headers: HeaderMap,
     Query(params): Query<ChallengeIdQuery>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     let cid = match params.challenge_id {
@@ -1667,7 +1931,7 @@ async fn ctfd_flag_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::create_flag_full(&state.ctfd_pool, &body).await {
@@ -1681,7 +1945,7 @@ async fn ctfd_flag_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::delete_flag_by_id(&state.ctfd_pool, id).await {
@@ -1697,7 +1961,7 @@ async fn ctfd_hints_list(
     headers: HeaderMap,
     Query(params): Query<ChallengeIdQuery>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     let cid = match params.challenge_id {
@@ -1715,7 +1979,7 @@ async fn ctfd_hint_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::create_hint(&state.ctfd_pool, &body).await {
@@ -1729,7 +1993,7 @@ async fn ctfd_hint_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::delete_hint(&state.ctfd_pool, id).await {
@@ -1745,7 +2009,7 @@ async fn ctfd_tags_list(
     headers: HeaderMap,
     Query(params): Query<ChallengeIdQuery>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     let cid = match params.challenge_id {
@@ -1763,7 +2027,7 @@ async fn ctfd_tag_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::create_tag(&state.ctfd_pool, &body).await {
@@ -1777,7 +2041,7 @@ async fn ctfd_tag_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::delete_tag(&state.ctfd_pool, id).await {
@@ -1793,7 +2057,7 @@ async fn ctfd_files_list(
     headers: HeaderMap,
     Query(params): Query<ChallengeIdQuery>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     let cid = match params.challenge_id {
@@ -1811,7 +2075,7 @@ async fn ctfd_files_upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
 
@@ -1882,7 +2146,7 @@ async fn ctfd_file_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::delete_file_record(&state.ctfd_pool, id).await {
@@ -1908,7 +2172,7 @@ async fn ctfd_topics_list(
     headers: HeaderMap,
     Query(params): Query<ChallengeIdQuery>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     let cid = match params.challenge_id {
@@ -1926,7 +2190,7 @@ async fn ctfd_topic_create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::create_topic(&state.ctfd_pool, &body).await {
@@ -1940,7 +2204,7 @@ async fn ctfd_topic_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if !check_monitor_auth(&headers, &state.monitor_token) {
+    if !check_any_auth(&headers, &state.db).await {
         return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
     }
     match ctfd_db::delete_topic(&state.ctfd_pool, id).await {
@@ -1956,51 +2220,73 @@ mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderValue};
 
-    fn make_headers(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "authorization",
-            HeaderValue::from_str(value).unwrap(),
-        );
-        headers
+    fn bearer_headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    fn cookie_headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("cookie", HeaderValue::from_str(value).unwrap());
+        h
     }
 
     #[test]
-    fn check_monitor_auth_valid_token() {
-        let headers = make_headers("Token secret123");
-        assert!(check_monitor_auth(&headers, "secret123"));
+    fn hash_token_deterministic() {
+        let h1 = hash_token("secret123");
+        let h2 = hash_token("secret123");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64); // SHA-256 → 64 hex chars
     }
 
     #[test]
-    fn check_monitor_auth_wrong_token() {
-        let headers = make_headers("Token wrongtoken");
-        assert!(!check_monitor_auth(&headers, "secret123"));
+    fn hash_token_different_inputs_differ() {
+        assert_ne!(hash_token("secret123"), hash_token("wrongtoken"));
     }
 
     #[test]
-    fn check_monitor_auth_missing_header() {
-        let headers = HeaderMap::new();
-        assert!(!check_monitor_auth(&headers, "secret123"));
+    fn hash_token_empty_input() {
+        assert_ne!(hash_token(""), hash_token("notempty"));
     }
 
     #[test]
-    fn check_monitor_auth_wrong_scheme() {
-        // "Bearer" instead of "Token" should fail
-        let headers = make_headers("Bearer secret123");
-        assert!(!check_monitor_auth(&headers, "secret123"));
+    fn extract_bearer_valid() {
+        let headers = bearer_headers("Token secret123");
+        assert_eq!(extract_bearer(&headers), Some("secret123"));
     }
 
     #[test]
-    fn check_monitor_auth_empty_token() {
-        let headers = make_headers("Token ");
-        // An empty submitted token should not match a non-empty expected token
-        assert!(!check_monitor_auth(&headers, "secret123"));
+    fn extract_bearer_wrong_scheme() {
+        let headers = bearer_headers("Bearer secret123");
+        assert_eq!(extract_bearer(&headers), None);
     }
 
     #[test]
-    fn check_monitor_auth_constant_time_empty_expected() {
-        // Even if expected is empty, a non-empty submission should fail
-        let headers = make_headers("Token notempty");
-        assert!(!check_monitor_auth(&headers, ""));
+    fn extract_bearer_missing() {
+        assert_eq!(extract_bearer(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn extract_session_cookie_present() {
+        let headers = cookie_headers("nervctf_session=abc123; other=val");
+        assert_eq!(extract_session_cookie(&headers), Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn extract_session_cookie_only_session() {
+        let headers = cookie_headers("nervctf_session=xyz");
+        assert_eq!(extract_session_cookie(&headers), Some("xyz".to_string()));
+    }
+
+    #[test]
+    fn extract_session_cookie_missing() {
+        assert_eq!(extract_session_cookie(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn extract_session_cookie_wrong_name() {
+        let headers = cookie_headers("other=val");
+        assert_eq!(extract_session_cookie(&headers), None);
     }
 }

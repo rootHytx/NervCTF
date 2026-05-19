@@ -7,6 +7,8 @@ use anyhow::{anyhow, Result};
 use rand::Rng;
 use tokio::io::AsyncWriteExt as _;
 
+use super::ssh;
+
 /// Find a free TCP port in the ephemeral range, avoiding ports already used by running instances.
 ///
 /// Port availability is checked against the DB, not via bind(), because the monitor runs inside
@@ -27,6 +29,36 @@ pub fn pick_free_port(used_ports: &std::collections::HashSet<u16>) -> Result<u16
         }
     }
     Err(anyhow!("No free ports available in range 40000-60000"))
+}
+
+/// Returns the names of all currently running Docker containers.
+///
+/// Uses `{{.Names}}` format so callers can match against the container name stored
+/// in the DB (which is the `--name` value passed to `docker run`, not the hex ID).
+///
+/// Returns `None` if the query fails so the caller can skip cleanup rather than
+/// risk false-positive deletions due to a transient SSH/Docker error.
+pub async fn list_running_container_names(runner_ssh: Option<&str>) -> Option<std::collections::HashSet<String>> {
+    let cmd = "docker ps --format '{{.Names}}'";
+    let output = if let Some(target) = runner_ssh {
+        ssh::output(target, cmd).await.ok()?
+    } else {
+        tokio::process::Command::new("sh")
+            .args(["-c", cmd])
+            .output()
+            .await
+            .ok()?
+    };
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    )
 }
 
 /// Run `ssh -o ... <target> <cmd>` and return the output.

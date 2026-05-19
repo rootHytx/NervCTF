@@ -272,6 +272,15 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                         "not set (CTFd will default to 0)",
                     ));
                 }
+                if let Some(df) = &extra.decay_function {
+                    if !matches!(df.as_str(), "linear" | "logarithmic") {
+                        issues.push(Issue::error(
+                            name,
+                            "extra.decay_function",
+                            format!("must be 'linear' or 'logarithmic', got '{}'", df),
+                        ));
+                    }
+                }
             }
         },
         ChallengeType::Instance => {
@@ -285,16 +294,47 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                     if inst.internal_port == 0 {
                         issues.push(Issue::error(name, "instance.internal_port", "must be > 0"));
                     }
+                    if inst.internal_port > 65535 {
+                        issues.push(Issue::error(name, "instance.internal_port", "must be a valid port (1-65535)"));
+                    }
                     if inst.connection.trim().is_empty() {
                         issues.push(Issue::error(name, "instance.connection", "required (e.g. 'nc', 'http', 'ssh')"));
+                    }
+                    // timeout_minutes: 0 means instances would expire instantly
+                    if inst.timeout_minutes == Some(0) {
+                        issues.push(Issue::warn(name, "instance.timeout_minutes", "set to 0 — instances will expire immediately; omit to allow no timeout"));
+                    }
+                    // random_flag_length: 0 would produce an empty flag
+                    if inst.random_flag_length == Some(0) {
+                        issues.push(Issue::warn(name, "instance.random_flag_length", "set to 0 — flag will be empty; use a positive value (e.g. 16)"));
                     }
                     // Backend-specific required fields
                     match inst.backend {
                         crate::ctfd_api::models::InstanceBackend::Docker => {
-                            if inst.image.as_deref().unwrap_or("").trim().is_empty() {
+                            let img = inst.image.as_deref().unwrap_or("").trim();
+                            if img.is_empty() {
                                 issues.push(Issue::error(
                                     name, "instance.image",
-                                    "required for docker backend — docker image name or build path",
+                                    "required for docker backend — registry image (e.g. 'nginx') or local build path (e.g. '.')",
+                                ));
+                            } else if img.starts_with('.') || img.starts_with('/') {
+                                // Local build path: check Dockerfile exists
+                                let dockerfile = Path::new(&c.source_path).join(img).join("Dockerfile");
+                                if !dockerfile.exists() {
+                                    issues.push(Issue::warn(
+                                        name, "instance.image",
+                                        format!("local path '{}' has no Dockerfile at {}", img, dockerfile.display()),
+                                    ));
+                                }
+                            }
+                        }
+                        crate::ctfd_api::models::InstanceBackend::Compose => {
+                            let cf = inst.compose_file.as_deref().unwrap_or("docker-compose.yml");
+                            let cf_path = Path::new(&c.source_path).join(cf);
+                            if !cf_path.exists() {
+                                issues.push(Issue::warn(
+                                    name, "instance.compose_file",
+                                    format!("'{}' not found at {}", cf, cf_path.display()),
                                 ));
                             }
                         }
@@ -314,9 +354,6 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                                 ));
                             }
                         }
-                        crate::ctfd_api::models::InstanceBackend::Compose => {
-                            // compose_file defaults to docker-compose.yml; no strict requirement
-                        }
                     }
                     // Flag requirements
                     let is_random = matches!(inst.flag_mode, Some(InstanceFlagMode::Random));
@@ -327,14 +364,32 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                         ));
                     }
                     // flag_delivery: file requires flag_file_path
-                    if matches!(inst.flag_delivery, Some(crate::ctfd_api::models::FlagDelivery::File))
-                        && inst.flag_file_path.is_none()
-                    {
-                        issues.push(Issue::error(
-                            name,
-                            "instance.flag_file_path",
-                            "required when flag_delivery: file — absolute path inside the container",
-                        ));
+                    if matches!(inst.flag_delivery, Some(crate::ctfd_api::models::FlagDelivery::File)) {
+                        match &inst.flag_file_path {
+                            None => issues.push(Issue::error(
+                                name,
+                                "instance.flag_file_path",
+                                "required when flag_delivery: file — absolute path inside the container",
+                            )),
+                            Some(p) if !p.starts_with('/') => issues.push(Issue::warn(
+                                name,
+                                "instance.flag_file_path",
+                                format!("'{}' is not an absolute path — should start with '/'", p),
+                            )),
+                            _ => {}
+                        }
+                    }
+                    // flag_prefix/suffix only apply to random mode
+                    if !is_random {
+                        if inst.flag_prefix.is_some() {
+                            issues.push(Issue::warn(name, "instance.flag_prefix", "only used with flag_mode: random — has no effect for static flags"));
+                        }
+                        if inst.flag_suffix.is_some() {
+                            issues.push(Issue::warn(name, "instance.flag_suffix", "only used with flag_mode: random — has no effect for static flags"));
+                        }
+                        if inst.random_flag_length.is_some() {
+                            issues.push(Issue::warn(name, "instance.random_flag_length", "only used with flag_mode: random — has no effect for static flags"));
+                        }
                     }
                 }
             }
@@ -345,6 +400,15 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                 }
                 if let Some(0) = extra.decay {
                     issues.push(Issue::error(name, "extra.decay", "must be > 0"));
+                }
+                if let Some(df) = &extra.decay_function {
+                    if !matches!(df.as_str(), "linear" | "logarithmic") {
+                        issues.push(Issue::error(
+                            name,
+                            "extra.decay_function",
+                            format!("must be 'linear' or 'logarithmic', got '{}'", df),
+                        ));
+                    }
                 }
             }
         }
@@ -362,6 +426,11 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
         _ => {}
     }
 
+    // attempts: 0 is almost certainly a mistake (means unlimited — same as omitting it)
+    if c.attempts == Some(0) {
+        issues.push(Issue::warn(name, "attempts", "set to 0 — this means unlimited attempts, same as omitting the field"));
+    }
+
     // Instance challenges with flag_mode=random auto-generate flags at runtime,
     // so `flags:` is not required for those.
     let is_random_instance = c.challenge_type == ChallengeType::Instance
@@ -377,6 +446,7 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
     if !skip_flags_check && flags.is_empty() {
         issues.push(Issue::error(name, "flags", "no flags defined"));
     } else if !skip_flags_check {
+        let mut seen_flag_content: HashSet<&str> = HashSet::new();
         for (i, flag) in flags.iter().enumerate() {
             let content = match flag {
                 FlagContent::Simple(s) => s.as_str(),
@@ -387,6 +457,25 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                     name,
                     &format!("flags[{}]", i),
                     "empty flag content",
+                ));
+            } else if !seen_flag_content.insert(content) {
+                issues.push(Issue::warn(
+                    name,
+                    &format!("flags[{}]", i),
+                    format!("duplicate flag content '{}'", truncate_str(content, 40)),
+                ));
+            }
+        }
+    }
+
+    // hints — validate content of each hint
+    if let Some(hints) = &c.hints {
+        for (i, hint) in hints.iter().enumerate() {
+            if hint.content_str().trim().is_empty() {
+                issues.push(Issue::error(
+                    name,
+                    &format!("hints[{}]", i),
+                    "empty hint content",
                 ));
             }
         }
@@ -487,7 +576,6 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
 
     // ── Field rows ────────────────────────────────────────────────────────────
     frow(FW, "name", Some(c.name.as_str()), fi("name"));
-    frow(FW, "author", c.author.as_deref(), fi("author"));
     frow(FW, "category", Some(c.category.as_str()), fi("category"));
 
     let desc_val = c.description.as_deref().map(|d| {
@@ -517,6 +605,9 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 frow(FW, "extra.initial", i_s.as_deref(), fi("extra.initial"));
                 frow(FW, "extra.decay", d_s.as_deref(), fi("extra.decay"));
                 frow(FW, "extra.minimum", m_s.as_deref(), fi("extra.minimum"));
+                if let Some(df) = &e.decay_function {
+                    frow(FW, "extra.decay_function", Some(df.as_str()), fi("extra.decay_function"));
+                }
             } else {
                 frow(FW, "extra", None, fi("extra"));
             }
@@ -529,12 +620,64 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 frow(FW, "instance.connection", Some(&inst.connection), fi("instance.connection"));
                 if let Some(img) = &inst.image {
                     frow(FW, "instance.image", Some(img.as_str()), fi("instance.image"));
+                } else {
+                    frow(FW, "instance.image", None, fi("instance.image"));
+                }
+                if let Some(cf) = &inst.compose_file {
+                    frow(FW, "instance.compose_file", Some(cf.as_str()), fi("instance.compose_file"));
+                }
+                if let Some(cs) = &inst.compose_service {
+                    frow(FW, "instance.compose_service", Some(cs.as_str()), fi("instance.compose_service"));
+                }
+                if let Some(li) = &inst.lxc_image {
+                    frow(FW, "instance.lxc_image", Some(li.as_str()), fi("instance.lxc_image"));
+                } else if inst.backend == crate::ctfd_api::models::InstanceBackend::Lxc {
+                    frow(FW, "instance.lxc_image", None, fi("instance.lxc_image"));
+                }
+                if let Some(vf) = &inst.vagrantfile {
+                    frow(FW, "instance.vagrantfile", Some(vf.as_str()), fi("instance.vagrantfile"));
+                } else if inst.backend == crate::ctfd_api::models::InstanceBackend::Vagrant {
+                    frow(FW, "instance.vagrantfile", None, fi("instance.vagrantfile"));
                 }
                 let fm_s = inst.flag_mode.as_ref().map(|m| match m {
                     InstanceFlagMode::Static => "static",
                     InstanceFlagMode::Random => "random",
                 });
                 frow(FW, "instance.flag_mode", fm_s, fi("instance.flag_mode"));
+                let fd_s = inst.flag_delivery.as_ref().map(|d| match d {
+                    crate::ctfd_api::models::FlagDelivery::Env => "env",
+                    crate::ctfd_api::models::FlagDelivery::File => "file",
+                });
+                frow(FW, "instance.flag_delivery", fd_s, fi("instance.flag_delivery"));
+                if inst.flag_delivery.as_ref().map(|d| matches!(d, crate::ctfd_api::models::FlagDelivery::File)).unwrap_or(false)
+                    || inst.flag_file_path.is_some()
+                {
+                    frow(FW, "instance.flag_file_path", inst.flag_file_path.as_deref(), fi("instance.flag_file_path"));
+                }
+                if let Some(fs) = &inst.flag_service {
+                    frow(FW, "instance.flag_service", Some(fs.as_str()), fi("instance.flag_service"));
+                }
+                if let Some(fp) = &inst.flag_prefix {
+                    frow(FW, "instance.flag_prefix", Some(fp.as_str()), fi("instance.flag_prefix"));
+                }
+                if let Some(fs) = &inst.flag_suffix {
+                    frow(FW, "instance.flag_suffix", Some(fs.as_str()), fi("instance.flag_suffix"));
+                }
+                if let Some(rl) = inst.random_flag_length {
+                    let rl_s = rl.to_string();
+                    frow(FW, "instance.random_flag_length", Some(&rl_s), fi("instance.random_flag_length"));
+                }
+                if let Some(tm) = inst.timeout_minutes {
+                    let tm_s = tm.to_string();
+                    frow(FW, "instance.timeout_minutes", Some(&tm_s), fi("instance.timeout_minutes"));
+                }
+                if let Some(mr) = inst.max_renewals {
+                    let mr_s = mr.to_string();
+                    frow(FW, "instance.max_renewals", Some(&mr_s), fi("instance.max_renewals"));
+                }
+                if let Some(cmd) = &inst.command {
+                    frow(FW, "instance.command", Some(cmd.as_str()), fi("instance.command"));
+                }
             } else {
                 frow(FW, "instance", None, fi("instance"));
             }
@@ -546,6 +689,9 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 frow(FW, "extra.initial", i_s.as_deref(), fi("extra.initial"));
                 frow(FW, "extra.decay", d_s.as_deref(), fi("extra.decay"));
                 frow(FW, "extra.minimum", m_s.as_deref(), fi("extra.minimum"));
+                if let Some(df) = &e.decay_function {
+                    frow(FW, "extra.decay_function", Some(df.as_str()), fi("extra.decay_function"));
+                }
             }
         }
     }
@@ -617,6 +763,23 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
         }
     });
     frow(FW, "hints", hints_val.as_deref(), fi("hints"));
+    // per-hint sub-issues (hints[0], hints[1], …)
+    if let Some(hints) = &c.hints {
+        for (i, hc) in hints.iter().enumerate() {
+            let key = format!("hints[{}]", i);
+            let sub = by_field.get(key.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !sub.is_empty() {
+                let cost_s = match hc {
+                    crate::ctfd_api::models::HintContent::Simple(_) => "(free)".to_string(),
+                    crate::ctfd_api::models::HintContent::Detailed { cost, .. } => {
+                        cost.map(|c| format!("cost:{}", c)).unwrap_or_else(|| "(free)".to_string())
+                    }
+                };
+                let hval = format!("{} {}", truncate_str(hc.content_str(), 30), cost_s);
+                frow_sub(FW, &key, Some(&hval), sub);
+            }
+        }
+    }
 
     // requirements
     let reqs_val = c.requirements.as_ref().map(|r| {
@@ -674,16 +837,15 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
 
     // Catch any issue fields not already rendered above
     const RENDERED: &[&str] = &[
-        "name", "author", "category", "description", "type", "value",
-        "extra", "extra.initial", "extra.decay", "extra.minimum",
+        "name", "category", "description", "type", "value",
+        "extra", "extra.initial", "extra.decay", "extra.minimum", "extra.decay_function",
         // instance fields
         "instance", "instance.backend", "instance.internal_port", "instance.connection",
-        "instance.image", "instance.flag_mode",
-        "instance.flag_delivery", "instance.flag_file_path", "instance.flag_service",
-        "instance.flag_prefix", "instance.flag_suffix", "instance.random_flag_length",
-        "instance.compose_file", "instance.compose_service",
+        "instance.image", "instance.compose_file", "instance.compose_service",
         "instance.lxc_image", "instance.vagrantfile",
-        "instance.timeout_minutes", "instance.max_renewals",
+        "instance.flag_mode", "instance.flag_delivery", "instance.flag_file_path",
+        "instance.flag_service", "instance.flag_prefix", "instance.flag_suffix",
+        "instance.random_flag_length", "instance.timeout_minutes", "instance.max_renewals",
         "instance.command",
         "flags", "tags", "topics", "files", "hints", "requirements",
         "next", "state", "connection_info", "attempts", "image",
@@ -691,7 +853,7 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
     ];
     for (field, field_issues) in &by_field {
         if RENDERED.contains(field) { continue; }
-        if field.starts_with("flags[") || field.starts_with("files[") { continue; }
+        if field.starts_with("flags[") || field.starts_with("hints[") || field.starts_with("files[") { continue; }
         if c.unknown_yaml_keys.iter().any(|k| k == *field) { continue; }
         frow(FW, field, None, field_issues.as_slice());
     }

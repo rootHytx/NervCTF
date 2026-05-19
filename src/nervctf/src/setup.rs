@@ -278,14 +278,13 @@ pub fn run_setup() -> Result<()> {
     };
 
     // ── MONITOR_CTFD_PATH ─────────────────────────────────────────────────────
+    let ctfd_path_default = config
+        .monitor_ctfd_path
+        .clone()
+        .unwrap_or_else(|| format!("/home/{}/CTFd", monitor_user));
     let ctfd_path = prompt_with_default(
         "CTFd installation path on remote",
-        Some(
-            config
-                .monitor_ctfd_path
-                .as_deref()
-                .unwrap_or("/home/docker/CTFd"),
-        ),
+        Some(&ctfd_path_default),
     )?;
 
     // ── MONITOR_PORT ──────────────────────────────────────────────────────────
@@ -528,10 +527,11 @@ pub fn run_upgrade() -> Result<()> {
         anyhow!("monitor_ip not set in .nervctf.yml — run `nervctf setup` to fix.")
     })?;
     let monitor_user = config.monitor_user.as_deref().unwrap_or("root");
+    let ctfd_path_default = format!("/home/{}/CTFd", monitor_user);
     let ctfd_path = config
         .monitor_ctfd_path
         .as_deref()
-        .unwrap_or("/home/docker/CTFd");
+        .unwrap_or(&ctfd_path_default);
     let monitor_port = config.monitor_port.as_deref().unwrap_or("33133");
 
     // ── Find local artifacts ───────────────────────────────────────────────────

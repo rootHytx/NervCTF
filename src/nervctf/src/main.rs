@@ -599,10 +599,27 @@ fn merge_extra_fields(payload: &mut serde_json::Value, extra: &nervctf::ctfd_api
     }
 }
 
+/// Normalize description newlines for CTFd's Markdown renderer.
+///
+/// CTFd renders descriptions as Markdown (CommonMark). A single \n inside a
+/// paragraph is a soft break — rendered as a space. Authors write multi-line
+/// YAML block scalars expecting each line to appear on its own line, so we
+/// convert single \n to \n\n (paragraph breaks). Existing double newlines are
+/// preserved; runs of 3+ newlines are collapsed to 2.
+fn normalize_description(desc: &str) -> String {
+    let mut out = desc.replace('\n', "\n\n");
+    loop {
+        let collapsed = out.replace("\n\n\n", "\n\n");
+        if collapsed == out { break; }
+        out = collapsed;
+    }
+    out.trim_end().to_string()
+}
+
 /// Determine the CTFd challenge type string and description for a challenge.
 /// Instance challenges are deployed as `"instance"` (requires the nervctf_instance CTFd plugin).
 fn resolve_challenge_type_and_description(challenge: &Challenge) -> (String, String) {
-    let base_desc = challenge.description.as_deref().unwrap_or("").to_string();
+    let base_desc = normalize_description(challenge.description.as_deref().unwrap_or(""));
     match challenge.challenge_type {
         ChallengeType::Instance => ("instance".to_string(), base_desc),
         ChallengeType::Dynamic => ("dynamic".to_string(), base_desc),

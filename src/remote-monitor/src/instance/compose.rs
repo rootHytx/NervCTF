@@ -288,7 +288,34 @@ pub async fn up(
     Ok((host_port, project_name.to_string()))
 }
 
-/// List all running compose project names that start with `ctf-`.
+/// List compose project names that start with `ctf-` and are currently running.
+///
+/// Returns `None` if the query fails (SSH error, docker unavailable) so the
+/// caller can skip cleanup rather than risk false-positive deletions.
+pub async fn list_running_ctf_project_names() -> Option<std::collections::HashSet<String>> {
+    let output = if let Some(target) = runner_target() {
+        ssh::output(&target, "docker compose ls --format json").await.ok()?
+    } else {
+        tokio::process::Command::new("docker")
+            .args(["compose", "ls", "--format", "json"])
+            .output()
+            .await
+            .ok()?
+    };
+    if !output.status.success() {
+        return None;
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    Some(
+        parsed.as_array()?
+            .iter()
+            .filter_map(|entry| entry["Name"].as_str().map(String::from))
+            .filter(|name| name.starts_with("ctf-"))
+            .collect()
+    )
+}
+
+/// List all compose project names that start with `ctf-` (running or stopped).
 /// Used by the background expiry task to detect orphaned projects.
 pub async fn list_ctf_projects() -> Vec<String> {
     let output = if let Some(target) = runner_target() {

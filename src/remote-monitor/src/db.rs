@@ -465,6 +465,25 @@ pub fn get_expired_instances(db: &Db) -> Result<Vec<(String, Option<String>, i64
     Ok(result)
 }
 
+/// Returns all `status='running'` instances for container health checking.
+pub fn get_running_instances(db: &Db) -> Result<Vec<(String, i64, Option<String>, Option<i64>)>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT challenge_name, team_id, container_id, ctfd_flag_id FROM instances WHERE status = 'running'",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<i64>>(3)?,
+        ))
+    })?;
+    let mut result = Vec::new();
+    for r in rows { result.push(r?); }
+    Ok(result)
+}
+
 /// Returns all tracked container_ids (non-null) as a HashSet, for orphan detection.
 pub fn get_all_container_ids(db: &Db) -> Result<std::collections::HashSet<String>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;

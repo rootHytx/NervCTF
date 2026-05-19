@@ -213,6 +213,49 @@ async fn main() -> Result<()> {
                     let _ = instance::compose::down(&project, expiry_state.runner_ssh_target.as_deref(), None).await;
                 }
             }
+
+            // ── Health check: remove DB entries for externally killed containers ──
+            //
+            // Both docker and compose backends store a `ctf-*` short name as
+            // container_id, so we can't reliably infer the backend from the name alone.
+            // Instead we check both lists: a container is alive if found in EITHER the
+            // compose projects list OR the docker container names list.
+            // If a query fails (SSH down, docker unreachable) we get None and treat that
+            // list as unable to confirm anything — only mark dead when BOTH queries
+            // succeed and confirm absence. This avoids false-deletes on transient errors.
+            let running_instances = db::get_running_instances(&expiry_state.db).unwrap_or_default();
+            if !running_instances.is_empty() {
+                let running_projects = instance::compose::list_running_ctf_project_names().await;
+                let running_names = instance::docker::list_running_container_names(
+                    expiry_state.runner_ssh_target.as_deref(),
+                ).await;
+                for (challenge_name, team_id, container_id, ctfd_flag_id) in running_instances {
+                    let Some(ref cid) = container_id else { continue };
+                    // Determine liveness: Some(true) = confirmed present, Some(false) = confirmed absent, None = unknown
+                    let in_projects  = running_projects.as_ref().map(|s| s.contains(cid));
+                    let in_names     = running_names.as_ref().map(|s| s.contains(cid));
+                    let is_dead = match (in_projects, in_names) {
+                        // Both queries succeeded and neither list contains this id
+                        (Some(false), Some(false)) => true,
+                        // One query failed — only mark dead if the successful one
+                        // confirmed absence AND the other was the only possible home
+                        // (compose-only projects won't be in docker names and vice-versa)
+                        (Some(false), None) | (None, Some(false)) => true,
+                        // Found in at least one list, or both queries failed — assume alive
+                        _ => false,
+                    };
+                    if is_dead {
+                        info!("health: container gone for {}/{}, removing from DB", challenge_name, team_id);
+                        let _ = db::delete_instance(&expiry_state.db, &challenge_name, team_id);
+                        if let Some(flag_id) = ctfd_flag_id {
+                            ctfd_db::delete_flag(&expiry_state.ctfd_pool, flag_id).await;
+                        }
+                        if let Some(cid) = container_id {
+                            instance::cleanup_container(&cid, expiry_state.runner_ssh_target.as_deref()).await;
+                        }
+                    }
+                }
+            }
         }
     });
 

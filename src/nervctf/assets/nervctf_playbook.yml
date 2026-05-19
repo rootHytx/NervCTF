@@ -3,7 +3,7 @@
   become: yes
   vars:
     ansible_python_interpreter: auto_silent
-    docker_user: docker
+    docker_user: "{{ ansible_user }}"
 
   tasks:
     # ── Docker ─────────────────────────────────────────────────────────────────
@@ -331,9 +331,10 @@
       slurp:
         src: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key.pub"
       register: monitor_pubkey_raw
+      failed_when: false
 
     - name: Set monitor_pubkey fact
-      when: runner_ip is defined
+      when: runner_ip is defined and monitor_pubkey_raw.content is defined
       set_fact:
         monitor_pubkey: "{{ monitor_pubkey_raw.content | b64decode | trim }}"
 
@@ -496,7 +497,7 @@
   become: yes
   vars:
     ansible_python_interpreter: auto_silent
-    docker_user: docker
+    docker_user: "{{ ansible_user }}"
 
   tasks:
     # ── Docker ─────────────────────────────────────────────────────────────────

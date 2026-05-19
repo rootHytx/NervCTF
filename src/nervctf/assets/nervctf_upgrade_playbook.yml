@@ -6,7 +6,7 @@
   become: yes
   vars:
     ansible_python_interpreter: auto_silent
-    docker_user: docker
+    docker_user: "{{ ansible_user }}"
     monitor_port: "{{ monitor_port | default('33133') }}"
 
   tasks:
@@ -123,14 +123,34 @@
             else runner_ip
           }}
 
+    # ── SSH keypair for monitor→runner (generate if missing, preserve if existing) ─
+    - name: Generate SSH keypair for remote-monitor (split mode, if missing)
+      when: runner_ip is defined
+      command: >-
+        ssh-keygen -t rsa -b 4096 -N ""
+        -f {{ ctfd_path }}/remote-monitor/monitor_ssh_key
+      args:
+        creates: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key"
+      become_user: "{{ docker_user }}"
+
+    - name: Set monitor SSH private key permissions
+      when: runner_ip is defined
+      file:
+        path: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key"
+        mode: "0600"
+        owner: "{{ docker_user }}"
+        group: docker
+      failed_when: false
+
     - name: Read monitor SSH public key
       when: runner_ip is defined
       slurp:
         src: "{{ ctfd_path }}/remote-monitor/monitor_ssh_key.pub"
       register: monitor_pubkey_raw
+      failed_when: false
 
     - name: Set monitor_pubkey fact
-      when: runner_ip is defined
+      when: runner_ip is defined and monitor_pubkey_raw.content is defined
       set_fact:
         monitor_pubkey: "{{ monitor_pubkey_raw.content | b64decode | trim }}"
 
@@ -215,7 +235,7 @@
   become: yes
   vars:
     ansible_python_interpreter: auto_silent
-    docker_user: docker
+    docker_user: "{{ ansible_user }}"
   tasks:
     - name: Authorize remote-monitor SSH public key on runner
       when: runner_ip is defined

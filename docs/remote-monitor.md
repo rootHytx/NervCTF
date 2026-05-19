@@ -21,21 +21,34 @@ CLI  ──Token<monitor>──▶  remote-monitor:33133  ──SQL──▶  CT
          (local docker daemon)   (SSH to runner node)
 ```
 
-The monitor runs as a Docker container inside the same Compose stack as CTFd:
+The monitor runs as a Docker container inside the same Compose stack as CTFd.
+`nervctf setup` writes a `docker-compose.override.yml` that wires it in:
 
 ```yaml
-# docker-compose.override.yml (written by Ansible)
+# docker-compose.override.yml — single-machine mode (no runner_ip)
 services:
   remote-monitor:
     image: nervctf-monitor:latest
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - remote_monitor_data:/data
-      - {{ ctfd_uploads_dir }}:{{ ctfd_uploads_dir }}  # same-path bind mount
+      - /var/run/docker.sock:/var/run/docker.sock        # local Docker daemon
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+      - <ctfd_path>/remote-monitor/data:<ctfd_path>/remote-monitor/data
+      - <ctfd_path>/.data/CTFd/uploads:<ctfd_path>/.data/CTFd/uploads
+
+# docker-compose.override.yml — split-machine mode (runner_ip set)
+services:
+  remote-monitor:
+    image: nervctf-monitor:latest
+    volumes:
+      - <ctfd_path>/remote-monitor/monitor_ssh_key:/run/monitor_ssh_key:ro  # SSH key for runner
+      - <ctfd_path>/remote-monitor/data:<ctfd_path>/remote-monitor/data
+      - <ctfd_path>/.data/CTFd/uploads:<ctfd_path>/.data/CTFd/uploads
 ```
 
 In split-machine mode, Docker commands run on a separate worker node via SSH
 (`RUNNER_SSH_TARGET`). Challenge files are rsynced directly to the runner by the CLI.
+The monitor's SSH private key is bind-mounted at `/run/monitor_ssh_key` and copied to
+`/root/.ssh/id_rsa` by the container entrypoint on startup.
 
 ---
 
@@ -55,6 +68,7 @@ In split-machine mode, Docker commands run on a separate worker node via SSH
 | `MAX_CONCURRENT_PROVISIONS` | `4` | Semaphore limit for concurrent docker/compose ops |
 | `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team across all challenges (0 = unlimited) |
 | `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd MariaDB → SQLite sync cycles |
+| `CTFD_DOMAIN` | `""` | CTFd base URL shown in admin dashboard links (e.g. `http://ctfd.example.com`). Defaults to `http://{PUBLIC_HOST}` if unset. Set by Ansible from `ctfd_domain` in `.nervctf.yml`. |
 
 ---
 
@@ -65,9 +79,17 @@ In split-machine mode, Docker commands run on a separate worker node via SSH
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | `{"status": "ok"}` |
+| `GET` | `/` | Login page (redirects to `/admin` if session cookie is valid) |
 | `GET` | `/instance/:name` | HTML player UI page |
 
-### Admin auth (`Authorization: Token <MONITOR_TOKEN>` or `?token=`)
+### Session auth (cookie `nervctf_session`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/auth/login` | Create session from `{token}` JSON body; sets `nervctf_session` cookie |
+| `POST` | `/auth/logout` | Delete session cookie |
+
+### Admin auth (`Authorization: Token <MONITOR_TOKEN>` or `?token=` or session cookie)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -96,6 +118,9 @@ In split-machine mode, Docker commands run on a separate worker node via SSH
 | `GET` | `/api/v1/admin/instances` | JSON list of all active instances |
 | `GET` | `/api/v1/admin/attempts` | Flag attempt log (`?alerts_only=true` for sharing only) |
 | `GET` | `/api/v1/admin/solves` | Correct solves per team |
+| `GET` | `/api/v1/admin/config` | Runtime config dump (public_host, challenges_base_dir, runner mode, etc.) |
+| `GET/POST` | `/api/v1/admin/tokens` | List or create operator tokens |
+| `DELETE` | `/api/v1/admin/tokens/:id` | Revoke an operator token |
 
 ### Plugin auth (admin token + explicit `team_id` — called by CTFd plugin)
 
@@ -159,7 +184,7 @@ No file upload — the CLI handles file transfer directly via rsync.
 ### Placeholder directory problem
 
 Docker creates empty dirs at bind-mount source paths when they don't exist. If the monitor
-starts before any challenge is deployed, stub directories like `/data/challenges/my-chall/certs/`
+starts before any challenge is deployed, stub directories like `<CHALLENGES_BASE_DIR>/my-chall/certs/`
 are created. A subsequent `tar -x` cannot overwrite a directory with a file.
 
 **Fix**: the `build-compose` handler wipes `CHALLENGES_BASE_DIR/<name>/` before extracting.
@@ -170,16 +195,26 @@ are created. A subsequent `tar -x` cannot overwrite a directory with a file.
 
 ### Expiry task (every 30 s)
 
-1. `get_expired_instances()` — returns two sets:
+Three checks run on every tick:
+
+1. **Expiry cleanup**: `get_expired_instances()` returns two sets:
    - **Expired running instances**: `status = 'running'` and `expires_at < now`
    - **Stuck provisioning instances**: `status = 'provisioning'` and `created_at < now - 30 min`
      (uses `created_at`, not `expires_at`, so short-timeout challenges don't trigger this early)
-   
+
    For each matched row:
-   - `cleanup_container(id, runner_ssh)` — tries compose down, lxc delete, docker remove
-   - `ctfd_db::delete_flag(ctfd_flag_id)` — removes dynamic flag from CTFd
    - `db::delete_instance()`
-2. Orphan cleanup: list running `ctf-*` compose projects → stop any not tracked in DB
+   - `ctfd_db::delete_flag(ctfd_flag_id)` — removes dynamic flag from CTFd
+   - `cleanup_container(id, runner_ssh)` — tries compose down, lxc delete, docker remove
+
+2. **Orphan cleanup**: list all `ctf-*` compose projects (via `docker compose ls --all`) → stop any not tracked in DB.
+
+3. **Health check**: query running docker container **names** (`docker ps`) and running compose project names (`docker compose ls`). For each `status='running'` DB row whose `container_id` appears in neither list, the container was externally killed:
+   - `db::delete_instance()`
+   - `ctfd_db::delete_flag(ctfd_flag_id)`
+   - `cleanup_container()` (best-effort — container is already gone)
+
+   Both queries return `None` on failure (SSH/docker error). The row is only marked dead when at least one query succeeds and confirms the container is absent; if both queries fail, the row is preserved to avoid false deletes.
 
 ### CTFd sync task (every `CTFD_DB_SYNC_INTERVAL` s, default 30)
 
@@ -256,6 +291,23 @@ CREATE TABLE ctfd_solves (
 -- Cached team/user names (synced from MariaDB)
 CREATE TABLE ctfd_teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE ctfd_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, team_id INTEGER);
+
+-- Operator tokens for admin/API access (hashed; multiple tokens supported)
+CREATE TABLE operator_tokens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,   -- SHA-256 hex of the raw token
+    created_at   TEXT DEFAULT (datetime('now')),
+    last_used_at TEXT
+);
+
+-- Browser sessions (created by POST /auth/login, scoped to an operator_token)
+CREATE TABLE sessions (
+    session_id  TEXT PRIMARY KEY,
+    operator_id INTEGER NOT NULL REFERENCES operator_tokens(id) ON DELETE CASCADE,
+    created_at  TEXT DEFAULT (datetime('now')),
+    expires_at  TEXT NOT NULL
+);
 ```
 
 ---

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Select};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -7,14 +7,12 @@ use walkdir::WalkDir;
 #[derive(Debug, Default)]
 struct Issues {
     missing_state: Vec<PathBuf>,
-    missing_author: Vec<PathBuf>,
     missing_version: Vec<PathBuf>,
 }
 
 impl Issues {
     fn is_empty(&self) -> bool {
         self.missing_state.is_empty()
-            && self.missing_author.is_empty()
             && self.missing_version.is_empty()
     }
 }
@@ -104,9 +102,6 @@ fn scan_issues(base_dir: &Path) -> Issues {
         if !has_field(&contents, "state") {
             issues.missing_state.push(path.clone());
         }
-        if !has_field(&contents, "author") {
-            issues.missing_author.push(path.clone());
-        }
         if !has_field(&contents, "version") {
             issues.missing_version.push(path.clone());
         }
@@ -186,39 +181,6 @@ pub fn run_fix(base_dir: &Path, dry_run: bool) -> Result<()> {
             }
         } else {
             println!("  Skipped.");
-        }
-    }
-
-    // ── author ─────────────────────────────────────────────────────────────
-    if !issues.missing_author.is_empty() {
-        println!(
-            "\n[author]  {} file(s) missing the `author` field:",
-            issues.missing_author.len()
-        );
-        print_paths(&issues.missing_author);
-
-        let default_author: String = Input::new()
-            .with_prompt("Author name to use (leave blank to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-
-        if default_author.trim().is_empty() {
-            println!("  Skipped.");
-        } else if dry_run {
-            println!(
-                "  [dry-run] Would add `author: {}` to {} file(s)",
-                default_author,
-                issues.missing_author.len()
-            );
-        } else {
-            let n = apply_fix(
-                &issues.missing_author,
-                "author",
-                &default_author,
-                "name",
-                "category",
-            )?;
-            println!("  Added `author: {}` to {} file(s).", default_author, n);
         }
     }
 

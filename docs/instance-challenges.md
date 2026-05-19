@@ -27,7 +27,6 @@ instance:
 
 ```yaml
 name: "Challenge Name"
-author: "author"
 category: pwn
 description: |
   Describe the challenge.
@@ -235,7 +234,7 @@ instance:
 
 The `compose` backend manages a `docker compose` project per team:
 
-- Challenge files are stored on the monitor at `/data/challenges/<sanitized_name>/`
+- Challenge files are stored on the monitor at `$CHALLENGES_BASE_DIR/<sanitized_name>/` (default: `/opt/nervctf/challenges/<name>/`; Ansible sets this to `<ctfd_path>/remote-monitor/data/challenges/<name>/`)
 - Project name: `ctf-<sanitized_challenge_name>-<6 random chars>`
 - A per-team override file (`<project_name>.override.yml`) is written next to the compose file
 
@@ -294,10 +293,11 @@ name as a prefix by default, making container names unique across teams. A hardc
 
 ### Bind mount path constraint
 
-The monitor stores challenge files at `/data/challenges/<name>/`. Challenge docker-compose.yml
-files that reference absolute paths (e.g. cert files) **must use `/data/challenges/<name>/...`**
-as the path, because the host Docker daemon resolves bind mount paths from the host filesystem,
-not from inside the monitor container.
+The monitor stores challenge files at `$CHALLENGES_BASE_DIR/<name>/`. Challenge docker-compose.yml
+files that reference absolute paths (e.g. cert files) **must use the full path as seen on the runner/host filesystem** (i.e. `$CHALLENGES_BASE_DIR/<name>/...`), because the host Docker daemon resolves bind mount paths from the host filesystem, not from inside the monitor container.
+
+The actual value of `CHALLENGES_BASE_DIR` depends on `ctfd_path` in `.nervctf.yml` — check the
+`docker-compose.override.yml` on the CTFd host to see the exact path.
 
 ---
 
@@ -331,6 +331,7 @@ playbook but the provisioning logic is not yet implemented.
 | Player stops | Container removed; row deleted |
 | Instance expires | Background task (30s interval) calls `cleanup_container()` and deletes row |
 | Provisioning stuck >30 min | Background task treats the row the same as expired (`created_at` is the reference, not `expires_at`) |
+| Container externally killed | Health check (runs every 30s tick) detects the container absent from both `docker ps` and `docker compose ls`; deletes row and cleans up flag |
 | Challenge deleted | All instances stopped; challenge config removed from `instance_configs` |
 
 ---

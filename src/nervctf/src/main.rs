@@ -104,6 +104,8 @@ struct RunnerTarget {
     ssh_target: String,
     /// Remote path where challenges are stored, e.g. "/home/docker/challenges"
     challenges_dir: String,
+    /// Optional private key path (ssh_key_path in .nervctf.yml), passed as -i to ssh/rsync.
+    ssh_key: Option<String>,
 }
 
 // ── Queue types for deferred phases ──────────────────────────────────────────
@@ -206,6 +208,7 @@ async fn main() -> Result<()> {
         (Some(ip), Some(user)) if !ip.is_empty() => Some(RunnerTarget {
             ssh_target: format!("{}@{}", user, ip),
             challenges_dir: format!("/home/{}/challenges", user),
+            ssh_key: file_config.ssh_key_path.clone(),
         }),
         _ => None,
     };
@@ -745,25 +748,33 @@ async fn deploy_instance(
 
                     // Pre-create the remote directory via SSH so rsync never needs
                     // --mkpath, which requires rsync ≥ 3.2.3 on the runner.
-                    let mkdir_status = tokio::process::Command::new("ssh")
-                        .args([
-                            "-o", "StrictHostKeyChecking=no",
-                            "-o", "UserKnownHostsFile=/dev/null",
-                            "-o", "LogLevel=ERROR",
-                            "-o", "BatchMode=yes",
-                            &rt.ssh_target,
-                            &format!("mkdir -p '{}'", remote_dir),
-                        ])
-                        .status()
-                        .await;
+                    let key_args: Vec<String> = rt.ssh_key.as_ref()
+                        .map(|k| vec!["-i".to_string(), k.clone()])
+                        .unwrap_or_default();
+                    let mut mkdir_cmd = tokio::process::Command::new("ssh");
+                    mkdir_cmd.args([
+                        "-o", "StrictHostKeyChecking=no",
+                        "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "LogLevel=ERROR",
+                        "-o", "BatchMode=yes",
+                    ]);
+                    for arg in &key_args { mkdir_cmd.arg(arg); }
+                    mkdir_cmd.args([&rt.ssh_target, &format!("mkdir -p '{}'", remote_dir)]);
+                    let mkdir_status = mkdir_cmd.status().await;
                     if !matches!(mkdir_status, Ok(s) if s.success()) {
                         eprintln!("   [!] failed to create remote dir on runner: {}", remote_dir);
                     }
 
+                    let ssh_e = {
+                        let key_flag = rt.ssh_key.as_ref()
+                            .map(|k| format!(" -i {}", k))
+                            .unwrap_or_default();
+                        format!("ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR{}", key_flag)
+                    };
                     let status = tokio::process::Command::new("rsync")
                         .args([
                             "-az", "--delete",
-                            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
+                            "-e", &ssh_e,
                             &format!("{}/", context_dir.display()),
                             &format!("{}:{}/", rt.ssh_target, remote_dir),
                         ])

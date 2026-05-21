@@ -117,6 +117,13 @@ struct ChallengesSchema {
     /// true  = initial/minimum/decay/function are inline in `challenges` (newer CTFd)
     /// false = they live in the separate `dynamic_challenge` join table (older CTFd)
     dynamic_in_challenges: bool,
+    /// true = `dynamic_challenge` join table exists in the database.
+    /// CTFd uses SQLAlchemy joined-table inheritance: the row must always be present.
+    has_dynamic_table: bool,
+    /// true = `dynamic_challenge` table has its own scoring columns (initial/minimum/decay/function).
+    /// Older CTFd: scoring lives only in dynamic_challenge.
+    /// Newer CTFd: scoring is inline in challenges; dynamic_challenge is a bare stub (id only).
+    dynamic_table_has_scoring: bool,
 }
 
 async fn detect_challenges_schema(conn: &mut mysql_async::Conn) -> ChallengesSchema {
@@ -129,11 +136,23 @@ async fn detect_challenges_schema(conn: &mut mysql_async::Conn) -> ChallengesSch
         .await
         .unwrap_or_default();
     let col_set: std::collections::HashSet<String> = cols.into_iter().collect();
+    let dyn_cols: Vec<String> = conn
+        .exec(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dynamic_challenge'",
+            (),
+        )
+        .await
+        .unwrap_or_default();
+    let has_dynamic_table = !dyn_cols.is_empty();
+    let dyn_col_set: std::collections::HashSet<String> = dyn_cols.into_iter().collect();
     ChallengesSchema {
-        has_attribution:       col_set.contains("attribution"),
-        has_logic:             col_set.contains("logic"),
-        has_position:          col_set.contains("position"),
-        dynamic_in_challenges: col_set.contains("initial"),
+        has_attribution:          col_set.contains("attribution"),
+        has_logic:                col_set.contains("logic"),
+        has_position:             col_set.contains("position"),
+        dynamic_in_challenges:    col_set.contains("initial"),
+        has_dynamic_table,
+        dynamic_table_has_scoring: dyn_col_set.contains("initial"),
     }
 }
 
@@ -377,16 +396,26 @@ pub async fn create_challenge(pool: &Pool, body: &Value) -> Result<Value> {
 
     let new_id = conn.last_insert_id().unwrap_or(0) as i64;
 
-    // For dynamic type on older CTFd: scoring lives in dynamic_challenge (columns: initial/minimum/decay/function)
-    if type_ == "dynamic" && !schema.dynamic_in_challenges {
-        let di = initial.unwrap_or(value);
-        let dm = minimum.unwrap_or(1);
-        let dd = decay.unwrap_or(50);
-        let df = function.clone().unwrap_or_else(|| "linear".to_string());
-        let sql2 = "INSERT INTO dynamic_challenge \
-            (id, initial, minimum, decay, `function`) VALUES (?, ?, ?, ?, ?)";
-        conn.exec_drop(sql2, (new_id, di, dm, dd, df)).await
-            .map_err(|e| anyhow!("ctfd_db: insert dynamic_challenge: {}", e))?;
+    // Insert into dynamic_challenge whenever the table exists — CTFd's SQLAlchemy
+    // joined-table inheritance requires this row regardless of whether challenges.initial
+    // also exists. Newer CTFd: dynamic_challenge is a bare stub (id only); scoring
+    // is already inline in challenges. Older CTFd: table has its own scoring columns.
+    if type_ == "dynamic" && schema.has_dynamic_table {
+        if schema.dynamic_table_has_scoring {
+            let di = initial.unwrap_or(value);
+            let dm = minimum.unwrap_or(1);
+            let dd = decay.unwrap_or(50);
+            let df = function.clone().unwrap_or_else(|| "linear".to_string());
+            conn.exec_drop(
+                "INSERT INTO dynamic_challenge (id, initial, minimum, decay, `function`) VALUES (?, ?, ?, ?, ?)",
+                (new_id, di, dm, dd, df),
+            ).await.map_err(|e| anyhow!("ctfd_db: insert dynamic_challenge: {}", e))?;
+        } else {
+            conn.exec_drop(
+                "INSERT INTO dynamic_challenge (id) VALUES (?)",
+                (new_id,),
+            ).await.map_err(|e| anyhow!("ctfd_db: insert dynamic_challenge (stub): {}", e))?;
+        }
     }
 
     if type_ == "instance" {
@@ -463,19 +492,26 @@ pub async fn update_challenge(pool: &Pool, id: i64, body: &Value) -> Result<Valu
     }
 
     let type_ = body["type"].as_str().unwrap_or("");
-    // Older CTFd: upsert dynamic_challenge join table (columns: initial/minimum/decay/function)
-    if type_ == "dynamic" && !schema.dynamic_in_challenges {
-        let di = body["initial"].as_i64().unwrap_or(0);
-        let dm = body["minimum"].as_i64().unwrap_or(1);
-        let dd = body["decay"].as_i64().unwrap_or(50);
-        let df = body["function"].as_str().unwrap_or("linear").to_string();
-        let sql3 = "INSERT INTO dynamic_challenge \
-             (id, initial, minimum, decay, `function`) VALUES (?, ?, ?, ?, ?) \
-             ON DUPLICATE KEY UPDATE \
-             initial=VALUES(initial), minimum=VALUES(minimum), \
-             decay=VALUES(decay), `function`=VALUES(`function`)";
-        conn.exec_drop(sql3, (id, di, dm, dd, df)).await
-            .map_err(|e| anyhow!("ctfd_db: upsert dynamic_challenge: {}", e))?;
+    // Upsert dynamic_challenge join row whenever the table exists.
+    // ON DUPLICATE KEY UPDATE repairs existing challenges whose join row was previously missing.
+    if type_ == "dynamic" && schema.has_dynamic_table {
+        if schema.dynamic_table_has_scoring {
+            let di = body["initial"].as_i64().unwrap_or(0);
+            let dm = body["minimum"].as_i64().unwrap_or(1);
+            let dd = body["decay"].as_i64().unwrap_or(50);
+            let df = body["function"].as_str().unwrap_or("linear").to_string();
+            conn.exec_drop(
+                "INSERT INTO dynamic_challenge (id, initial, minimum, decay, `function`) VALUES (?, ?, ?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE initial=VALUES(initial), minimum=VALUES(minimum), \
+                 decay=VALUES(decay), `function`=VALUES(`function`)",
+                (id, di, dm, dd, df),
+            ).await.map_err(|e| anyhow!("ctfd_db: upsert dynamic_challenge: {}", e))?;
+        } else {
+            conn.exec_drop(
+                "INSERT IGNORE INTO dynamic_challenge (id) VALUES (?)",
+                (id,),
+            ).await.map_err(|e| anyhow!("ctfd_db: upsert dynamic_challenge (stub): {}", e))?;
+        }
     }
 
     if type_ == "instance" || body["backend"].is_string() {

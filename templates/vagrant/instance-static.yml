@@ -15,7 +15,8 @@ instance:
     # Path to the directory containing the Vagrantfile on the monitor server.
     vagrantfile: /opt/challenges/challenge-name/vagrant
 
-    internal_port: 4000
+    # Single port (most challenges). For multi-port: internal_ports: [4000, 5000]
+    internal_ports: [4000]
     connection: nc  # nc | http | ssh
 
     # Static flag — bake it into the box image or provision it via the Vagrantfile.

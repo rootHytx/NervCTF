@@ -18,8 +18,15 @@ instance:
     # Service name whose port is exposed to players (defaults to "app" if omitted)
     compose_service: app
 
-    # Port the service listens on inside the container (must match compose file)
-    internal_port: 8080
+    # Port(s) the service listens on inside the container (must match compose file).
+    # Single port (most challenges):
+    internal_ports: [8080]
+    # Multi-port (all ports to the same service): internal_ports: [80, 443]
+    #
+    # Multi-service (each service gets its own ports — replaces compose_service + internal_ports):
+    # service_ports:
+    #   app:   [80]
+    #   admin: [8080]
 
     # How players connect: nc | http | ssh
     connection: http

@@ -1,11 +1,21 @@
 use crate::ctfd_api::models::{Challenge, FlagContent, HintContent};
 
 /// Returns true if the remote challenge needs to be updated to match local.
+///
+/// Note: challenge type changes are NOT handled here — they require a delete+recreate
+/// because CTFd's PATCH endpoint does not call the new type's `create()` method,
+/// leaving the plugin-specific table row (e.g. `dynamic_challenge`) missing.
+/// The deploy loop checks `remote.challenge_type != local.challenge_type` separately.
+///
+/// Dynamic challenge `value` is intentionally excluded: CTFd manages it automatically
+/// as teams solve. Comparing it would cause spurious re-deploys that reset the decay.
 pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
     if remote.category != local.category {
         return true;
     }
-    if remote.value != local.value {
+    // Skip value comparison for dynamic challenges — CTFd owns that field.
+    let is_dynamic = local.challenge_type == crate::ctfd_api::models::ChallengeType::Dynamic;
+    if !is_dynamic && remote.value != local.value {
         return true;
     }
     if remote.description != local.description {
@@ -162,7 +172,7 @@ mod tests {
             compose_service: None,
             lxc_image: None,
             vagrantfile: None,
-            internal_port: 80,
+            internal_ports: vec![80],
             connection: "http://{host}:{port}".to_string(),
             timeout_minutes: Some(30),
             max_renewals: None,
@@ -174,6 +184,7 @@ mod tests {
             flag_delivery: None,
             flag_file_path: None,
             flag_service: None,
+            service_ports: None,
         }
     }
 
@@ -501,7 +512,7 @@ mod tests {
         remote.instance = Some(base_instance_config());
         let mut local = base();
         let mut cfg = base_instance_config();
-        cfg.internal_port = 8080;
+        cfg.internal_ports = vec![8080];
         local.instance = Some(cfg);
         assert!(needs_update(&remote, &local));
     }

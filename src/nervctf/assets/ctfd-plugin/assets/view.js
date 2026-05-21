@@ -75,7 +75,22 @@ function _setAlertText(alert, text) {
   alert.textContent = text;
 }
 
-function _renderWithLabel(connection, parent) {
+function _renderWithLabel(connection, parent, connections) {
+  if (connections && connections.length > 0) {
+    // Multi-service (service_ports): render each service with its name as a label.
+    connections.forEach(function (conn) {
+      var label = document.createElement("strong");
+      label.textContent = conn.label + ":";
+      parent.append(label);
+      parent.append(document.createTextNode(" "));
+      renderConnectionInfo(conn, parent);
+      if (!parent.lastChild || parent.lastChild.tagName !== "BR") {
+        parent.append(document.createElement("br"));
+      }
+    });
+    return;
+  }
+  // Single-service or multi-port (internal_ports): one connection, no service label.
   var label = document.createElement("strong");
   label.textContent = "Instance Connection";
   parent.append(label, document.createElement("br"));
@@ -287,7 +302,7 @@ function view_container_info(challenge_id) {
         var expires = document.createElement("span");
         expires.textContent = formatExpiry(data.expires_at);
         alert.append(expires, document.createElement("br"));
-        _renderWithLabel(data.connection, alert);
+        _renderWithLabel(data.connection, alert, data.connections);
         hideCreateBtn();
         showUpdateBtns();
       } else {
@@ -348,7 +363,7 @@ function container_request(challenge_id) {
         var expires = document.createElement("span");
         expires.textContent = formatExpiry(data.expires_at);
         alert.append(expires, document.createElement("br"));
-        _renderWithLabel(data.connection, alert);
+        _renderWithLabel(data.connection, alert, data.connections);
         hideCreateBtn();
         showUpdateBtns();
       }

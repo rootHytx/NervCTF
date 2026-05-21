@@ -15,20 +15,46 @@ use super::ssh;
 /// a Docker container: bind() checks the container's network namespace, not the host where
 /// challenge containers actually publish their ports.
 pub fn pick_free_port(used_ports: &std::collections::HashSet<u16>) -> Result<u16> {
+    pick_free_ports(used_ports, 1).map(|v| v[0])
+}
+
+/// Pick `count` distinct free ports in one call so that all ports for a multi-port instance
+/// are allocated atomically — no two of them can collide with each other or with existing
+/// instances.
+pub fn pick_free_ports(used_ports: &std::collections::HashSet<u16>, count: usize) -> Result<Vec<u16>> {
+    if count == 0 {
+        return Ok(vec![]);
+    }
     let mut rng = rand::thread_rng();
-    for _ in 0..200 {
-        let port = rng.gen_range(40000u16..60000u16);
-        if !used_ports.contains(&port) {
-            return Ok(port);
+    let mut allocated: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut result = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let mut found = false;
+        for _ in 0..500 {
+            let port = rng.gen_range(40000u16..60000u16);
+            if !used_ports.contains(&port) && !allocated.contains(&port) {
+                allocated.insert(port);
+                result.push(port);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            for port in 40000u16..60000u16 {
+                if !used_ports.contains(&port) && !allocated.contains(&port) {
+                    allocated.insert(port);
+                    result.push(port);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return Err(anyhow!("No free ports available in range 40000-60000"));
         }
     }
-    // Sequential fallback if the random range is crowded
-    for port in 40000u16..60000u16 {
-        if !used_ports.contains(&port) {
-            return Ok(port);
-        }
-    }
-    Err(anyhow!("No free ports available in range 40000-60000"))
+    Ok(result)
 }
 
 /// Returns the names of all currently running Docker containers.
@@ -118,13 +144,13 @@ pub async fn write_flag_file(flag_host_path: &str, flag_value: &str, runner_ssh:
 
 /// Start a Docker container and return its **name** (not the Docker hex ID).
 ///
-/// `volumes` — list of `(host_path, container_path)` bind mounts; each is added as
-/// `-v host_path:container_path:ro`.  Used for file-based flag delivery.
+/// `port_mappings` — list of `(host_port, internal_port)` pairs; each becomes a
+/// `-p host:internal` flag.  First entry is the primary port shown to players.
+/// `volumes` — list of `(host_path, container_path)` bind mounts added as `-v …:…:ro`.
 pub async fn run_container(
     image_tag: &str,
     container_name: &str,
-    host_port: u16,
-    internal_port: u32,
+    port_mappings: &[(u16, u32)],
     command: Option<&str>,
     env_vars: &[(String, String)],
     volumes: &[(String, String)],
@@ -135,10 +161,12 @@ pub async fn run_container(
         "-d".to_string(),
         "--name".to_string(),
         container_name.to_string(),
-        "-p".to_string(),
-        format!("{}:{}", host_port, internal_port),
         "--restart=unless-stopped".to_string(),
     ];
+    for (hp, ip) in port_mappings {
+        docker_args.push("-p".to_string());
+        docker_args.push(format!("{}:{}", hp, ip));
+    }
     for (k, v) in env_vars {
         docker_args.push("-e".to_string());
         docker_args.push(format!("{}={}", k, v));

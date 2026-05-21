@@ -317,14 +317,20 @@ async fn deploy_challenges(
 
     let mut to_create: Vec<&Challenge> = Vec::new();
     let mut to_update: Vec<(&Challenge, u32)> = Vec::new();
+    // Challenges whose type changed: CTFd PATCH doesn't call the new type's create(),
+    // so changing type via PATCH leaves the plugin table row (e.g. dynamic_challenge)
+    // missing → CTFd 500 on access. Must delete + recreate instead.
+    let mut to_recreate: Vec<(&Challenge, u32)> = Vec::new();
     let mut up_to_date_names: Vec<&str> = Vec::new();
 
     for local in &local_challenges {
         if let Some(remote) = remote_map.get(&local.name) {
-            if recreate || needs_update(remote, local) {
-                let remote_id = remote
-                    .id
-                    .ok_or_else(|| anyhow!("Remote challenge '{}' has no ID", local.name))?;
+            let remote_id = remote
+                .id
+                .ok_or_else(|| anyhow!("Remote challenge '{}' has no ID", local.name))?;
+            if remote.challenge_type != local.challenge_type {
+                to_recreate.push((local, remote_id));
+            } else if recreate || needs_update(remote, local) {
                 to_update.push((local, remote_id));
             } else {
                 up_to_date_names.push(&local.name);
@@ -347,6 +353,10 @@ async fn deploy_challenges(
     if !to_create.is_empty() {
         println!("[+] CREATE ({}):", to_create.len());
         for c in &to_create { println!("    - {}", c.name); }
+    }
+    if !to_recreate.is_empty() {
+        println!("[↺] TYPE CHANGE — delete + recreate ({}):", to_recreate.len());
+        for (c, _) in &to_recreate { println!("    - {}", c.name); }
     }
     if !to_update.is_empty() {
         println!("[~] UPDATE ({}):", to_update.len());
@@ -371,7 +381,7 @@ async fn deploy_challenges(
         return Ok(());
     }
 
-    if to_create.is_empty() && to_update.is_empty() {
+    if to_create.is_empty() && to_update.is_empty() && to_recreate.is_empty() {
         println!("everything is up to date.");
         return Ok(());
     }
@@ -396,6 +406,45 @@ async fn deploy_challenges(
 
     for local in &to_create {
         print!("  [+] {}: ", local.name);
+        std::io::stdout().flush()?;
+        match create_challenge_phase1(client, local).await {
+            Ok((id, has_files, has_reqs, has_next)) => {
+                println!("ok (ID {})", id);
+                created += 1;
+                if local.challenge_type == ChallengeType::Instance {
+                    if let Err(e) = deploy_instance(client, local, id, runner).await {
+                        eprintln!("  [!] instance deploy error for '{}': {}", local.name, e);
+                    }
+                }
+                if has_files {
+                    file_jobs.push(FileUploadJob {
+                        challenge_id: id,
+                        source_path: local.source_path.clone(),
+                        files: local.files.as_ref().cloned().unwrap_or_default(),
+                    });
+                }
+                if has_reqs {
+                    req_jobs.push(ReqJob {
+                        challenge_id: id,
+                        prereq_names: local.requirements.as_ref().unwrap().prerequisite_names(),
+                    });
+                }
+                if let Some(next_name) = has_next {
+                    next_jobs.push(NextJob { challenge_id: id, next_name });
+                }
+            }
+            Err(e) => eprintln!("[x] {}", e),
+        }
+    }
+
+    for (local, remote_id) in &to_recreate {
+        print!("  [↺] {}: delete old... ", local.name);
+        std::io::stdout().flush()?;
+        if let Err(e) = client.delete_challenge(*remote_id).await {
+            eprintln!("[x] delete failed for '{}': {}", local.name, e);
+            continue;
+        }
+        print!("create new... ");
         std::io::stdout().flush()?;
         match create_challenge_phase1(client, local).await {
             Ok((id, has_files, has_reqs, has_next)) => {

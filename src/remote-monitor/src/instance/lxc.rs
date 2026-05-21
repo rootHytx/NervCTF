@@ -3,10 +3,10 @@ use anyhow::{anyhow, Result};
 pub async fn launch(
     lxc_image: &str,
     container_name: &str,
-    host_port: u16,
-    internal_port: u32,
+    port_mappings: &[(u16, u32)],
     flag: Option<&str>,
 ) -> Result<String> {
+    let host_port = port_mappings.first().map(|p| p.0).unwrap_or(0);
     // Remove any stale container with the same name
     let _ = delete(container_name).await;
 
@@ -40,26 +40,30 @@ pub async fn launch(
         ));
     }
 
-    // Add proxy device: host_port → internal_port
-    let output = tokio::process::Command::new("lxc")
-        .args([
-            "config", "device", "add",
-            container_name,
-            "ctfport",
-            "proxy",
-            &format!("listen=tcp:0.0.0.0:{}", host_port),
-            &format!("connect=tcp:127.0.0.1:{}", internal_port),
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow!("lxc config device add failed: {}", e))?;
+    // Add proxy devices: one per port mapping (host_port → internal_port)
+    for (i, (hp, ip)) in port_mappings.iter().enumerate() {
+        let device_name = format!("ctfport{}", i);
+        let output = tokio::process::Command::new("lxc")
+            .args([
+                "config", "device", "add",
+                container_name,
+                &device_name,
+                "proxy",
+                &format!("listen=tcp:0.0.0.0:{}", hp),
+                &format!("connect=tcp:127.0.0.1:{}", ip),
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow!("lxc config device add failed: {}", e))?;
 
-    if !output.status.success() {
-        let _ = delete(container_name).await;
-        return Err(anyhow!(
-            "lxc port forward setup failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        if !output.status.success() {
+            let _ = delete(container_name).await;
+            return Err(anyhow!(
+                "lxc port forward setup failed for {}:{}: {}",
+                hp, ip,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
     }
 
     // Inject flag into /challenge/flag if provided.

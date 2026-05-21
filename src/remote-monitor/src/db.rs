@@ -115,6 +115,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN flag TEXT", []);
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN ctfd_flag_id INTEGER", []);
     let _ = conn.execute("ALTER TABLE instances ADD COLUMN user_id INTEGER", []);
+    let _ = conn.execute("ALTER TABLE instances ADD COLUMN extra_ports TEXT", []);
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS ctfd_solves (
             challenge_name TEXT NOT NULL,
@@ -264,12 +265,14 @@ pub struct InstanceRow {
     pub renewals_used: i64,
     pub expires_at: String,
     pub flag: Option<String>,
+    /// JSON object `{"<internal>": <host>}` for each port mapping when >1 port exposed.
+    pub extra_ports: Option<String>,
 }
 
 pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Option<InstanceRow>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT id, challenge_name, team_id, user_id, container_id, host, port, connection_type, status, renewals_used, expires_at, flag
+        "SELECT id, challenge_name, team_id, user_id, container_id, host, port, connection_type, status, renewals_used, expires_at, flag, extra_ports
          FROM instances WHERE challenge_name = ?1 AND team_id = ?2",
     )?;
     let mut rows = stmt.query(params![challenge_name, team_id])?;
@@ -287,6 +290,7 @@ pub fn get_instance(db: &Db, challenge_name: &str, team_id: i64) -> Result<Optio
             renewals_used: row.get(9)?,
             expires_at: row.get(10)?,
             flag: row.get(11)?,
+            extra_ports: row.get(12)?,
         }))
     } else {
         Ok(None)
@@ -341,18 +345,20 @@ pub fn insert_instance(
     expires_at: &str,
     flag: Option<&str>,
     ctfd_flag_id: Option<i64>,
+    extra_ports: Option<&str>,
 ) -> Result<()> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     conn.execute(
-        r#"INSERT INTO instances (challenge_name, team_id, user_id, container_id, host, port, connection_type, status, flag, ctfd_flag_id, expires_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, ?9, ?10)
+        r#"INSERT INTO instances (challenge_name, team_id, user_id, container_id, host, port, connection_type, status, flag, ctfd_flag_id, extra_ports, expires_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8, ?9, ?10, ?11)
            ON CONFLICT(challenge_name, team_id) DO UPDATE SET
              user_id=excluded.user_id, container_id=excluded.container_id,
              host=excluded.host, port=excluded.port,
              connection_type=excluded.connection_type, status='running',
              flag=excluded.flag, ctfd_flag_id=excluded.ctfd_flag_id,
+             extra_ports=excluded.extra_ports,
              expires_at=excluded.expires_at, renewals_used=0"#,
-        params![challenge_name, team_id, user_id, container_id, host, port, connection_type, flag, ctfd_flag_id, expires_at],
+        params![challenge_name, team_id, user_id, container_id, host, port, connection_type, flag, ctfd_flag_id, extra_ports, expires_at],
     )?;
     // Persist the flag permanently so sharing detection works after the instance is gone.
     if let Some(f) = flag {
@@ -429,16 +435,29 @@ pub fn mark_instance_solved(db: &Db, challenge_name: &str, team_id: i64) -> Resu
 }
 
 /// Returns all host ports currently in use by running instances.
+/// Includes both the primary port and any extra ports stored in the extra_ports JSON column.
 pub fn get_used_ports(db: &Db) -> Result<std::collections::HashSet<u16>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let mut stmt = conn.prepare(
-        "SELECT port FROM instances WHERE status = 'running' OR (status = 'provisioning' AND port > 0)",
+        "SELECT port, extra_ports FROM instances WHERE status = 'running' OR (status = 'provisioning' AND port > 0)",
     )?;
-    let ports = stmt
-        .query_map([], |row| row.get::<_, i64>(0))?
-        .filter_map(|r| r.ok())
-        .filter_map(|p| u16::try_from(p).ok())
-        .collect();
+    let mut ports = std::collections::HashSet::new();
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for r in rows {
+        let (port, extra_ports) = r?;
+        if let Ok(p) = u16::try_from(port) { ports.insert(p); }
+        if let Some(ep) = extra_ports {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&ep) {
+                for (_, v) in map {
+                    if let Some(p) = v.as_u64().and_then(|p| u16::try_from(p).ok()) {
+                        ports.insert(p);
+                    }
+                }
+            }
+        }
+    }
     Ok(ports)
 }
 

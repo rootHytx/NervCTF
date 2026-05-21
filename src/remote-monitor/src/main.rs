@@ -904,6 +904,46 @@ async fn build_compose_remote_handler(
     Json(json!({"ok": true, "compose_dir": extract_dir})).into_response()
 }
 
+// ── Connection helpers ────────────────────────────────────────────────────────
+
+/// Load and parse a challenge's config JSON from the DB, returning a default Value on error.
+fn load_config_val(db: &crate::db::Db, challenge_name: &str) -> Value {
+    db::get_config(db, challenge_name)
+        .ok()
+        .flatten()
+        .and_then(|j| serde_json::from_str(&j).ok())
+        .unwrap_or_default()
+}
+
+/// Build a per-service labeled connections array for `service_ports` challenges.
+/// Returns `None` when the config has no `service_ports` key (single-service challenges).
+/// Each entry: `{"label": "<service>", "type": "<connection_type>", "host": "...", "port": N}`.
+fn build_connections(config: &Value, host: &str, port: u16, connection_type: &str, extra_ports: Option<&str>) -> Option<Value> {
+    let svc_ports_obj = config["service_ports"].as_object()?;
+    let extra: serde_json::Map<String, Value> = extra_ports
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    let mut connections: Vec<Value> = Vec::new();
+    for (svc, ports_val) in svc_ports_obj {
+        let iports: Vec<u32> = ports_val.as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|p| p as u32)).collect())
+            .unwrap_or_default();
+        for ip in &iports {
+            let host_port = extra.get(&ip.to_string())
+                .and_then(|v| v.as_u64())
+                .map(|p| p as u16)
+                .unwrap_or(port);
+            connections.push(json!({
+                "label": svc,
+                "type": connection_type,
+                "host": host,
+                "port": host_port
+            }));
+        }
+    }
+    if connections.is_empty() { None } else { Some(json!(connections)) }
+}
+
 // ── Player: request instance ──────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -929,12 +969,16 @@ async fn instance_request_handler(
     // Check for existing running or provisioning instance
     if let Ok(Some(inst)) = db::get_instance(&state.db, &body.challenge_name, team_id) {
         if inst.status == "running" {
+            let cfg = load_config_val(&state.db, &body.challenge_name);
+            let connections = build_connections(&cfg, &inst.host, inst.port as u16, &inst.connection_type, inst.extra_ports.as_deref());
             return Json(json!({
                 "status": "running",
                 "host": inst.host,
                 "port": inst.port,
                 "connection_type": inst.connection_type,
                 "expires_at": inst.expires_at,
+                "extra_ports": inst.extra_ports.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+                "connections": connections,
             })).into_response();
         }
         if inst.status == "provisioning" {
@@ -1056,14 +1100,20 @@ async fn instance_info_handler(
     };
 
     match db::get_instance(&state.db, &challenge_name, team_id) {
-        Ok(Some(inst)) => Json(json!({
-            "status": inst.status,
-            "host": inst.host,
-            "port": inst.port,
-            "connection_type": inst.connection_type,
-            "expires_at": inst.expires_at,
-            "renewals_used": inst.renewals_used,
-        })).into_response(),
+        Ok(Some(inst)) => {
+            let cfg = load_config_val(&state.db, &challenge_name);
+            let connections = build_connections(&cfg, &inst.host, inst.port as u16, &inst.connection_type, inst.extra_ports.as_deref());
+            Json(json!({
+                "status": inst.status,
+                "host": inst.host,
+                "port": inst.port,
+                "connection_type": inst.connection_type,
+                "expires_at": inst.expires_at,
+                "renewals_used": inst.renewals_used,
+                "extra_ports": inst.extra_ports.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+                "connections": connections,
+            })).into_response()
+        }
         Ok(None) => Json(json!({"status": "none"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
@@ -1109,11 +1159,14 @@ async fn instance_renew_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
 
+    let connections = build_connections(&config_val, &inst.host, inst.port as u16, &inst.connection_type, inst.extra_ports.as_deref());
     Json(json!({
         "host": inst.host,
         "port": inst.port,
         "connection_type": inst.connection_type,
         "expires_at": new_expires,
+        "extra_ports": inst.extra_ports.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "connections": connections,
     })).into_response()
 }
 
@@ -1177,16 +1230,22 @@ async fn plugin_info_handler(
         None => return (StatusCode::BAD_REQUEST, Json(json!({"error": "missing team_id"}))).into_response(),
     };
     match db::get_instance(&state.db, &challenge_name, team_id) {
-        Ok(Some(inst)) => Json(json!({
-            "status": inst.status,
-            "host": inst.host,
-            "port": inst.port,
-            "connection_type": inst.connection_type,
-            "expires_at": inst.expires_at,
-            "renewals_used": inst.renewals_used,
-            "container_id": inst.container_id,
-            "flag": inst.flag,
-        })).into_response(),
+        Ok(Some(inst)) => {
+            let cfg = load_config_val(&state.db, &challenge_name);
+            let connections = build_connections(&cfg, &inst.host, inst.port as u16, &inst.connection_type, inst.extra_ports.as_deref());
+            Json(json!({
+                "status": inst.status,
+                "host": inst.host,
+                "port": inst.port,
+                "connection_type": inst.connection_type,
+                "expires_at": inst.expires_at,
+                "renewals_used": inst.renewals_used,
+                "container_id": inst.container_id,
+                "flag": inst.flag,
+                "extra_ports": inst.extra_ports.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+                "connections": connections,
+            })).into_response()
+        }
         Ok(None) => Json(json!({"status": "none"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
@@ -1214,12 +1273,18 @@ async fn plugin_request_handler(
     if let Ok(Some(inst)) = db::get_instance(&state.db, &body.challenge_name, body.team_id) {
         if inst.status == "running" || inst.status == "provisioning" {
             info!("plugin_request: returning existing {} instance for {}/{}", inst.status, body.challenge_name, body.team_id);
+            let cfg = load_config_val(&state.db, &body.challenge_name);
+            let connections = if inst.status == "running" {
+                build_connections(&cfg, &inst.host, inst.port as u16, &inst.connection_type, inst.extra_ports.as_deref())
+            } else { None };
             return Json(json!({
                 "status": inst.status,
                 "host": inst.host,
                 "port": inst.port,
                 "connection_type": inst.connection_type,
                 "expires_at": inst.expires_at,
+                "extra_ports": inst.extra_ports.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+                "connections": connections,
             })).into_response();
         }
     }
@@ -1336,17 +1401,9 @@ async fn plugin_renew_handler(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
 
-    let timeout_minutes = db::get_config(&state.db, &body.challenge_name)
-        .ok().flatten()
-        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-        .and_then(|v| v["timeout_minutes"].as_u64())
-        .unwrap_or(45);
-
-    let max_renewals = db::get_config(&state.db, &body.challenge_name)
-        .ok().flatten()
-        .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
-        .and_then(|v| v["max_renewals"].as_u64())
-        .unwrap_or(3);
+    let cfg = load_config_val(&state.db, &body.challenge_name);
+    let timeout_minutes = cfg["timeout_minutes"].as_u64().unwrap_or(45);
+    let max_renewals = cfg["max_renewals"].as_u64().unwrap_or(3);
 
     if inst.renewals_used >= max_renewals as i64 {
         return (StatusCode::FORBIDDEN, Json(json!({"error": "Maximum renewals reached"}))).into_response();
@@ -1357,11 +1414,14 @@ async fn plugin_renew_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
 
+    let connections = build_connections(&cfg, &inst.host, inst.port as u16, &inst.connection_type, inst.extra_ports.as_deref());
     Json(json!({
         "host": inst.host,
         "port": inst.port,
         "connection_type": inst.connection_type,
         "expires_at": new_expires,
+        "extra_ports": inst.extra_ports.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "connections": connections,
     })).into_response()
 }
 

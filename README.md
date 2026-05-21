@@ -193,9 +193,9 @@ type: instance
 value: 0
 extra: { initial: 500, decay: 50, minimum: 100 }
 instance:
-  backend: docker         # docker | compose | lxc
-  image: .                # local path or registry image
-  internal_port: 1337
+  backend: docker          # docker | compose | lxc
+  image: .                 # local path or registry image
+  internal_ports: [1337]   # array; multi-port: [80, 443] — each gets a random host port
   connection: nc
   flag_mode: random
   timeout_minutes: 45

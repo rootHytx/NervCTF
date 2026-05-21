@@ -12,7 +12,9 @@ state: visible
 instance:
     backend: lxc
     lxc_image: ubuntu:22.04
-    internal_port: 4000
+    # Single port (most challenges). For multi-port: internal_ports: [4000, 5000]
+    # Each listed port gets its own LXC proxy device (ctfport0, ctfport1, ...).
+    internal_ports: [4000]
     connection: nc
 
     flag_mode: random

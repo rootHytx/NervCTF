@@ -74,12 +74,17 @@ def _sqlite_to_ms(s):
 
 
 def _to_connection(inst):
-    """Convert monitor instance row dict to Docker-plugin-compatible connection object."""
-    return {
+    """Convert monitor instance row dict to a connection object for view.js."""
+    conn = {
         "type": inst.get("connection_type", "nc"),
         "host": inst.get("host", ""),
         "port": inst.get("port", 0),
     }
+    # Wire extra_ports through so view.js can render all port mappings for
+    # multi-port challenges (internal_ports: [80, 443] etc.).
+    if inst.get("extra_ports"):
+        conn["ports"] = inst["extra_ports"]
+    return conn
 
 
 # ── Challenge type ─────────────────────────────────────────────────────────────
@@ -425,11 +430,14 @@ def get_instance_info(challenge_id):
         data = _monitor_json(resp)
         status = data.get("status", "")
         if status == "running":
-            return {
+            resp_body = {
                 "status": "running",
                 "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
                 "connection": _to_connection(data),
-            }, 200
+            }
+            if data.get("connections"):
+                resp_body["connections"] = data["connections"]
+            return resp_body, 200
         if status == "provisioning":
             return {
                 "status": "provisioning",
@@ -487,10 +495,13 @@ def request_instance():
                     "status": "provisioning",
                     "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
                 }, 200
-            return {
+            resp_body = {
                 "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
                 "connection": _to_connection(data),
-            }, 200
+            }
+            if data.get("connections"):
+                resp_body["connections"] = data["connections"]
+            return resp_body, 200
         return data, resp.status_code
     except Exception as e:
         logger.error("Route error: %s", e)
@@ -532,10 +543,13 @@ def renew_instance():
             return {"error": "Internal server error"}, 500
         data = _monitor_json(resp)
         if resp.ok and not data.get("error"):
-            return {
+            resp_body = {
                 "expires_at": _sqlite_to_ms(data.get("expires_at", "")),
                 "connection": _to_connection(data),
-            }, 200
+            }
+            if data.get("connections"):
+                resp_body["connections"] = data["connections"]
+            return resp_body, 200
         return data, resp.status_code
     except Exception as e:
         logger.error("Route error: %s", e)

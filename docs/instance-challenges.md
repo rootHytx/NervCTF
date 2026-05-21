@@ -18,9 +18,9 @@ Both are deployed by `nervctf setup`.
 ```yaml
 type: instance
 instance:
-  backend: docker       # docker | compose | lxc | vagrant
-  internal_port: 1337   # port exposed inside the container
-  connection: nc        # nc | http | ssh
+  backend: docker          # docker | compose | lxc | vagrant
+  internal_ports: [1337]   # port(s) exposed inside the container (see below)
+  connection: nc           # nc | http | ssh
 ```
 
 ### Top-level fields
@@ -65,7 +65,24 @@ instance:
   vagrantfile: ./vm
 
   # ── Common ──────────────────────────────────────────────────────────────────
-  internal_port: 1337
+
+  # Single port (most challenges):
+  internal_ports: [1337]
+
+  # Multi-port: all listed ports are exposed on separate randomly-assigned host ports.
+  # The first entry is the primary port (used in `connection` string and `port` field).
+  # All allocated host ports are returned in the `extra_ports` response field.
+  # Backward compat: `internal_port: 1337` (scalar) is still accepted.
+  # internal_ports: [80, 443]
+
+  # Compose only — alternative to `internal_ports` for challenges with multiple independent
+  # services that each need their own randomly-allocated host port(s).
+  # Maps each service name to the internal ports it exposes.
+  # Mutually exclusive with `internal_ports` (a warning is raised if both are set).
+  # service_ports:
+  #   app:   [80]
+  #   admin: [8080]
+
   connection: nc              # nc | http | ssh
   command: null               # override container entrypoint/CMD (optional)
   timeout_minutes: 45
@@ -105,7 +122,7 @@ flags:
 instance:
   backend: docker
   image: myimage:latest
-  internal_port: 4000
+  internal_ports: [4000]
   connection: nc
 ```
 
@@ -186,7 +203,7 @@ The `docker` backend runs a single container per team.
 ```
 docker run -d \
   --name ctf-<challenge>-<random6> \
-  -p <host_port>:<internal_port> \
+  -p <host_port1>:<internal_port1> [-p <host_port2>:<internal_port2> ...] \
   -e FLAG=<random_flag> \
   <image_tag> [command]
 ```
@@ -198,7 +215,7 @@ Read the flag inside the container via the `FLAG` environment variable.
 ```
 docker run -d \
   --name ctf-<challenge>-<random6> \
-  -p <host_port>:<internal_port> \
+  -p <host_port1>:<internal_port1> \
   -v /tmp/ctf-flags/<name>.flag:<flag_file_path>:ro \
   <image_tag> [command]
 ```
@@ -216,7 +233,8 @@ instance:
 
 **Common:**
 
-- Port is picked randomly in range 40000–60000 (avoiding ports already in use)
+- Each internal port gets its own randomly-picked host port in range 40000–60000 (all allocated atomically — no collisions between ports of the same instance)
+- Primary port (first in `internal_ports`) is the `port` field in all API responses; all port mappings are also available in `extra_ports` (see [API Responses](#api-responses))
 - Container name: `ctf-<sanitized_challenge_name>-<6 random chars>` (unique per provision)
 - Image is built once during `nervctf deploy` and reused for all teams
 
@@ -240,7 +258,9 @@ The `compose` backend manages a `docker compose` project per team:
 
 The override always contains:
 
-1. **Port mapping** for the main service (`compose_service`): `host_port:internal_port`
+1. **Port mappings** per service: one `host_port:internal_port` entry per listed port — all pre-allocated atomically before `docker compose up`.
+   - With `internal_ports`: all ports mapped to `compose_service` (default: `app`).
+   - With `service_ports`: each service gets its own port list (see [Multi-service port randomization](#multi-service-port-randomization) below).
 2. **`image:` key** for every pre-built service, referencing the image built by `nervctf deploy`
 3. **Volume mount** for `flag_delivery: file` (if applicable)
 
@@ -285,6 +305,28 @@ instance:
   # flag_service: other-service  # optional, defaults to compose_service
 ```
 
+### Multi-service port randomization
+
+Use `service_ports` when a challenge exposes ports on **more than one independent service**.
+Each service gets its own set of randomly-allocated host ports:
+
+```yaml
+instance:
+  backend: compose
+  compose_file: docker-compose.yml
+  service_ports:
+    app:   [80]
+    admin: [8080]
+  connection: http
+```
+
+- `service_ports` replaces both `compose_service` and `internal_ports` — do not set both.
+- The primary service (whose port appears in the player-facing `port` field) is `compose_service`
+  if that key is present in the map; otherwise the first declared service is used.
+- All allocated host ports (across all services) appear in the `extra_ports` API response field
+  as `{"<internal_port>": <host_port>}` entries.
+- Validator raises a warning if `service_ports` and `internal_ports` are both set.
+
 ### Important: `container_name:` must not be set
 
 Do not use `container_name:` in your `docker-compose.yml`. Docker Compose uses the project
@@ -307,7 +349,7 @@ Launches an LXC/LXD container per team:
 
 1. `lxc launch <lxc_image> <container_name>`
 2. `lxc wait --state=Running`
-3. `lxc config device add` — proxy port `host_port → internal_port`
+3. `lxc config device add` — one `ctfport{i}` proxy device per entry in `internal_ports` (e.g. `ctfport0`, `ctfport1`, …), each mapping a random host port to the corresponding internal port
 4. `lxc exec` — inject flag into `/challenge/flag` (if `flag_mode: random`)
 
 Requires LXD to be installed and initialised on the monitor server. `nervctf setup`
@@ -333,6 +375,52 @@ playbook but the provisioning logic is not yet implemented.
 | Provisioning stuck >30 min | Background task treats the row the same as expired (`created_at` is the reference, not `expires_at`) |
 | Container externally killed | Health check (runs every 30s tick) detects the container absent from both `docker ps` and `docker compose ls`; deletes row and cleans up flag |
 | Challenge deleted | All instances stopped; challenge config removed from `instance_configs` |
+
+---
+
+## API Responses
+
+All instance info/request/renew responses include the following fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | string | `provisioning` \| `running` \| `none` |
+| `host` | string | Public hostname/IP |
+| `port` | number | Primary host port (maps to `internal_ports[0]`, or primary service's first port) |
+| `connection_type` | string | Connection template (`nc` / `http` / `ssh`) |
+| `expires_at` | string | SQLite datetime of expiry |
+| `extra_ports` | object \| null | `{"<internal>": <host>}` for every port mapping when >1 port is exposed across all services; `null` for single-port challenges |
+| `connections` | array \| null | Per-service labeled entries (see below); `null` for challenges without `service_ports` |
+
+### `extra_ports` (multi-port, same service)
+
+For `internal_ports: [80, 443]` — all ports go to one service, no labels needed:
+
+```json
+{
+  "port": 42100,
+  "extra_ports": {"80": 42100, "443": 53210}
+}
+```
+
+The CTFd plugin renders all ports from `extra_ports` as separate links/commands. The `port` field equals `extra_ports["<internal_ports[0]>"]`.
+
+### `connections` (multi-service, `service_ports`)
+
+For `service_ports: {app: [80], admin: [8080]}` — each service has its own labeled entry:
+
+```json
+{
+  "port": 42100,
+  "extra_ports": {"80": 42100, "8080": 54321},
+  "connections": [
+    {"label": "app",   "type": "http", "host": "1.2.3.4", "port": 42100},
+    {"label": "admin", "type": "http", "host": "1.2.3.4", "port": 54321}
+  ]
+}
+```
+
+The CTFd plugin renders each entry as `<service>: <connection>` so players see clearly which port belongs to which service.
 
 ---
 

@@ -44,33 +44,37 @@ pub async fn compose_cmd() -> tokio::process::Command {
 
 /// Bring up a compose project for a team instance.
 ///
-/// `compose_file`   — path to the docker-compose.yml (on runner in split mode, local otherwise)
-/// `project_name`   — unique project name (e.g. ctf-challenge-t42)
-/// `internal_port`  — the container port to expose
-/// `service`        — service name whose port to map (empty = "app")
-/// `flag`           — optional per-instance flag value
-/// `flag_delivery`  — `"env"` (default): FLAG exposed as a compose env var for
-///                    `${FLAG}` substitution; `"file"`: flag written to a bind-mounted
-///                    file at `flag_file_path` inside `flag_service`
-/// `flag_file_path` — absolute path inside the container (required for `"file"` mode)
-/// `flag_service`   — service that receives the flag file mount; defaults to `service`
-/// `runner_ssh`     — override SSH target; falls back to `runner_target()` if `None`
+/// `compose_file`     — path to the docker-compose.yml (on runner in split mode, local otherwise)
+/// `project_name`     — unique project name (e.g. ctf-challenge-t42)
+/// `service_mappings` — maps each service name to its pre-allocated `[(host_port, internal_port)]`
+///                      pairs.  The primary service's first host port is returned to the caller.
+/// `primary_service`  — service whose first port is shown to players; empty = "app"
+/// `flag`             — optional per-instance flag value
+/// `flag_delivery`    — `"env"` (default): FLAG exposed as a compose env var for
+///                      `${FLAG}` substitution; `"file"`: flag written to a bind-mounted
+///                      file at `flag_file_path` inside `flag_service`
+/// `flag_file_path`   — absolute path inside the container (required for `"file"` mode)
+/// `flag_service`     — service that receives the flag file mount; defaults to `primary_service`
+/// `runner_ssh`       — override SSH target; falls back to `runner_target()` if `None`
 ///
-/// Returns `(host_port, container_id_or_project)`.
+/// Returns `(primary_host_port, container_id_or_project)`.
 pub async fn up(
     compose_file: &Path,
     project_name: &str,
-    internal_port: u32,
-    service: &str,
-    used_ports: &std::collections::HashSet<u16>,
+    service_mappings: &std::collections::HashMap<String, Vec<(u16, u32)>>,
+    primary_service: &str,
     flag: Option<&str>,
     flag_delivery: &str,
     flag_file_path: Option<&str>,
     flag_service: Option<&str>,
     runner_ssh: Option<&str>,
 ) -> Result<(u16, String)> {
-    let host_port = crate::instance::docker::pick_free_port(used_ports)?;
-    let svc_name = if service.is_empty() { "app" } else { service };
+    let svc_name = if primary_service.is_empty() { "app" } else { primary_service };
+    let host_port = service_mappings
+        .get(svc_name)
+        .and_then(|v| v.first())
+        .map(|(h, _)| *h)
+        .ok_or_else(|| anyhow::anyhow!("service_mappings has no entry for primary service '{}'", svc_name))?;
 
     let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
 
@@ -154,11 +158,13 @@ pub async fn up(
         ($svc:expr) => {{
             let svc: &str = $svc;
             override_content.push_str(&format!("  {}:\n    image: {}-{}\n", svc, challenge_dir_name, svc));
-            if svc == svc_name {
-                override_content.push_str(&format!(
-                    "    ports:\n      - \"{}:{}\"\n",
-                    host_port, internal_port
-                ));
+            if let Some(mappings) = service_mappings.get(svc) {
+                if !mappings.is_empty() {
+                    override_content.push_str("    ports:\n");
+                    for (hp, ip) in mappings {
+                        override_content.push_str(&format!("      - \"{}:{}\"\n", hp, ip));
+                    }
+                }
             }
             if let Some((ref hp, _, ref tsvc, ref cp)) = flag_info {
                 if tsvc.as_str() == svc {

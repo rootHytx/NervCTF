@@ -92,10 +92,19 @@ pub async fn provision(
     container_name_hint: Option<String>,
 ) -> Result<(String, u16, String, String)> {
     let backend = config["backend"].as_str().unwrap_or("docker");
-    let internal_port = config["internal_port"].as_u64().unwrap_or(4000) as u32;
     let connection = config["connection"].as_str().unwrap_or("nc").to_string();
     let timeout_minutes = config["timeout_minutes"].as_u64().unwrap_or(45);
     let command = config["command"].as_str();
+
+    // Parse internal_ports: accept array (new) or scalar (old config_json in DB).
+    let internal_ports: Vec<u32> = if let Some(arr) = config["internal_ports"].as_array() {
+        arr.iter().filter_map(|v| v.as_u64().map(|p| p as u32)).collect()
+    } else if let Some(p) = config["internal_port"].as_u64() {
+        vec![p as u32]
+    } else {
+        vec![4000]
+    };
+    let port_count = internal_ports.len().max(1);
 
     // Look up the CTFd challenge ID for flag registration.
     let ctfd_id = crate::db::get_ctfd_id(db, challenge_name)?;
@@ -106,7 +115,9 @@ pub async fn provision(
                 .unwrap_or_else(|| format!("{}:latest", sanitize_name(challenge_name)));
 
             let used_ports = crate::db::get_used_ports(db)?;
-            let host_port = docker::pick_free_port(&used_ports)?;
+            let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
+            let port_mappings: Vec<(u16, u32)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, &i)| (h, i)).collect();
+            let host_port = host_ports[0];
             let cname = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
 
             let flag = generate_flag(config);
@@ -134,8 +145,7 @@ pub async fn provision(
             let container_id = docker::run_container(
                 &image_tag,
                 &cname,
-                host_port,
-                internal_port,
+                &port_mappings,
                 command,
                 &env_vars,
                 &volumes,
@@ -147,11 +157,12 @@ pub async fn provision(
                 _ => None,
             };
 
+            let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &container_id,
                 public_host, host_port as i64, &connection, &expires_at,
-                flag.as_deref(), ctfd_flag_id,
+                flag.as_deref(), ctfd_flag_id, extra_ports.as_deref(),
             )?;
 
             Ok((public_host.to_string(), host_port, connection, expires_at))
@@ -179,12 +190,63 @@ pub async fn provision(
             let project_name = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
             let used_ports = crate::db::get_used_ports(db)?;
             let flag = generate_flag(config);
-            let (host_port, project) = compose::up(
+
+            // Build service_mappings and determine primary service + host_port.
+            // Path A: service_ports is present — allocate ports per-service.
+            // Path B: service_ports absent — wrap existing internal_ports into single-key map.
+            let (service_mappings, primary_service, host_port, all_port_mappings) =
+                if let Some(svc_ports_obj) = config["service_ports"].as_object() {
+                    // Path A: multi-service port allocation
+                    let total_count: usize = svc_ports_obj.values()
+                        .map(|v| v.as_array().map(|a| a.len()).unwrap_or(0))
+                        .sum();
+                    let total_count = total_count.max(1);
+                    let host_ports = docker::pick_free_ports(&used_ports, total_count)?;
+                    let mut offset = 0usize;
+                    let mut map: std::collections::HashMap<String, Vec<(u16, u32)>> =
+                        std::collections::HashMap::new();
+                    let mut all_pairs: Vec<(u16, u32)> = Vec::new();
+                    for (svc, ports_val) in svc_ports_obj {
+                        let iports: Vec<u32> = ports_val.as_array()
+                            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|p| p as u32)).collect())
+                            .unwrap_or_default();
+                        let n = iports.len();
+                        let pairs: Vec<(u16, u32)> = host_ports[offset..offset + n].iter()
+                            .zip(iports.iter())
+                            .map(|(&h, &i)| (h, i))
+                            .collect();
+                        all_pairs.extend_from_slice(&pairs);
+                        map.insert(svc.clone(), pairs);
+                        offset += n;
+                    }
+                    // Primary service: compose_service if set and present in map, else first key.
+                    let primary = if !compose_service.is_empty() && map.contains_key(compose_service) {
+                        compose_service.to_string()
+                    } else {
+                        map.keys().next().cloned().unwrap_or_else(|| "app".to_string())
+                    };
+                    let hp = map.get(&primary).and_then(|v| v.first()).map(|(h, _)| *h)
+                        .ok_or_else(|| anyhow!("service_ports: primary service '{}' has no ports", primary))?;
+                    (map, primary, hp, all_pairs)
+                } else {
+                    // Path B: single-service, existing behavior
+                    let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
+                    let port_mappings: Vec<(u16, u32)> = host_ports.iter()
+                        .zip(internal_ports.iter())
+                        .map(|(&h, &i)| (h, i))
+                        .collect();
+                    let hp = host_ports[0];
+                    let svc_key = if compose_service.is_empty() { "app" } else { compose_service };
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(svc_key.to_string(), port_mappings.clone());
+                    (map, svc_key.to_string(), hp, port_mappings)
+                };
+
+            let (_, project) = compose::up(
                 &compose_path,
                 &project_name,
-                internal_port,
-                compose_service,
-                &used_ports,
+                &service_mappings,
+                &primary_service,
                 flag.as_deref(),
                 flag_delivery,
                 flag_file_path,
@@ -197,11 +259,12 @@ pub async fn provision(
                 _ => None,
             };
 
+            let extra_ports = build_extra_ports_json(&all_port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &project,
                 public_host, host_port as i64, &connection, &expires_at,
-                flag.as_deref(), ctfd_flag_id,
+                flag.as_deref(), ctfd_flag_id, extra_ports.as_deref(),
             )?;
             Ok((public_host.to_string(), host_port, connection, expires_at))
         }
@@ -209,36 +272,58 @@ pub async fn provision(
             let lxc_image = config["lxc_image"].as_str().unwrap_or("");
             let cname = container_name(challenge_name);
             let used_ports = crate::db::get_used_ports(db)?;
-            let host_port = docker::pick_free_port(&used_ports)?;
+            let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
+            let port_mappings: Vec<(u16, u32)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, &i)| (h, i)).collect();
+            let host_port = host_ports[0];
             let flag = generate_flag(config);
-            let cid = lxc::launch(lxc_image, &cname, host_port, internal_port, flag.as_deref()).await?;
+            let cid = lxc::launch(lxc_image, &cname, &port_mappings, flag.as_deref()).await?;
 
             let ctfd_flag_id = match (&flag, ctfd_id) {
                 (Some(f), Some(cid_val)) => crate::ctfd_db::create_flag(ctfd_pool, cid_val, f).await,
                 _ => None,
             };
 
+            let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &cid,
                 public_host, host_port as i64, &connection, &expires_at,
-                flag.as_deref(), ctfd_flag_id,
+                flag.as_deref(), ctfd_flag_id, extra_ports.as_deref(),
             )?;
             Ok((public_host.to_string(), host_port, connection, expires_at))
         }
         "vagrant" => {
             let vagrantfile = config["vagrantfile"].as_str().unwrap_or("");
             let vm_name = container_name(challenge_name);
-            let (host_port, vm_id) = vagrant::up(vagrantfile, &vm_name, internal_port).await?;
+            let used_ports = crate::db::get_used_ports(db)?;
+            let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
+            let port_mappings: Vec<(u16, u32)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, &i)| (h, i)).collect();
+            let host_port = host_ports[0];
+            let (_, vm_id) = vagrant::up(vagrantfile, &vm_name, &port_mappings).await?;
+            let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &vm_id,
-                public_host, host_port as i64, &connection, &expires_at, None, None,
+                public_host, host_port as i64, &connection, &expires_at,
+                None, None, extra_ports.as_deref(),
             )?;
             Ok((public_host.to_string(), host_port, connection, expires_at))
         }
         other => Err(anyhow!("Unknown backend: {}", other)),
     }
+}
+
+/// Build a JSON object `{"<internal>": <host>}` for multi-port instances.
+/// Returns None for single-port instances (no extra info needed).
+fn build_extra_ports_json(port_mappings: &[(u16, u32)]) -> Option<String> {
+    if port_mappings.len() <= 1 {
+        return None;
+    }
+    let map: serde_json::Map<String, Value> = port_mappings
+        .iter()
+        .map(|(h, i)| (i.to_string(), serde_json::json!(*h as u64)))
+        .collect();
+    serde_json::to_string(&map).ok()
 }
 
 pub fn expires_at_string(timeout_minutes: u64) -> String {

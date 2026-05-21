@@ -16,8 +16,12 @@ instance:
     # Or a registry image: "ubuntu:22.04", "registry.example.com/my-image:latest"
     image: .
 
-    # Port the service listens on inside the container
-    internal_port: 4000
+    # Port(s) the service listens on inside the container.
+    # Single port (most challenges):
+    internal_ports: [4000]
+    # Multi-port: each listed port gets a separate randomly-assigned host port.
+    # The first entry is the primary port shown to players.
+    # internal_ports: [80, 443]
 
     # How players connect: nc | http | ssh
     connection: nc

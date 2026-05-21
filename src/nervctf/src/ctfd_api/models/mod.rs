@@ -1,4 +1,26 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Accept either a single port integer or a list of port integers.
+/// Allows challenge.yml files to use `internal_port: 1337` (old single-port form)
+/// or `internal_ports: [1337, 8080]` (new multi-port form) interchangeably.
+fn deserialize_ports<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u32>, D::Error> {
+    use serde::de::{self, Visitor};
+    struct PortsVisitor;
+    impl<'de> Visitor<'de> for PortsVisitor {
+        type Value = Vec<u32>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a port number or a list of port numbers")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Vec<u32>, E> { Ok(vec![v as u32]) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Vec<u32>, E> { Ok(vec![v as u32]) }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u32>, A::Error> {
+            let mut ports = Vec::new();
+            while let Some(p) = seq.next_element::<u32>()? { ports.push(p); }
+            Ok(ports)
+        }
+    }
+    d.deserialize_any(PortsVisitor)
+}
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -140,7 +162,11 @@ pub struct InstanceConfig {
     pub vagrantfile: Option<String>,
 
     // Common
-    pub internal_port: u32,
+    /// All internal ports to expose. Accepts both `internal_port: 1337` (single, old form)
+    /// and `internal_ports: [1337, 8080]` (list, new form). First port is the primary one
+    /// shown in the player connection string; all are randomly allocated at provision time.
+    #[serde(alias = "internal_port", deserialize_with = "deserialize_ports", default)]
+    pub internal_ports: Vec<u32>,
     pub connection: String,
     pub timeout_minutes: Option<u32>,
     pub max_renewals: Option<u32>,
@@ -161,6 +187,11 @@ pub struct InstanceConfig {
     /// Compose service that receives the flag.  Defaults to `compose_service`.
     /// Useful when the port-exposing service differs from the one that holds the flag.
     pub flag_service: Option<String>,
+    /// Compose only: maps each service name to the internal ports it exposes.
+    /// When set, replaces `compose_service` + `internal_ports` for port allocation.
+    /// Mutually exclusive with `internal_ports` (validator warns if both set).
+    #[serde(default)]
+    pub service_ports: Option<std::collections::HashMap<String, Vec<u32>>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]

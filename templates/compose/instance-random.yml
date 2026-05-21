@@ -13,7 +13,13 @@ instance:
     backend: compose
     compose_file: docker-compose.yml
     compose_service: app
-    internal_port: 8080
+    # Single port (most challenges). For multi-port: internal_ports: [80, 443]
+    # Each listed port gets its own host port in the per-instance override file.
+    internal_ports: [8080]
+    # Multi-service alternative (replaces compose_service + internal_ports):
+    # service_ports:
+    #   app:   [80]
+    #   admin: [8080]
     connection: http  # nc | http | ssh
 
     # Random per-team flag — the monitor generates a unique flag per instance.

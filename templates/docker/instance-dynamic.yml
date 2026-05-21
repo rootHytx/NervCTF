@@ -12,7 +12,9 @@ state: visible
 instance:
     backend: docker
     image: .
-    internal_port: 4000
+    # Single port (most challenges). For multi-port: internal_ports: [80, 443]
+    # Each listed port gets a separate randomly-assigned host port.
+    internal_ports: [4000]
     connection: nc  # nc | http | ssh
 
     # NOTE: flag_mode: random and dynamic scoring are independent concepts.

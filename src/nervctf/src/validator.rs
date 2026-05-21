@@ -291,11 +291,22 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                     "required for instance challenges — add an `instance:` block with backend, internal_port, connection (or put them under `extra:`)",
                 )),
                 Some(inst) => {
-                    if inst.internal_port == 0 {
-                        issues.push(Issue::error(name, "instance.internal_port", "must be > 0"));
-                    }
-                    if inst.internal_port > 65535 {
-                        issues.push(Issue::error(name, "instance.internal_port", "must be a valid port (1-65535)"));
+                    let has_service_ports = inst.backend == crate::ctfd_api::models::InstanceBackend::Compose
+                        && inst.service_ports.as_ref().map_or(false, |sp| !sp.is_empty());
+                    if inst.internal_ports.is_empty() {
+                        if !has_service_ports {
+                            issues.push(Issue::error(name, "instance.internal_ports", "at least one port required — use `internal_port: N` or `internal_ports: [N, …]`"));
+                        }
+                    } else if has_service_ports {
+                        issues.push(Issue::warn(name, "instance.internal_ports", "service_ports and internal_ports are mutually exclusive — internal_ports will be ignored"));
+                    } else {
+                        for &p in &inst.internal_ports {
+                            if p == 0 {
+                                issues.push(Issue::error(name, "instance.internal_ports", "port 0 is not a valid port number"));
+                            } else if p > 65535 {
+                                issues.push(Issue::error(name, "instance.internal_ports", format!("port {} out of valid range (1–65535)", p)));
+                            }
+                        }
                     }
                     if inst.connection.trim().is_empty() {
                         issues.push(Issue::error(name, "instance.connection", "required (e.g. 'nc', 'http', 'ssh')"));
@@ -336,6 +347,24 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                                     name, "instance.compose_file",
                                     format!("'{}' not found at {}", cf, cf_path.display()),
                                 ));
+                            }
+                            if let Some(ref svc_ports) = inst.service_ports {
+                                for (svc, ports) in svc_ports {
+                                    if ports.is_empty() {
+                                        issues.push(Issue::error(
+                                            name, "instance.service_ports",
+                                            format!("service '{}': at least one port is required", svc),
+                                        ));
+                                    }
+                                    for &p in ports {
+                                        if p == 0 || p > 65535 {
+                                            issues.push(Issue::error(
+                                                name, "instance.service_ports",
+                                                format!("service '{}': port {} out of valid range (1–65535)", svc, p),
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                         }
                         crate::ctfd_api::models::InstanceBackend::Lxc => {
@@ -614,9 +643,13 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
         }
         ChallengeType::Instance => {
             if let Some(inst) = &c.instance {
-                let port_s = inst.internal_port.to_string();
+                let ports_s: Option<String> = if inst.internal_ports.is_empty() {
+                    None
+                } else {
+                    Some(inst.internal_ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "))
+                };
                 frow(FW, "instance.backend", Some(&format!("{:?}", inst.backend).to_lowercase()), fi("instance.backend"));
-                frow(FW, "instance.internal_port", Some(&port_s), fi("instance.internal_port"));
+                frow(FW, "instance.internal_ports", ports_s.as_deref(), fi("instance.internal_ports"));
                 frow(FW, "instance.connection", Some(&inst.connection), fi("instance.connection"));
                 if let Some(img) = &inst.image {
                     frow(FW, "instance.image", Some(img.as_str()), fi("instance.image"));
@@ -628,6 +661,21 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
                 }
                 if let Some(cs) = &inst.compose_service {
                     frow(FW, "instance.compose_service", Some(cs.as_str()), fi("instance.compose_service"));
+                }
+                if inst.backend == crate::ctfd_api::models::InstanceBackend::Compose {
+                    if let Some(ref sp) = inst.service_ports {
+                        let mut entries: Vec<String> = sp.iter()
+                            .map(|(svc, ports)| {
+                                let ps: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+                                format!("{}: [{}]", svc, ps.join(", "))
+                            })
+                            .collect();
+                        entries.sort();
+                        let val = format!("{{{}}}", entries.join(", "));
+                        frow(FW, "instance.service_ports", Some(&val), fi("instance.service_ports"));
+                    } else if !fi("instance.service_ports").is_empty() {
+                        frow(FW, "instance.service_ports", None, fi("instance.service_ports"));
+                    }
                 }
                 if let Some(li) = &inst.lxc_image {
                     frow(FW, "instance.lxc_image", Some(li.as_str()), fi("instance.lxc_image"));
@@ -840,8 +888,8 @@ fn print_challenge_dict(c: &Challenge, issues: &[&Issue]) {
         "name", "category", "description", "type", "value",
         "extra", "extra.initial", "extra.decay", "extra.minimum", "extra.decay_function",
         // instance fields
-        "instance", "instance.backend", "instance.internal_port", "instance.connection",
-        "instance.image", "instance.compose_file", "instance.compose_service",
+        "instance", "instance.backend", "instance.internal_ports", "instance.connection",
+        "instance.image", "instance.compose_file", "instance.compose_service", "instance.service_ports",
         "instance.lxc_image", "instance.vagrantfile",
         "instance.flag_mode", "instance.flag_delivery", "instance.flag_file_path",
         "instance.flag_service", "instance.flag_prefix", "instance.flag_suffix",

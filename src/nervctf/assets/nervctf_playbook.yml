@@ -105,6 +105,9 @@
         path: "{{ ctfd_path }}/requirements.txt"
       register: ctfd_cloned
 
+    # Pin CTFd to the tested version. This only runs on first install (when: not ctfd_cloned.stat.exists).
+    # On subsequent runs, use 'nervctf probe' (or the upgrade playbook) to verify the installed version.
+    # Supported version: 3.7.3 — update this value and re-test when upgrading CTFd.
     - name: Clone CTFd
       git:
         repo: https://github.com/CTFd/CTFd.git

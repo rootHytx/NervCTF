@@ -109,6 +109,33 @@ fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_team_flags_lookup ON team_flags(challenge_name, flag);
         CREATE INDEX IF NOT EXISTS idx_flag_attempts_challenge ON flag_attempts(challenge_name, team_id);
         CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+
+        -- Singleton row (id=1 enforced by CHECK) that stores the most recent CTFd
+        -- schema fingerprint and capability status produced by run_probe().
+        -- Created once at startup; overwritten on every probe run.
+        CREATE TABLE IF NOT EXISTS ctfd_probe (
+            id                    INTEGER PRIMARY KEY CHECK (id = 1),
+            probed_at             TEXT NOT NULL DEFAULT (datetime('now')),
+            ctfd_version_tag      TEXT,
+            ctfd_version_source   TEXT,
+            is_team_mode          INTEGER,
+            challenges_cols       TEXT,
+            has_dynamic_table     INTEGER NOT NULL DEFAULT 0,
+            dynamic_cols          TEXT,
+            has_next_id           INTEGER NOT NULL DEFAULT 0,
+            has_attribution       INTEGER NOT NULL DEFAULT 0,
+            has_logic             INTEGER NOT NULL DEFAULT 0,
+            has_position          INTEGER NOT NULL DEFAULT 0,
+            dynamic_inline        INTEGER NOT NULL DEFAULT 0,
+            dynamic_partial       INTEGER NOT NULL DEFAULT 0,
+            has_instance_table    INTEGER NOT NULL DEFAULT 0,
+            cap_challenge_crud    TEXT NOT NULL DEFAULT 'unknown',
+            cap_dynamic_scoring   TEXT NOT NULL DEFAULT 'unknown',
+            cap_player_auth       TEXT NOT NULL DEFAULT 'unknown',
+            cap_instance_flags    TEXT NOT NULL DEFAULT 'unknown',
+            cap_redis_sync        TEXT NOT NULL DEFAULT 'degraded',
+            probe_notes           TEXT NOT NULL DEFAULT '[]'
+        );
         "#,
     )?;
     // Migrations for existing databases.
@@ -157,6 +184,32 @@ fn init_schema(conn: &Connection) -> Result<()> {
             expires_at  TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);"
+    );
+    // Migration: add ctfd_probe table for existing databases that predate this feature.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ctfd_probe (
+            id                    INTEGER PRIMARY KEY CHECK (id = 1),
+            probed_at             TEXT NOT NULL DEFAULT (datetime('now')),
+            ctfd_version_tag      TEXT,
+            ctfd_version_source   TEXT,
+            is_team_mode          INTEGER,
+            challenges_cols       TEXT,
+            has_dynamic_table     INTEGER NOT NULL DEFAULT 0,
+            dynamic_cols          TEXT,
+            has_next_id           INTEGER NOT NULL DEFAULT 0,
+            has_attribution       INTEGER NOT NULL DEFAULT 0,
+            has_logic             INTEGER NOT NULL DEFAULT 0,
+            has_position          INTEGER NOT NULL DEFAULT 0,
+            dynamic_inline        INTEGER NOT NULL DEFAULT 0,
+            dynamic_partial       INTEGER NOT NULL DEFAULT 0,
+            has_instance_table    INTEGER NOT NULL DEFAULT 0,
+            cap_challenge_crud    TEXT NOT NULL DEFAULT 'unknown',
+            cap_dynamic_scoring   TEXT NOT NULL DEFAULT 'unknown',
+            cap_player_auth       TEXT NOT NULL DEFAULT 'unknown',
+            cap_instance_flags    TEXT NOT NULL DEFAULT 'unknown',
+            cap_redis_sync        TEXT NOT NULL DEFAULT 'degraded',
+            probe_notes           TEXT NOT NULL DEFAULT '[]'
+        );"
     );
     Ok(())
 }
@@ -367,6 +420,24 @@ pub fn insert_instance(
             params![challenge_name, team_id, f],
         )?;
     }
+    Ok(())
+}
+
+/// Updates ctfd_flag_id for an existing instance row after the CTFd flag has been
+/// created. Called immediately after create_flag() succeeds so that a crash between
+/// insert_instance (ctfd_flag_id=NULL) and this call leaves the row without an ID —
+/// the cleanup task already skips delete_flag when ctfd_flag_id IS NULL.
+pub fn set_ctfd_flag_id(
+    db: &Db,
+    challenge_name: &str,
+    team_id: i64,
+    ctfd_flag_id: i64,
+) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute(
+        "UPDATE instances SET ctfd_flag_id = ?1 WHERE challenge_name = ?2 AND team_id = ?3",
+        params![ctfd_flag_id, challenge_name, team_id],
+    )?;
     Ok(())
 }
 
@@ -925,4 +996,124 @@ pub fn purge_expired_sessions(db: &Db) -> Result<usize> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let n = conn.execute("DELETE FROM sessions WHERE expires_at <= datetime('now')", [])?;
     Ok(n)
+}
+
+// ── CTFd probe ────────────────────────────────────────────────────────────────
+
+/// Persists the probe result as the singleton row (`id = 1`) in `ctfd_probe`.
+/// Replaces any existing row — there can only ever be one.
+pub fn save_probe_result(db: &Db, result: &crate::ctfd_db::ProbeResult) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    // Vec<String> → comma-joined TEXT for storage; reconstructed on load.
+    let challenges_cols = result.challenges_cols.join(",");
+    let dynamic_cols = result.dynamic_cols.join(",");
+    let probe_notes = serde_json::to_string(&result.probe_notes)
+        .unwrap_or_else(|_| "[]".to_string());
+    // Option<bool> → NULL / 1 / 0
+    let is_team_mode: Option<i64> = result.is_team_mode.map(|b| if b { 1 } else { 0 });
+    conn.execute(
+        r#"INSERT OR REPLACE INTO ctfd_probe (
+            id, probed_at, ctfd_version_tag, ctfd_version_source,
+            is_team_mode, challenges_cols, has_dynamic_table, dynamic_cols,
+            has_next_id, has_attribution, has_logic, has_position,
+            dynamic_inline, dynamic_partial, has_instance_table,
+            cap_challenge_crud, cap_dynamic_scoring, cap_player_auth,
+            cap_instance_flags, cap_redis_sync, probe_notes
+        ) VALUES (
+            1, ?1, ?2, ?3,
+            ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11,
+            ?12, ?13, ?14,
+            ?15, ?16, ?17,
+            ?18, ?19, ?20
+        )"#,
+        params![
+            result.probed_at,
+            result.ctfd_version_tag,
+            result.ctfd_version_source,
+            is_team_mode,
+            challenges_cols,
+            result.has_dynamic_table as i64,
+            dynamic_cols,
+            result.has_next_id as i64,
+            result.has_attribution as i64,
+            result.has_logic as i64,
+            result.has_position as i64,
+            result.dynamic_inline as i64,
+            result.dynamic_partial as i64,
+            result.has_instance_table as i64,
+            result.cap_challenge_crud,
+            result.cap_dynamic_scoring,
+            result.cap_player_auth,
+            result.cap_instance_flags,
+            result.cap_redis_sync,
+            probe_notes,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Loads the singleton probe result from SQLite.
+/// Returns `None` if no probe has been run yet (row is absent).
+pub fn load_probe_result(db: &Db) -> Result<Option<crate::ctfd_db::ProbeResult>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let result = conn.query_row(
+        "SELECT probed_at, ctfd_version_tag, ctfd_version_source,
+                is_team_mode, challenges_cols, has_dynamic_table, dynamic_cols,
+                has_next_id, has_attribution, has_logic, has_position,
+                dynamic_inline, dynamic_partial, has_instance_table,
+                cap_challenge_crud, cap_dynamic_scoring, cap_player_auth,
+                cap_instance_flags, cap_redis_sync, probe_notes
+         FROM ctfd_probe WHERE id = 1",
+        [],
+        |row| {
+            // Reconstruct Vec<String> from comma-joined strings; empty string → empty Vec.
+            let challenges_cols_raw: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
+            let challenges_cols: Vec<String> = if challenges_cols_raw.is_empty() {
+                Vec::new()
+            } else {
+                challenges_cols_raw.split(',').map(|s| s.to_string()).collect()
+            };
+            let dynamic_cols_raw: String = row.get::<_, Option<String>>(6)?.unwrap_or_default();
+            let dynamic_cols: Vec<String> = if dynamic_cols_raw.is_empty() {
+                Vec::new()
+            } else {
+                dynamic_cols_raw.split(',').map(|s| s.to_string()).collect()
+            };
+            // Reconstruct probe_notes from JSON; fall back to empty Vec on parse error.
+            let probe_notes_raw: String = row.get::<_, String>(19)?;
+            let probe_notes: Vec<String> = serde_json::from_str(&probe_notes_raw)
+                .unwrap_or_default();
+            // NULL / 1 / 0 → Option<bool>
+            let is_team_mode: Option<bool> = row.get::<_, Option<i64>>(3)?
+                .map(|v| v != 0);
+            Ok(crate::ctfd_db::ProbeResult {
+                probed_at: row.get(0)?,
+                ctfd_version_tag: row.get(1)?,
+                ctfd_version_source: row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "inferred".to_string()),
+                is_team_mode,
+                challenges_cols,
+                has_dynamic_table: row.get::<_, i64>(5)? != 0,
+                dynamic_cols,
+                has_next_id: row.get::<_, i64>(7)? != 0,
+                has_attribution: row.get::<_, i64>(8)? != 0,
+                has_logic: row.get::<_, i64>(9)? != 0,
+                has_position: row.get::<_, i64>(10)? != 0,
+                dynamic_inline: row.get::<_, i64>(11)? != 0,
+                dynamic_partial: row.get::<_, i64>(12)? != 0,
+                has_instance_table: row.get::<_, i64>(13)? != 0,
+                cap_challenge_crud: row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "unknown".to_string()),
+                cap_dynamic_scoring: row.get::<_, Option<String>>(15)?.unwrap_or_else(|| "unknown".to_string()),
+                cap_player_auth: row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "unknown".to_string()),
+                cap_instance_flags: row.get::<_, Option<String>>(17)?.unwrap_or_else(|| "unknown".to_string()),
+                cap_redis_sync: row.get::<_, Option<String>>(18)?.unwrap_or_else(|| "degraded".to_string()),
+                probe_notes,
+            })
+        },
+    );
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }

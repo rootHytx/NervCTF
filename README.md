@@ -1,50 +1,43 @@
 # NervCTF
 
-CLI + server toolchain for managing CTFd competitions: deploy challenges from YAML, provision ephemeral per-team containers, and detect flag sharing — all from one command.
+A CLI + server toolchain for running CTF competitions on CTFd. Deploy challenges from YAML, provision ephemeral per-team containers, and detect flag sharing — all from one command, with no manual CTFd API interaction.
+
+> **Tested against CTFd 3.7.3.** Run `nervctf probe` after any CTFd upgrade to verify compatibility.
 
 ---
 
-## Quick Start
+## How it works
 
-### 1. Download
-
-Grab `nervctf` (CLI) and `remote-monitor` (server) from the [releases page](https://github.com/rootHytx/NervCTF/releases). Place both somewhere in your `PATH`.
-
-### 2. Prepare challenges
+NervCTF has two components that you deploy once and then leave running:
 
 ```
-challenges/
-├── web/sqli/challenge.yml
-├── pwn/overflow/challenge.yml
-└── misc/trivia/challenge.yml
+Your machine                CTFd host (single-machine mode)
+─────────────               ─────────────────────────────────────────────────
+                            ┌─ Docker Compose stack ──────────────────────┐
+nervctf CLI  ─── Token ──▶  │  remote-monitor:33133 ─── SQL ──▶ MariaDB   │
+                            │         │                 └──▶ uploads dir   │
+                            │   instance manager                           │
+                            │   (docker daemon, local)                     │
+                            │                          CTFd (nginx+gunicorn)│
+                            │                          nervctf plugin       │
+                            └─────────────────────────────────────────────┘
 ```
 
-Minimal `challenge.yml`:
+**`nervctf` (CLI)** — runs on your machine. Reads `challenge.yml` files, validates them, and syncs them to the remote monitor. Also runs `nervctf setup` to provision the server.
 
-```yaml
-name: My Challenge
-category: web
-value: 100
-type: standard
-flags:
-  - flag{example}
+**`remote-monitor` (server)** — runs inside Docker on the CTFd host. It writes directly to CTFd's MariaDB (no CTFd API key needed), manages container instances for per-team challenges, and serves an admin dashboard.
+
+**`nervctf_instance` (CTFd plugin)** — deployed by `nervctf setup`. Hooks into CTFd's challenge system so players can request, renew, and stop containers from the CTFd UI.
+
+In **split-machine mode**, containers run on a separate worker node. The CLI rsyncs challenge files directly to the runner; the monitor controls containers over SSH.
+
 ```
-
-### 3. Setup server
-
-```sh
-nervctf setup
+Your machine    CTFd host                       Runner node
+────────────    ──────────────────────────────  ──────────────────
+nervctf CLI ──▶ remote-monitor ─── SSH ──────▶  docker daemon
+       │               │
+       └── rsync ──────┘ (challenge files)
 ```
-
-Prompts for target IP, SSH user, and CTFd path. Deploys Docker, CTFd, the monitor service, and the CTFd plugin via an embedded Ansible playbook. Creates `.nervctf.yml` with all settings.
-
-### 4. Deploy
-
-```sh
-nervctf deploy
-```
-
-Validates, diffs, and pushes your challenges to CTFd. Run `--dry-run` to preview changes.
 
 ---
 
@@ -52,22 +45,60 @@ Validates, diffs, and pushes your challenges to CTFd. Run `--dry-run` to preview
 
 ### Pre-compiled binaries (recommended)
 
-Download from [GitHub Releases](https://github.com/rootHytx/NervCTF/releases). You need:
-- `nervctf` — for your local machine (Linux x86_64, ARM64, Windows, macOS)
-- `remote-monitor` — for the CTFd server (Linux x86_64 only)
+Download from [GitHub Releases](https://github.com/rootHytx/NervCTF/releases):
+
+- `nervctf-linux-x86_64-static` — CLI for Linux (static, no deps)
+- `nervctf-linux-aarch64` — CLI for ARM64
+- `nervctf-windows-x86_64.exe` — CLI for Windows
+- `remote-monitor-linux-x86_64-static` — server binary (deploy to CTFd host)
+
+Rename to `nervctf` and `remote-monitor`, place in your `PATH`.
 
 ### Build from source
 
 ```sh
-# With Nix (provides all deps)
+# With Nix (provides all dependencies)
 nix develop .# --command cargo build --release
 
 # Without Nix (Debian/Ubuntu)
 sudo apt install build-essential pkg-config libssl-dev
 cargo build --release
+
+# Static musl builds (what the releases use)
+nix develop .# --command cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-Cross-compilation: `make release-musl` (static), `make release-arm64`, `make release-windows`. Run `make help` for all targets.
+Cross-compile targets: `make release-musl` (static), `make release-arm64`, `make release-windows`. Run `make help` for all targets.
+
+---
+
+## Quick start
+
+```sh
+# 1. Run setup wizard — provisions Docker, CTFd, plugin, monitor on the remote host
+nervctf setup
+
+# 2. Write your challenges
+mkdir -p challenges/web/sqli challenges/pwn/overflow
+cat > challenges/web/sqli/challenge.yml <<'EOF'
+name: SQL Injection 101
+category: web
+value: 100
+type: standard
+description: Find the flag in the database.
+flags:
+  - flag{sql_is_fun}
+EOF
+
+# 3. Validate locally (no network required)
+nervctf validate
+
+# 4. Deploy to CTFd
+nervctf deploy
+
+# 5. Check compatibility with the live CTFd instance
+nervctf probe
+```
 
 ---
 
@@ -75,174 +106,635 @@ Cross-compilation: `make release-musl` (static), `make release-arm64`, `make rel
 
 ### `.nervctf.yml`
 
-Created by `nervctf setup`. Searched upward from `--challenges-dir`.
+Created by `nervctf setup`. Searched upward from the working directory (walks up to filesystem root). You can place it at the repo root and run `nervctf` from any subdirectory.
 
 ```yaml
-# CTFd/monitor host
-monitor_ip: 1.2.3.4
-monitor_port: 33133             # default: 33133
+# ── Monitor connection ─────────────────────────────────────────────────────────
+monitor_ip: 1.2.3.4          # IP of the CTFd/monitor host
+monitor_port: 33133          # default: 33133
 
-# Authentication
-monitor_token: <auto-generated> # written by nervctf setup
+# ── Authentication ────────────────────────────────────────────────────────────
+monitor_token: <hex>         # 64-char hex token; auto-generated by nervctf setup
+                             # This is the token for the remote-monitor, NOT CTFd.
 
-# Deployment credentials (used by nervctf setup / setup --upgrade)
-monitor_user: root              # SSH user on the CTFd host
-monitor_ctfd_path: /home/admin/CTFd  # defaults to /home/<monitor_user>/CTFd
-ssh_key_path: ~/.ssh/id_rsa.pub
+# ── Deployment (used only by nervctf setup / setup --upgrade) ─────────────────
+monitor_user: root           # SSH user on the CTFd host (must have sudo/docker)
+monitor_ctfd_path: /home/root/CTFd  # CTFd install path on the remote host
+                                    # default: /home/<monitor_user>/CTFd
+ssh_key_path: ~/.ssh/id_rsa  # private key for SSH access to monitor + runner hosts
 
-# Local challenge directory
-challenges_path: ./challenges
+# ── Local challenges ──────────────────────────────────────────────────────────
+challenges_path: ./challenges  # where nervctf looks for challenge.yml files
 
-# Tuning (optional)
-# NOTE: max_concurrent_provisions and max_instances_per_team are baked into the
-# remote-monitor's environment at setup time. Changing them here has no effect
-# until you run nervctf setup --upgrade again.
-max_concurrent_provisions: 4    # parallel Docker builds/provisions
-max_instances_per_team: 3       # 0 = unlimited
+# ── Tuning (baked in at setup time; requires setup --upgrade to change) ────────
+max_concurrent_provisions: 4   # max parallel container provisions
+max_instances_per_team: 3      # max active instances per team across all challenges
+                               # 0 = unlimited
 
-# CTFd public domain shown in admin dashboard links (defaults to monitor_ip)
-ctfd_domain: ctfd.example.com
+# ── Display ───────────────────────────────────────────────────────────────────
+ctfd_domain: ctfd.example.com  # CTFd URL shown in admin dashboard links
+                               # defaults to http://<monitor_ip>
 
-# Split-machine mode (optional — run containers on a separate node)
+# ── Split-machine mode (optional) ─────────────────────────────────────────────
+# Set runner_ip to run containers on a separate node.
+# Leave unset to run containers on the same machine as CTFd.
 runner_ip: 192.168.1.50
 runner_user: docker
-runner_domain: challenges.example.com  # optional — shown to players instead of runner_ip
+runner_domain: challenges.example.com  # hostname shown to players in connection strings
+                                       # defaults to runner_ip
 ```
 
-**Priority** (highest wins): CLI flags → environment variables → `.nervctf.yml`
+### Configuration precedence (highest wins)
 
-| CLI flag | Env var | Description |
-|----------|---------|-------------|
-| `--monitor-url` | `MONITOR_URL` | Remote monitor URL |
+```
+CLI flags  >  environment variables  >  .nervctf.yml
+```
+
+| CLI flag | Environment variable | Description |
+|---|---|---|
+| `--monitor-url` | `MONITOR_URL` | Full URL of the remote monitor (`http://host:port`) |
 | `--monitor-token` | `MONITOR_TOKEN` | Monitor auth token |
+
+The `--monitor-url` flag overrides both `monitor_ip` and `monitor_port` from the config file.
 
 ---
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `nervctf setup` | Provision server (Docker, CTFd, plugin, monitor) |
-| `nervctf setup --upgrade` | Push updated plugin + binary, restart services |
-| `nervctf deploy` | Create/update changed challenges |
-| `nervctf deploy --dry-run` | Preview diff without changes |
-| `nervctf deploy --recreate` | Force re-deploy all (rebuild images, re-sync files) |
-| `nervctf validate` | Check challenges for errors |
-| `nervctf validate --debug` | Full field-by-field view |
-| `nervctf list` | List local challenges |
-| `nervctf scan` | Scan + print statistics |
-| `nervctf fix` | Interactively patch missing YAML fields |
+All commands accept global flags that come **before** the subcommand name:
+
+```sh
+nervctf [GLOBAL FLAGS] <subcommand> [SUBCOMMAND FLAGS]
+```
+
+### Global flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `-c, --challenges-dir <path>` | `.` (current directory) | Root directory to search for `challenge.yml` files |
+| `-v, --verbose` | false | Enable verbose output |
+| `--monitor-url <url>` | from config/env | Override monitor URL for this run |
+| `--monitor-token <token>` | from config/env | Override monitor token for this run |
 
 ---
 
-## Challenge Specification
+### `nervctf setup`
 
-Full example with all supported fields:
+Provisions the complete server environment on the remote host. Run once per competition.
 
-```yaml
-name: Advanced Challenge
-version: "0.3"
-category: web
-description: Find the vulnerability.
-value: 300
-type: standard            # standard | dynamic | instance
-state: visible
-connection_info: "nc challenge.example.com 1337"
-attempts: 5
-topics: [web, owasp-top-10]   # optional freeform topic labels
-
-flags:
-  - flag{simple}
-  - type: static
-    content: "flag{alt}"
-    data: case_insensitive
-
-tags: [web, sql-injection]
-hints:
-  - "Free hint"
-  - content: "Paid hint"
-    cost: 50
-
-files:
-  - dist/source.py
-
-requirements:
-  - "Warmup"
-
-next: "Follow-up Challenge"
+```sh
+nervctf setup
+nervctf setup --upgrade
 ```
 
-### Dynamic scoring
+**What it does (first run):**
+1. Prompts interactively: host IP, SSH user, CTFd path, monitor port, token, SSH key
+2. Saves everything to `.nervctf.yml`
+3. Runs an embedded Ansible playbook that:
+   - Installs Docker + Docker Compose (if not present)
+   - Clones CTFd 3.7.3 and starts it
+   - Builds and starts the `remote-monitor` container
+   - Rsyncs the `nervctf_instance` plugin into CTFd's plugin directory
+   - Writes `docker-compose.override.yml` with the monitor's env vars
+   - Restarts CTFd so the plugin is loaded
+   - Polls health endpoints until everything is up
+4. Prints the admin dashboard URL and token
+
+**What `--upgrade` does:**
+- Pushes a new `remote-monitor` binary and plugin files to the server
+- Rebuilds the monitor Docker image
+- Restarts CTFd and the monitor
+- Checks whether the installed CTFd version matches the tested version (3.7.3)
+- Does **not** re-provision CTFd or regenerate the token
+
+| Flag | Description |
+|---|---|
+| `--upgrade` | Upgrade plugin + monitor binary on an existing deployment |
+
+---
+
+### `nervctf deploy`
+
+Validates all challenges locally, diffs them against what's on CTFd, and applies changes.
+
+```sh
+nervctf deploy
+nervctf deploy --dry-run
+nervctf deploy --recreate
+nervctf deploy --recreate --prune
+```
+
+**Deploy runs in four ordered phases:**
+
+| Phase | What happens |
+|---|---|
+| 1 — Cores | Creates new challenges and updates changed ones. Uploads flags, tags, topics, hints. Detects changed files (marks for phase 2). |
+| 2 — Files | Uploads attachment files for new/changed challenges. |
+| 3 — Requirements | Resolves prerequisite challenge names to CTFd IDs and patches `requirements`. Run after phase 1 so all IDs exist. |
+| 4 — Next pointers | Patches `next_id` links. Same reason as phase 3. |
+
+Before phase 1, the CLI fetches the stored compatibility probe and:
+- **Aborts** if dynamic challenge scoring is in a broken state (partial CTFd migration)
+- **Warns** if CTFd is in user-mode (player instance auth will fail)
+- **Notes** any degraded capabilities (e.g. Redis cache not invalidated)
+- **Warns** if the live CTFd version differs from the tested version (3.7.3)
+
+A challenge is considered **changed** if any of these differ from the remote: `category`, `description`, `state`, `connection_info`, `attempts`, `extra` fields, flags `(content, type, data)`, hints `(content, cost)`, tags, topics, or files.
+
+**Type changes** (e.g. `standard` → `dynamic`) always trigger a delete + recreate because CTFd's PATCH endpoint does not create the required join table rows.
+
+| Flag | Description |
+|---|---|
+| `-d, --dry-run` | Print what would change without applying anything |
+| `--recreate` | Force re-deploy all challenges even if up to date; re-syncs files to runner and rebuilds images |
+| `--prune` | Delete remote challenges that no longer exist locally (run after phase 4) |
+
+---
+
+### `nervctf validate`
+
+Validates challenge YAML files without connecting to the server. Exits 1 if any errors are found.
+
+```sh
+nervctf validate
+nervctf validate --debug
+```
+
+Validation checks all fields for each challenge type and cross-challenge rules (e.g. duplicate names, self-referencing requirements). See [Challenge specification](#challenge-specification) for the full rule table.
+
+| Flag | Description |
+|---|---|
+| `--debug` | Print the full parsed field dictionary for every challenge |
+
+---
+
+### `nervctf probe`
+
+Queries the remote monitor for the current CTFd compatibility status and displays a capability matrix.
+
+```sh
+nervctf probe
+nervctf probe --refresh
+nervctf probe --json
+```
+
+The monitor stores a probe result at startup and refreshes it on demand. The probe queries CTFd's MariaDB to detect the installed version, team vs user mode, which optional schema columns exist, and whether the plugin table is installed.
+
+**Example output:**
+
+```
+NervCTF <-> CTFd Compatibility Report
+══════════════════════════════════════
+CTFd version : 3.7.3  (source: configs_table)
+CTFd mode    : team
+Probed at    : 2026-05-26 14:32:11 UTC
+
+Capability                   Status
+─────────────────────────    ──────────
+Challenge CRUD               [ok]
+Dynamic scoring              [ok]
+Player authentication        [ok]
+Instance flag lifecycle      [ok]
+Redis cache invalidation     [DEGRADED]
+
+Schema fingerprint:
+  challenges       : attribution, category, connection_info, decay, description,
+                     function, id, initial, logic, max_attempts, minimum, name,
+                     next_id, position, requirements, state, type, value
+  dynamic_challenge: id  (stub-only — scoring is inline in challenges)
+
+Warnings:
+  • Direct MariaDB writes bypass CTFd Redis cache — stale data may be served
+    until CTFd restart or TTL expiry
+```
+
+**Capability statuses:**
+
+| Status | Meaning |
+|---|---|
+| `[ok]` | Fully supported, no caveats |
+| `[DEGRADED]` | Works with known limitations — operator is warned |
+| `[BROKEN]` | Will not work; deploy is blocked or severely impaired |
+
+**Exit code:** 0 if all capabilities are `ok` or `degraded`; 1 if any capability is `broken`. Suitable for CI gates.
+
+Note: `Redis cache invalidation` is always `DEGRADED` — NervCTF writes directly to MariaDB and cannot invalidate CTFd's Redis cache. Restart CTFd or tune `CACHE_DEFAULT_TIMEOUT` after a bulk deploy.
+
+| Flag | Description |
+|---|---|
+| `--refresh` | Force a fresh probe from MariaDB (ignores cached result on monitor) |
+| `--json` | Output raw JSON instead of the formatted table |
+
+---
+
+### `nervctf list`
+
+Lists all challenges found under `--challenges-dir`.
+
+```sh
+nervctf list
+nervctf list --detailed
+```
+
+| Flag | Description |
+|---|---|
+| `-d, --detailed` | Show full field values for each challenge |
+
+---
+
+### `nervctf scan`
+
+Scans the challenges directory and prints statistics (counts by type, category, total points, etc.).
+
+```sh
+nervctf scan
+nervctf scan --detailed
+```
+
+| Flag | Description |
+|---|---|
+| `-d, --detailed` | Show per-challenge breakdown |
+
+---
+
+### `nervctf fix`
+
+Interactively scans challenge YAML files and offers to patch common missing fields (`state`, `version`, `description`, etc.).
+
+```sh
+nervctf fix
+nervctf fix --dry-run
+```
+
+| Flag | Description |
+|---|---|
+| `-d, --dry-run` | Show what would be patched without modifying files |
+
+---
+
+## Challenge specification
+
+Challenges live in files named `challenge.yml` (or `challenge.yaml`). NervCTF searches recursively under `--challenges-dir` up to depth 5. The directory structure is arbitrary — use whatever layout suits your competition.
+
+```
+challenges/
+├── web/
+│   └── sqli/
+│       ├── challenge.yml
+│       └── dist/source.py      ← referenced in files:
+└── pwn/
+    └── overflow/
+        └── challenge.yml
+```
+
+---
+
+### Standard challenge
+
+Fixed-point challenge. Players submit a flag and it either matches or it doesn't.
 
 ```yaml
+# ── Identity ──────────────────────────────────────────────────────────────────
+name: SQL Injection 101          # required; must be unique across all challenges
+category: web                    # required
+version: "0.3"                   # optional; local metadata only, not sent to CTFd
+author: alice                    # optional; local metadata only
+
+# ── Scoring ───────────────────────────────────────────────────────────────────
+type: standard                   # standard | dynamic | instance
+value: 100                       # required for standard; must be > 0
+state: visible                   # visible (default) | hidden
+
+# ── Content ───────────────────────────────────────────────────────────────────
+description: |
+  Find the vulnerability and retrieve the flag.
+  The server is at http://challenge.example.com
+
+connection_info: "http://challenge.example.com"   # optional; shown on the challenge page
+attempts: 5                                        # max wrong guesses; 0 or omitted = unlimited
+
+# ── Flags (at least one required for non-instance challenges) ─────────────────
+flags:
+  - flag{simple_string}                # shorthand: static type, case-sensitive
+  - type: static
+    content: "flag{alternate}"
+    data: case_insensitive             # optional modifier; default: case-sensitive
+  - type: regex
+    content: "flag\\{[a-z]+\\}"       # regex pattern
+
+# ── Organisation ──────────────────────────────────────────────────────────────
+tags: [web, sql-injection, beginner]
+topics: [owasp-top-10, database]     # freeform topic labels (separate from tags in CTFd)
+
+# ── Hints ─────────────────────────────────────────────────────────────────────
+hints:
+  - "Try single-quote injection"             # free hint
+  - content: "The login form is vulnerable"
+    cost: 50                                  # costs 50 points to unlock
+
+# ── Files ─────────────────────────────────────────────────────────────────────
+files:
+  - dist/source.py        # path relative to challenge.yml
+  - dist/Dockerfile
+
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+requirements:
+  - "Warmup"              # other challenge name; must exist locally or on CTFd
+  - "Web Intro"
+
+# ── Navigation ────────────────────────────────────────────────────────────────
+next: "Advanced SQLi"     # name of the challenge to show as "next" in CTFd UI
+```
+
+---
+
+### Dynamic scoring challenge
+
+Points decrease as more teams solve the challenge.
+
+```yaml
+name: Crypto Hard
+category: crypto
 type: dynamic
-value: 0
+value: 0                  # ignored for dynamic; set initial/minimum below
+
 extra:
+  initial: 500            # starting point value (required, must be > 0)
+  decay: 50               # number of solves at which value reaches minimum (required, must be > 0)
+  minimum: 100            # floor value (optional; defaults to 0)
+  decay_function: linear  # linear (default) | logarithmic
+
+flags:
+  - flag{crypto_hard}
+```
+
+---
+
+### Instance challenge
+
+Provisions an ephemeral container per team. Players click "Request Instance" in CTFd, receive a host/port, and interact directly with their isolated environment.
+
+```yaml
+name: Pwn Me
+category: pwn
+type: instance
+value: 0
+extra:                    # optional dynamic scoring on top of instance
   initial: 500
   decay: 50
   minimum: 100
-  decay_function: linear    # linear (default) | logarithmic
+  decay_function: linear
+
+description: |
+  Connect to your instance and get root.
+
+instance:
+  # ── Backend ─────────────────────────────────────────────────────────────────
+  backend: docker         # docker | compose | lxc | vagrant
+
+  # ── Docker backend ───────────────────────────────────────────────────────────
+  image: .                # "." = build from Dockerfile in challenge dir
+                          # or a registry image: "ubuntu:22.04"
+
+  # ── Compose backend (mutually exclusive with docker image) ───────────────────
+  # compose_file: docker-compose.yml
+  # compose_service: app   # which service exposes the port
+
+  # ── LXC backend ──────────────────────────────────────────────────────────────
+  # lxc_image: ubuntu:22.04
+
+  # ── Ports ────────────────────────────────────────────────────────────────────
+  # Single port (most common):
+  internal_ports: [1337]
+
+  # Multi-port: each gets a separately allocated random host port.
+  # The first port is the "primary" shown in the connection string.
+  # internal_ports: [80, 443]
+
+  # Compose multi-service (mutually exclusive with internal_ports):
+  # service_ports:
+  #   app:   [80]
+  #   admin: [8080]
+
+  connection: nc          # nc | http | ssh
+                          # Controls the connection string shown to players.
+
+  # ── Lifecycle ────────────────────────────────────────────────────────────────
+  timeout_minutes: 45     # instance auto-expires after this many minutes
+  max_renewals: 3         # how many times players can extend the timer
+
+  # ── Flag ─────────────────────────────────────────────────────────────────────
+  flag_mode: random       # random | static
+                          # random: a unique flag is generated per instance and
+                          #         registered in CTFd's flags table at provision time.
+                          # static: uses the flags: list above; one flag shared by all teams.
+
+  flag_prefix: "CTF{"    # optional; wraps the random part
+  flag_suffix: "}"
+  random_flag_length: 16  # characters in the random part (default: 16)
+
+  # How the flag is delivered into the container:
+  flag_delivery: env      # env (default) | file
+  # env:  injected as $FLAG environment variable
+  # file: written to a bind-mounted file at flag_file_path
+
+  # flag_file_path: /challenge/flag   # required when flag_delivery: file
+  # flag_service: app                  # compose only: which service gets the file mount
+
+  # ── Optional ─────────────────────────────────────────────────────────────────
+  command: null           # override the container's CMD/entrypoint
 ```
 
-### Instance challenges
+#### Static-flag instance challenge
 
-`type: instance` provisions ephemeral containers per team. See [`docs/instance-challenges.md`](docs/instance-challenges.md) for the full reference.
+Use `flag_mode: static` (or omit it) and define flags in the top-level `flags:` list. All teams share the same flag.
 
 ```yaml
 type: instance
-value: 0
-extra: { initial: 500, decay: 50, minimum: 100 }
 instance:
-  backend: docker          # docker | compose | lxc
-  image: .                 # local path or registry image
-  internal_ports: [1337]   # array; multi-port: [80, 443] — each gets a random host port
+  backend: docker
+  image: .
+  internal_ports: [1337]
   connection: nc
-  flag_mode: random
-  timeout_minutes: 45
+  flag_mode: static
+
+flags:
+  - flag{shared_static_flag}
 ```
+
+#### Validator rules for instance challenges
+
+| Check | Severity |
+|---|---|
+| `instance` block required | Error |
+| `instance.internal_ports` must have at least one entry (unless `service_ports` set) | Error |
+| Port values must be 1–65535 | Error |
+| `service_ports` and `internal_ports` are mutually exclusive | Warning |
+| `instance.connection` must not be empty | Error |
+| `instance.timeout_minutes == 0` | Warning |
+| Docker backend: `image` required | Error |
+| Docker backend: local path missing Dockerfile | Warning |
+| Compose backend: `compose_file` not found on disk | Warning |
+| LXC backend: `lxc_image` required | Error |
+| `flag_mode: random` without `flag_prefix`/`flag_suffix` | — (defaults used) |
+| `flag_delivery: file` without `flag_file_path` | Error |
+| `flag_file_path` not an absolute path | Warning |
+| `flag_mode: static` without any flags defined | Error |
+
+---
+
+## Validation rules (all types)
+
+| Field | Check | Severity |
+|---|---|---|
+| `name` | Empty or whitespace | Error |
+| `name` | Duplicate across challenge files | Error |
+| `category` | Empty or whitespace | Error |
+| `value` | `== 0` for `standard` type | Error |
+| `extra` | Missing for `dynamic` type | Error |
+| `extra.initial` | Missing or `== 0` for `dynamic` | Error |
+| `extra.decay` | Missing or `== 0` for `dynamic` | Error |
+| `extra.minimum` | Not set for `dynamic` | Warning |
+| `extra.decay_function` | Not `"linear"` or `"logarithmic"` when set | Error |
+| `flags` | At least one required (non-instance, non-random-flag) | Error |
+| `flags[].content` | Empty or whitespace | Error |
+| `flags` | Duplicate content values | Warning |
+| `hints[].content` | Empty or whitespace | Error |
+| `files` | Referenced file not found on disk | Error |
+| `requirements` | Challenge lists itself | Error |
+| `requirements` | Named challenge not found locally | Warning |
+| `next` | Points to itself | Error |
+| `next` | Named challenge not found locally | Warning |
+| `attempts` | Set to `0` (same as unlimited — likely a typo) | Warning |
+| Unknown YAML keys | Not in the spec | Warning |
 
 ---
 
 ## Remote Monitor
 
-Runs on the CTFd host. Writes directly to MariaDB (no CTFd API calls), manages instance lifecycle, and serves the admin dashboard.
+The monitor runs as a Docker container on the CTFd host and is managed by the `docker-compose.override.yml` that `nervctf setup` writes.
+
+### Admin dashboard
 
 ```
-CLI ──token──▶ remote-monitor:33133 ──SQL──▶ CTFd MariaDB
-                     │
-               instance manager
-          ┌─────────┴─────────┐
-       local              split-machine
-  (docker daemon)    (SSH to runner node)
+http://<monitor_ip>:<monitor_port>/admin?token=<MONITOR_TOKEN>
 ```
 
-**Admin dashboard**: `http://<host>:33133/admin?token=<TOKEN>`
+Or log in once at `http://<monitor_ip>:<monitor_port>/` and the session cookie is set.
 
-See [`docs/remote-monitor.md`](docs/remote-monitor.md) for env vars, routes, and API reference.
+The dashboard shows:
+- All active container instances per team
+- Flag submission attempts (including flag-sharing alerts)
+- Correct solve log
+- Runtime config (public host, runner mode, base dirs, etc.)
+- CTFd compatibility probe result
+
+### Environment variables
+
+These are set by `nervctf setup` in `docker-compose.override.yml` and don't normally need manual editing.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `CTFD_DB_URL` | **yes** | — | MariaDB URL: `mysql://user:pass@host/db` |
+| `MONITOR_TOKEN` | **yes** | — | Admin token (SHA-256 hashed on startup; plaintext never stored) |
+| `PUBLIC_HOST` | **yes** | — | Hostname or IP returned to players in connection strings |
+| `MONITOR_PORT` | no | `33133` | TCP port to listen on |
+| `MONITOR_BIND` | no | `0.0.0.0` | Bind address |
+| `DB_PATH` | no | `./monitor.db` | Path to the SQLite database |
+| `CHALLENGES_BASE_DIR` | no | `/opt/nervctf/challenges` | Where challenge files are extracted on the server |
+| `CTFD_UPLOADS_DIR` | no | `""` | Absolute path to CTFd's uploads directory (for file attachment writes) |
+| `RUNNER_SSH_TARGET` | no | `""` | Split-machine mode SSH target, e.g. `docker@192.168.1.50` |
+| `MAX_CONCURRENT_PROVISIONS` | no | `4` | Parallel container provisions (semaphore) |
+| `MAX_INSTANCES_PER_TEAM` | no | `0` | Max active instances per team across all challenges (`0` = unlimited) |
+| `CTFD_DB_SYNC_INTERVAL` | no | `30` | Seconds between CTFd solve/user sync cycles |
+| `CTFD_DOMAIN` | no | `http://<PUBLIC_HOST>` | CTFd URL shown in admin dashboard links |
+
+### Background tasks
+
+The monitor runs two background loops independently of HTTP traffic:
+
+**Sync loop** (every `CTFD_DB_SYNC_INTERVAL` seconds):
+- Reads CTFd `submissions` and caches correct solves in SQLite
+- Reads CTFd `teams` and `users` for name display
+- Reverts instances back to running if a CTFd admin deleted a solve record
+- Purges stale flag attempt records
+
+**Expiry + health loop** (every 30 seconds):
+- Tears down instances whose `expires_at` has passed
+- Kills stuck provisioning stubs older than 30 minutes
+- Detects and tears down orphaned Docker Compose projects not tracked in SQLite
+- Health-checks tracked instances and cleans up externally killed containers
+
+### Flag sharing detection
+
+When a player submits a flag, the CTFd plugin calls the monitor's `/api/v1/plugin/attempt` endpoint. The monitor checks whether the submitted flag was originally issued to a **different team**. If so, it records a flag-sharing alert visible in the admin dashboard under "Attempts (alerts only)".
+
+Flag ownership is stored permanently in the `team_flags` SQLite table — even after an instance expires, the monitor remembers which team owned which flag.
+
+---
+
+## Split-machine mode
+
+Set `runner_ip` and `runner_user` in `.nervctf.yml` to run containers on a separate node.
+
+**How it works:**
+1. `nervctf deploy` rsyncs each challenge's build context directly from your machine to `runner_user@runner_ip:~/challenges/<name>/` using `ssh_key_path`
+2. The monitor SSHes to the runner to build Docker images and start containers
+3. The monitor generates a dedicated SSH keypair at setup time (`monitor_ssh_key`) bind-mounted into the monitor container
+
+**Requirements on the runner node:**
+- Docker + Docker Compose installed
+- SSH access for the monitor (public key added to `~/.ssh/authorized_keys`)
+- No CTFd required — it is isolated to the CTFd host
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---------|-----|
-| No challenges found | Files must be `<category>/<name>/challenge.yml` (max depth 5) |
-| File upload 500 | `chown -R 1001:1001 <CTFd>/.data/CTFd/uploads` |
-| `state: Field may not be null` | Run `nervctf fix` |
-| Monitor 401 | `MONITOR_TOKEN` mismatch between CLI and server |
-| `ansible-playbook` not found | Run inside `nix develop .#` |
+| Symptom | Cause | Fix |
+|---|---|---|
+| No challenges found | Files not named `challenge.yml` or deeper than 5 directories | Check path; max depth is 5 |
+| `state: Field may not be null` | CTFd requires `state` field | Run `nervctf fix` |
+| File upload 500 | Wrong ownership on uploads directory | `chown -R 1001:1001 <ctfd_path>/.data/CTFd/uploads` |
+| Monitor 401 | Token mismatch between CLI and server | Check `monitor_token` in `.nervctf.yml` matches `MONITOR_TOKEN` on server |
+| `ansible-playbook: not found` | Tool not in PATH | Run inside `nix develop .#` or install ansible |
+| Players get 403 on instance request | CTFd is in user-mode | Switch CTFd to team mode; `nervctf probe` confirms |
+| Dynamic challenges fail 500 in CTFd admin | Partial CTFd schema migration | Run `nervctf probe --refresh` to diagnose |
+| rsync permission denied | SSH key not passed to rsync | Set `ssh_key_path` in `.nervctf.yml` |
+| Instance shows wrong host to players | `runner_domain` or `PUBLIC_HOST` wrong | Set `runner_domain` in `.nervctf.yml` and re-run `nervctf setup --upgrade` |
+| Flag submission says "Incorrect" but flag matches | CTFd `attempt()` return type mismatch | Upgrade NervCTF; fixed in v2.4.0 |
 
 ---
 
 ## Development
 
 ```sh
-make check    # cargo check
-make test     # unit tests
-make fmt      # rustfmt
+# All dev commands use the Nix devshell
+nix develop .# --command cargo check
+nix develop .# --command cargo test
+nix develop .# --command cargo fmt
+
+# Build static release binaries
+nix develop .# --command cargo build --release --target x86_64-unknown-linux-musl
+
+# Copy to dist/ after build (required by CLAUDE.md)
+cp target/x86_64-unknown-linux-musl/release/remote-monitor dist/remote-monitor-linux-x86_64-static
+cp target/x86_64-unknown-linux-musl/release/nervctf dist/nervctf-linux-x86_64-static
 ```
 
-See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full system reference and [`docs/`](docs/) for per-module documentation.
+See [`docs/`](docs/) for per-module documentation:
+
+| Document | Contents |
+|---|---|
+| [`docs/instance-challenges.md`](docs/instance-challenges.md) | Full instance challenge YAML reference, backend details, multi-port setup |
+| [`docs/remote-monitor.md`](docs/remote-monitor.md) | All API routes, env vars, schema detection, compatibility probe |
+| [`docs/challenge_manager.md`](docs/challenge_manager.md) | Sync logic, needs_update fields, sub-resource strategies |
+| [`docs/validator.md`](docs/validator.md) | All validation rules with severities |
+| [`docs/ctfd_api.md`](docs/ctfd_api.md) | HTTP API surface, version compatibility table |
+| [`docs/ctfd-dependency-audit.md`](docs/ctfd-dependency-audit.md) | Full CTFd dependency map, risk register |
+| [`docs/dev-notes.md`](docs/dev-notes.md) | Build env, cross-compilation, architectural notes |
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full system reference.
 
 ---
 

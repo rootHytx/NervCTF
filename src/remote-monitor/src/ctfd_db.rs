@@ -14,6 +14,34 @@ pub fn create_pool(url: &str) -> Result<Pool> {
     Ok(Pool::new(opts))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum CtfdMode {
+    TeamMode,
+    UserMode,
+    Unknown,
+}
+
+/// Queries CTFd's `configs` table to detect team-mode vs user-mode.
+/// Returns `Unknown` if the `configs` table is inaccessible or the key is absent.
+pub async fn detect_ctfd_mode(pool: &mysql_async::Pool) -> CtfdMode {
+    let mut conn = match pool.get_conn().await {
+        Ok(c) => c,
+        Err(_) => return CtfdMode::Unknown,
+    };
+    let row: Option<String> = conn
+        .exec_first(
+            "SELECT `value` FROM configs WHERE `key` = 'user_mode' LIMIT 1",
+            (),
+        )
+        .await
+        .unwrap_or(None);
+    match row.as_deref() {
+        Some("1") | Some("true") => CtfdMode::UserMode,
+        Some("0") | Some("false") | Some("") | None => CtfdMode::TeamMode,
+        _ => CtfdMode::Unknown,
+    }
+}
+
 /// INSERT a static flag for a challenge. Returns the new flag id, or None on failure.
 pub async fn create_flag(pool: &Pool, challenge_id: i64, content: &str) -> Option<i64> {
     let mut conn = match pool.get_conn().await {
@@ -114,9 +142,15 @@ struct ChallengesSchema {
     has_attribution: bool,
     has_logic: bool,
     has_position: bool,
-    /// true  = initial/minimum/decay/function are inline in `challenges` (newer CTFd)
-    /// false = they live in the separate `dynamic_challenge` join table (older CTFd)
+    /// true  = initial/minimum/decay/function are ALL inline in `challenges` (newer CTFd)
+    /// false = they live in the separate `dynamic_challenge` join table (older CTFd),
+    ///         OR the migration is partial (dynamic_partial=true).
     dynamic_in_challenges: bool,
+    /// True when only *some* inline scoring columns are present — indicates a partial
+    /// migration. Used by the probe system to report BROKEN dynamic scoring.
+    dynamic_partial: bool,
+    /// Whether `challenges.next_id` column exists (added in CTFd 3.5.x).
+    has_next_id: bool,
     /// true = `dynamic_challenge` join table exists in the database.
     /// CTFd uses SQLAlchemy joined-table inheritance: the row must always be present.
     has_dynamic_table: bool,
@@ -146,11 +180,20 @@ async fn detect_challenges_schema(conn: &mut mysql_async::Conn) -> ChallengesSch
         .unwrap_or_default();
     let has_dynamic_table = !dyn_cols.is_empty();
     let dyn_col_set: std::collections::HashSet<String> = dyn_cols.into_iter().collect();
+    // All four inline scoring columns must be present together; a partial migration
+    // (e.g. only `initial` added) would cause the generated SELECT to reference
+    // non-existent columns, producing runtime SQL errors or silent NULLs.
+    let has_initial  = col_set.contains("initial");
+    let has_minimum  = col_set.contains("minimum");
+    let has_decay    = col_set.contains("decay");
+    let has_function = col_set.contains("function");
     ChallengesSchema {
         has_attribution:          col_set.contains("attribution"),
         has_logic:                col_set.contains("logic"),
         has_position:             col_set.contains("position"),
-        dynamic_in_challenges:    col_set.contains("initial"),
+        dynamic_in_challenges:    has_initial && has_minimum && has_decay && has_function,
+        dynamic_partial:          has_initial && !(has_minimum && has_decay && has_function),
+        has_next_id:              col_set.contains("next_id"),
         has_dynamic_table,
         dynamic_table_has_scoring: dyn_col_set.contains("initial"),
     }
@@ -160,9 +203,11 @@ async fn detect_challenges_schema(conn: &mut mysql_async::Conn) -> ChallengesSch
 /// Column count and order always match `row_to_value` (NULL placeholders keep indices stable).
 fn build_full_query(has_instance: bool, schema: &ChallengesSchema) -> String {
     // Optional newer columns — NULL placeholder keeps row_to_value indices stable
-    let attr_col  = if schema.has_attribution { "c.attribution" } else { "NULL" };
-    let logic_col = if schema.has_logic       { "c.logic" }       else { "NULL" };
-    let pos_col   = if schema.has_position    { "c.position" }    else { "NULL" };
+    let attr_col    = if schema.has_attribution { "c.attribution" } else { "NULL" };
+    let logic_col   = if schema.has_logic       { "c.logic" }       else { "NULL" };
+    let pos_col     = if schema.has_position    { "c.position" }    else { "NULL" };
+    // NULL placeholder keeps col 10 (next_id) stable for row_to_value on CTFd <3.5.x
+    let next_id_col = if schema.has_next_id     { "c.next_id" }     else { "NULL" };
 
     // Dynamic scoring: inline in challenges (newer) or LEFT JOIN dynamic_challenge (older)
     let (dyn_cols, dyn_join) = if schema.dynamic_in_challenges {
@@ -193,7 +238,7 @@ fn build_full_query(has_instance: bool, schema: &ChallengesSchema) -> String {
     let ijoin = if has_instance { "LEFT JOIN nervctf_instance_challenge i ON i.id = c.id" } else { "" };
     format!(
         "SELECT c.id, c.name, c.description, c.category, c.value, c.`type`, c.state, \
-                c.max_attempts, c.connection_info, c.requirements, c.next_id, \
+                c.max_attempts, c.connection_info, c.requirements, {next_id_col}, \
                 {attr_col}, {logic_col}, {pos_col}, \
                 {dyn_cols}, \
                 {icols} \
@@ -363,8 +408,9 @@ pub async fn create_challenge(pool: &Pool, body: &Value) -> Result<Value> {
     // Build INSERT dynamically: only include columns that exist in this CTFd version
     let mut col_names: Vec<&str> = vec![
         "name", "category", "description", "value", "`type`", "state",
-        "max_attempts", "connection_info", "requirements", "next_id",
+        "max_attempts", "connection_info", "requirements",
     ];
+    if schema.has_next_id { col_names.push("next_id"); }
     if schema.has_logic { col_names.push("logic"); }
     if schema.dynamic_in_challenges && is_scored {
         col_names.extend(["initial", "minimum", "decay", "`function`"]);
@@ -382,8 +428,9 @@ pub async fn create_challenge(pool: &Pool, body: &Value) -> Result<Value> {
         name.clone().to_value(), category.clone().to_value(), description.clone().to_value(),
         value.to_value(), type_.clone().to_value(), state.clone().to_value(),
         max_attempts.to_value(), connection_info.clone().to_value(),
-        requirements.clone().to_value(), next_id.to_value(),
+        requirements.clone().to_value(),
     ];
+    if schema.has_next_id { params.push(next_id.to_value()); }
     if schema.has_logic { params.push(logic.to_value()); }
     if schema.dynamic_in_challenges && is_scored {
         params.push(initial.to_value());
@@ -464,9 +511,11 @@ pub async fn update_challenge(pool: &Pool, id: i64, body: &Value) -> Result<Valu
         sets.push("max_attempts = ?".to_string());
         params.push(mysql_async::Value::Int(a));
     }
-    if let Some(n) = body["next_id"].as_i64() {
-        sets.push("next_id = ?".to_string());
-        params.push(mysql_async::Value::Int(n));
+    if schema.has_next_id {
+        if let Some(n) = body["next_id"].as_i64() {
+            sets.push("next_id = ?".to_string());
+            params.push(mysql_async::Value::Int(n));
+        }
     }
     if body["requirements"].is_object() {
         if let Ok(s) = serde_json::to_string(&body["requirements"]) {
@@ -775,6 +824,262 @@ pub async fn delete_topic(pool: &Pool, topic_id: i64) -> Result<()> {
         .map_err(|e| anyhow!("ctfd_db: delete_topic: {}", e))?;
     conn.exec_drop("DELETE FROM challenge_topics WHERE topic_id = ?", (topic_id,)).await
         .map_err(|e| anyhow!("ctfd_db: delete_topic: {}", e))
+}
+
+// ── Compatibility probe ───────────────────────────────────────────────────────
+
+/// Full schema fingerprint and capability status for the connected CTFd instance.
+/// Produced by [`run_probe`] and persisted in the `ctfd_probe` SQLite table.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProbeResult {
+    /// UTC timestamp when the probe was run, formatted as `YYYY-MM-DD HH:MM:SS UTC`.
+    pub probed_at: String,
+    /// CTFd version string from the `configs` table, or `None` if absent/inaccessible.
+    pub ctfd_version_tag: Option<String>,
+    /// How the version was obtained: `"configs_table"` or `"inferred"`.
+    pub ctfd_version_source: String,
+    /// `Some(true)` = team-mode, `Some(false)` = user-mode, `None` = could not determine.
+    pub is_team_mode: Option<bool>,
+    /// All column names present in the `challenges` table, sorted alphabetically.
+    pub challenges_cols: Vec<String>,
+    /// Whether the `dynamic_challenge` join table exists.
+    pub has_dynamic_table: bool,
+    /// All column names present in `dynamic_challenge`, sorted alphabetically.
+    /// Empty when the table does not exist.
+    pub dynamic_cols: Vec<String>,
+    /// Whether `challenges.next_id` exists (added CTFd 3.5.x).
+    pub has_next_id: bool,
+    /// Whether `challenges.attribution` exists (added CTFd 3.7.0).
+    pub has_attribution: bool,
+    /// Whether `challenges.logic` exists (added CTFd 3.7.x).
+    pub has_logic: bool,
+    /// Whether `challenges.position` exists.
+    pub has_position: bool,
+    /// Whether all four inline scoring columns (`initial/minimum/decay/function`) are
+    /// present in `challenges` (newer CTFd; replaces the `dynamic_challenge` join table
+    /// for scoring).
+    pub dynamic_inline: bool,
+    /// Whether only a *partial* set of inline scoring columns is present — indicates a
+    /// broken schema migration.
+    pub dynamic_partial: bool,
+    /// Whether the NervCTF plugin table `nervctf_instance_challenge` exists.
+    pub has_instance_table: bool,
+    /// `"ok"` | `"degraded"` | `"broken"` — challenge CRUD capability.
+    pub cap_challenge_crud: String,
+    /// `"ok"` | `"degraded"` | `"broken"` — dynamic scoring capability.
+    pub cap_dynamic_scoring: String,
+    /// `"ok"` | `"degraded"` | `"broken"` — player token → team_id auth capability.
+    pub cap_player_auth: String,
+    /// `"ok"` | `"degraded"` | `"broken"` — per-instance flag capability.
+    pub cap_instance_flags: String,
+    /// Always `"degraded"` — direct MariaDB writes bypass CTFd's Redis cache.
+    pub cap_redis_sync: String,
+    /// Human-readable warnings for each degraded or broken capability.
+    pub probe_notes: Vec<String>,
+}
+
+/// Format a Unix timestamp (seconds) as `"YYYY-MM-DD HH:MM:SS UTC"` without
+/// pulling in the `chrono` crate.
+fn format_utc_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Reuse the same Gregorian computation that instance::expires_at_string uses,
+    // inlined here to avoid a cross-module dependency on a private function.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mon = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mon <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, mon, d, h, m, s)
+}
+
+/// Queries the connected CTFd MariaDB to build a full schema fingerprint and
+/// capability status report. Runs at monitor startup and on demand via the probe
+/// endpoint. Never fails — falls back to `"unknown"` / empty fields on errors so
+/// a single inaccessible table does not abort the probe.
+pub async fn run_probe(pool: &mysql_async::Pool) -> ProbeResult {
+    let mut conn = match pool.get_conn().await {
+        Ok(c) => c,
+        Err(e) => {
+            // Cannot connect at all — return a minimal broken result.
+            warn!("ctfd_probe: cannot connect to MariaDB: {}", e);
+            return ProbeResult {
+                probed_at: format_utc_now(),
+                ctfd_version_tag: None,
+                ctfd_version_source: "inferred".to_string(),
+                is_team_mode: None,
+                challenges_cols: Vec::new(),
+                has_dynamic_table: false,
+                dynamic_cols: Vec::new(),
+                has_next_id: false,
+                has_attribution: false,
+                has_logic: false,
+                has_position: false,
+                dynamic_inline: false,
+                dynamic_partial: false,
+                has_instance_table: false,
+                cap_challenge_crud: "broken".to_string(),
+                cap_dynamic_scoring: "broken".to_string(),
+                cap_player_auth: "broken".to_string(),
+                cap_instance_flags: "broken".to_string(),
+                cap_redis_sync: "degraded".to_string(),
+                probe_notes: vec![
+                    format!("Cannot connect to CTFd MariaDB: {}", e),
+                ],
+            };
+        }
+    };
+
+    // Step 1: detect schema via the existing helper.
+    let schema = detect_challenges_schema(&mut conn).await;
+
+    // Step 2: query the full column list for challenges (sorted) for the probe record.
+    let mut challenges_cols: Vec<String> = conn
+        .exec(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'challenges' \
+             ORDER BY COLUMN_NAME",
+            (),
+        )
+        .await
+        .unwrap_or_default();
+    challenges_cols.sort();
+
+    // Step 3: full column list for dynamic_challenge (sorted).
+    let mut dynamic_cols: Vec<String> = conn
+        .exec(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dynamic_challenge' \
+             ORDER BY COLUMN_NAME",
+            (),
+        )
+        .await
+        .unwrap_or_default();
+    dynamic_cols.sort();
+
+    // Step 4: detect CTFd version from the configs table.
+    let (ctfd_version_tag, ctfd_version_source) = {
+        let row: Option<String> = conn
+            .exec_first(
+                "SELECT `value` FROM configs WHERE `key` = 'ctf_version' LIMIT 1",
+                (),
+            )
+            .await
+            .unwrap_or(None);
+        match row {
+            Some(v) if !v.is_empty() => (Some(v), "configs_table".to_string()),
+            // Key exists but is empty — treat as absent.
+            Some(_) => (None, "inferred".to_string()),
+            None => (None, "inferred".to_string()),
+        }
+    };
+
+    // Step 5: detect team/user mode via the existing helper.
+    // Re-use the module-level function; it acquires its own connection from the pool.
+    let ctfd_mode = detect_ctfd_mode(pool).await;
+    let is_team_mode: Option<bool> = match ctfd_mode {
+        CtfdMode::TeamMode => Some(true),
+        CtfdMode::UserMode => Some(false),
+        CtfdMode::Unknown => None,
+    };
+
+    // Step 6: check for the NervCTF plugin table.
+    let has_inst = has_instance_table(&mut conn).await;
+
+    // Step 7: compute capability statuses (deterministic rules).
+    let cap_challenge_crud = if schema.has_next_id {
+        "ok"
+    } else {
+        "degraded"
+    }.to_string();
+
+    let cap_dynamic_scoring = if schema.dynamic_partial {
+        "broken"
+    } else if schema.dynamic_in_challenges || (schema.has_dynamic_table && !schema.dynamic_partial) {
+        "ok"
+    } else {
+        // No inline scoring and no dynamic table at all — unexpected but not broken per se.
+        "degraded"
+    }.to_string();
+
+    let cap_player_auth = match is_team_mode {
+        Some(true) => "ok",
+        Some(false) => "broken",
+        None => "degraded",
+    }.to_string();
+
+    let cap_instance_flags = if has_inst { "ok" } else { "degraded" }.to_string();
+
+    // Redis sync is always degraded — direct MariaDB writes always bypass the cache.
+    let cap_redis_sync = "degraded".to_string();
+
+    // Step 8: collect human-readable probe_notes for each non-ok capability.
+    let mut probe_notes: Vec<String> = Vec::new();
+    if cap_challenge_crud == "degraded" {
+        probe_notes.push(
+            "challenges.next_id column absent — next_id field will be silently ignored (CTFd < 3.5.x)".to_string(),
+        );
+    }
+    if cap_dynamic_scoring == "broken" {
+        probe_notes.push(
+            "Partial inline scoring migration detected — deploy of dynamic challenges will fail with SQL errors".to_string(),
+        );
+    }
+    if cap_player_auth == "broken" {
+        probe_notes.push(
+            "CTFd is in user-mode — all player instance requests will return 403".to_string(),
+        );
+    }
+    if cap_player_auth == "degraded" {
+        probe_notes.push(
+            "CTFd mode could not be determined — player auth may fail if user-mode is active".to_string(),
+        );
+    }
+    if cap_instance_flags == "degraded" {
+        probe_notes.push(
+            "nervctf_instance_challenge table absent — plugin not installed; instance challenges will fail".to_string(),
+        );
+    }
+    // Redis sync note is always present.
+    probe_notes.push(
+        "Direct MariaDB writes bypass CTFd Redis cache — stale data may be served until CTFd restart or TTL expiry".to_string(),
+    );
+
+    ProbeResult {
+        probed_at: format_utc_now(),
+        ctfd_version_tag,
+        ctfd_version_source,
+        is_team_mode,
+        challenges_cols,
+        has_dynamic_table: schema.has_dynamic_table,
+        dynamic_cols,
+        has_next_id: schema.has_next_id,
+        has_attribution: schema.has_attribution,
+        has_logic: schema.has_logic,
+        has_position: schema.has_position,
+        dynamic_inline: schema.dynamic_in_challenges,
+        dynamic_partial: schema.dynamic_partial,
+        has_instance_table: has_inst,
+        cap_challenge_crud,
+        cap_dynamic_scoring,
+        cap_player_auth,
+        cap_instance_flags,
+        cap_redis_sync,
+        probe_notes,
+    }
 }
 
 // ── Read-only sync from CTFd submissions ──────────────────────────────────────

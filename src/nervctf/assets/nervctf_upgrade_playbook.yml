@@ -2,6 +2,10 @@
 # NervCTF upgrade playbook — updates an existing deployment without reinstalling infrastructure.
 # Upgrades: CTFd plugin, remote-monitor binary, Docker image, restarts affected containers.
 # Assumes Docker, CTFd, and the monitor service are already running.
+#
+# NervCTF tested CTFd version: 3.7.3
+# The version-check tasks below detect drift. If CTFd has been updated beyond
+# 3.7.3, run 'nervctf probe' after this playbook to get a full compatibility report.
 - hosts: ctfd
   become: yes
   vars:
@@ -10,6 +14,31 @@
     monitor_port: "{{ monitor_port | default('33133') }}"
 
   tasks:
+    # ── CTFd version check ─────────────────────────────────────────────────────
+    - name: Read installed CTFd git tag
+      command: git -C "{{ ctfd_path }}" describe --tags --exact-match
+      register: ctfd_installed_tag
+      ignore_errors: true
+      changed_when: false
+
+    - name: Warn if CTFd version has drifted from tested version
+      debug:
+        msg: >
+          WARNING: Installed CTFd version is '{{ ctfd_installed_tag.stdout | trim }}'.
+          NervCTF is tested against 3.7.3. Schema assumptions may not hold.
+          After this upgrade, run 'nervctf probe' to verify compatibility.
+      when:
+        - ctfd_installed_tag.rc == 0
+        - ctfd_installed_tag.stdout | trim != '3.7.3'
+
+    - name: Note if CTFd version could not be determined
+      debug:
+        msg: >
+          WARNING: Could not read CTFd git tag (rc={{ ctfd_installed_tag.rc }}).
+          The installed CTFd version cannot be verified. Proceeding anyway.
+          Run 'nervctf probe' after upgrade to check compatibility.
+      when: ctfd_installed_tag.rc != 0
+
     # ── CTFd Plugin ────────────────────────────────────────────────────────────
     - name: Ensure CTFd plugins directory exists
       file:

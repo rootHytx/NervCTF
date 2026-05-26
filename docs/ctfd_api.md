@@ -253,6 +253,78 @@ the explicit handlers in `src/remote-monitor/src/main.rs`.
 
 ---
 
+## 7. Known Version Compatibility
+
+| Column / Feature | Present since | Guard | Notes |
+|-----------------|--------------|-------|-------|
+| `challenges.next_id` | CTFd 3.5.x | `has_next_id` — NULL placeholder in SELECT; omitted from INSERT/UPDATE when absent | Absent on older versions; every challenge operation failed with "Unknown column 'next_id'" before this guard |
+| `challenges.attribution` | CTFd 3.7.0 | `has_attribution` — already guarded in SELECT and UPDATE SET | Read-only path; never set by the monitor |
+| `challenges.logic` | CTFd 3.7.x | `has_logic` — already guarded in INSERT and UPDATE SET | Default insert value is `""` not NULL |
+| `challenges.initial/minimum/decay/function` (inline) | Newer CTFd | `dynamic_in_challenges` requires **all four** columns present | Single-column proxy (`initial` only) was wrong; a partial migration sets `dynamic_partial=true` and falls back safely to the join-table path |
+| User-mode CTFd | N/A (runtime config) | `detect_ctfd_mode()` at startup warns if user-mode is detected | User-mode sets `users.team_id = NULL` for all players; `validate_token()` returns `None`, causing 403 on all player instance routes |
+
+---
+
+## 8. `nervctf probe` Command
+
+The `nervctf probe` subcommand calls `GET /api/v1/admin/probe` on the remote monitor and
+displays a capability matrix showing CTFd schema compatibility and operational status.
+
+### Usage
+
+```
+nervctf probe [--refresh] [--json]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--refresh` | Force the monitor to re-run its schema introspection queries instead of returning a cached result. Adds a small MariaDB round-trip overhead. |
+| `--json` | Print the raw probe data as pretty-printed JSON instead of the formatted table. Suitable for scripting. |
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | All capabilities are `ok` or at most `degraded`. Deployment is expected to succeed with possible caveats. |
+| `1` | One or more critical capabilities (`cap_challenge_crud`, `cap_dynamic_scoring`, `cap_player_auth`, `cap_instance_flags`) are `broken`. Deployment is likely to fail. |
+
+Note that `cap_redis_sync` being `broken` or `degraded` does **not** affect the exit code —
+it is an operational warning only and does not prevent challenge CRUD operations.
+
+### Capability Fields
+
+All capability fields return one of: `"ok"`, `"degraded"`, `"broken"`, `"unknown"`.
+
+| Field | What it covers |
+|-------|----------------|
+| `cap_challenge_crud` | INSERT/UPDATE/DELETE on the `challenges` table |
+| `cap_dynamic_scoring` | `dynamic_challenge` table state and inline scoring columns |
+| `cap_player_auth` | Team-mode detection; user-mode CTFd blocks all player instance routes |
+| `cap_instance_flags` | `nervctf_instance_challenge` table presence |
+| `cap_redis_sync` | Redis cache invalidation after direct MariaDB writes |
+
+### Deploy-time Probe Gate
+
+`nervctf deploy` automatically fetches the cached probe result (no `--refresh`) before
+executing any remote writes. The following rules apply:
+
+- **`cap_dynamic_scoring == "broken"`** — deploy is aborted with exit code 1. The
+  `dynamic_challenge` table is in a partial migration state and deploying dynamic
+  challenges would produce runtime SQL errors.
+- **`cap_player_auth == "broken"`** — a warning is printed but deploy continues.
+  Instance challenges will not be accessible to players until CTFd is switched to
+  team mode.
+- **Degraded capabilities** — a summary line is printed listing which capabilities
+  are degraded. Run `nervctf probe` for the full report.
+- **Version mismatch** — if the probe reports a `ctfd_version_tag` different from the
+  `TESTED_CTFD_VERSION` constant (`3.7.3`), a warning is printed and deploy continues
+  with caution.
+- **Probe unavailable** — if the monitor does not yet implement the probe endpoint
+  (older monitor binary), a warning is printed and deploy continues without blocking.
+  This preserves backward compatibility with pre-probe monitor versions.
+
+---
+
 ## References
 
 - `src/nervctf/src/ctfd_api/client.rs`

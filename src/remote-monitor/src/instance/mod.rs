@@ -152,18 +152,22 @@ pub async fn provision(
                 runner_ssh,
             ).await?;
 
-            let ctfd_flag_id = match (&flag, ctfd_id) {
-                (Some(f), Some(cid)) => crate::ctfd_db::create_flag(ctfd_pool, cid, f).await,
-                _ => None,
-            };
-
             let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+
+            // Write instance to SQLite before creating the CTFd flag — if we crash
+            // between these steps, ctfd_flag_id stays NULL and cleanup skips delete_flag.
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &container_id,
                 public_host, host_port as i64, &connection, &expires_at,
-                flag.as_deref(), ctfd_flag_id, extra_ports.as_deref(),
+                flag.as_deref(), None, extra_ports.as_deref(),
             )?;
+
+            if let (Some(f), Some(cid)) = (&flag, ctfd_id) {
+                if let Some(flag_id) = crate::ctfd_db::create_flag(ctfd_pool, cid, f).await {
+                    crate::db::set_ctfd_flag_id(db, challenge_name, team_id, flag_id)?;
+                }
+            }
 
             Ok((public_host.to_string(), host_port, connection, expires_at))
         }
@@ -254,18 +258,23 @@ pub async fn provision(
                 runner_ssh,
             ).await?;
 
-            let ctfd_flag_id = match (&flag, ctfd_id) {
-                (Some(f), Some(cid)) => crate::ctfd_db::create_flag(ctfd_pool, cid, f).await,
-                _ => None,
-            };
-
             let extra_ports = build_extra_ports_json(&all_port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+
+            // Write instance to SQLite before creating the CTFd flag — if we crash
+            // between these steps, ctfd_flag_id stays NULL and cleanup skips delete_flag.
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &project,
                 public_host, host_port as i64, &connection, &expires_at,
-                flag.as_deref(), ctfd_flag_id, extra_ports.as_deref(),
+                flag.as_deref(), None, extra_ports.as_deref(),
             )?;
+
+            if let (Some(f), Some(cid)) = (&flag, ctfd_id) {
+                if let Some(flag_id) = crate::ctfd_db::create_flag(ctfd_pool, cid, f).await {
+                    crate::db::set_ctfd_flag_id(db, challenge_name, team_id, flag_id)?;
+                }
+            }
+
             Ok((public_host.to_string(), host_port, connection, expires_at))
         }
         "lxc" => {
@@ -278,18 +287,23 @@ pub async fn provision(
             let flag = generate_flag(config);
             let cid = lxc::launch(lxc_image, &cname, &port_mappings, flag.as_deref()).await?;
 
-            let ctfd_flag_id = match (&flag, ctfd_id) {
-                (Some(f), Some(cid_val)) => crate::ctfd_db::create_flag(ctfd_pool, cid_val, f).await,
-                _ => None,
-            };
-
             let extra_ports = build_extra_ports_json(&port_mappings);
             let expires_at = expires_at_string(timeout_minutes);
+
+            // Write instance to SQLite before creating the CTFd flag — if we crash
+            // between these steps, ctfd_flag_id stays NULL and cleanup skips delete_flag.
             crate::db::insert_instance(
                 db, challenge_name, team_id, user_id, &cid,
                 public_host, host_port as i64, &connection, &expires_at,
-                flag.as_deref(), ctfd_flag_id, extra_ports.as_deref(),
+                flag.as_deref(), None, extra_ports.as_deref(),
             )?;
+
+            if let (Some(f), Some(cid_val)) = (&flag, ctfd_id) {
+                if let Some(flag_id) = crate::ctfd_db::create_flag(ctfd_pool, cid_val, f).await {
+                    crate::db::set_ctfd_flag_id(db, challenge_name, team_id, flag_id)?;
+                }
+            }
+
             Ok((public_host.to_string(), host_port, connection, expires_at))
         }
         "vagrant" => {

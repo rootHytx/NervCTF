@@ -115,6 +115,63 @@ pub fn needs_update(remote: &Challenge, local: &Challenge) -> bool {
         return true;
     }
 
+    // Fix A4: Detect file changes.
+    // CTFd's list endpoint never populates `files` on the remote Challenge, so remote.files
+    // is always None. When local defines files, we cannot confirm they are in sync from the
+    // Challenge struct alone — return true so update_challenge_phase1 runs, which calls
+    // sync_files() for the real idempotent diff against the live CTFd API.
+    if let Some(local_files) = &local.files {
+        // Extract basenames from local paths for comparison
+        let mut local_names: Vec<&str> = local_files
+            .iter()
+            .filter_map(|p| std::path::Path::new(p).file_name()?.to_str())
+            .collect();
+        local_names.sort();
+
+        match &remote.files {
+            Some(remote_files) => {
+                // Remote files stored as 'uploads/<hash>/<filename>' — take the last segment
+                let mut remote_names: Vec<&str> = remote_files
+                    .iter()
+                    .filter_map(|loc| loc.split('/').last())
+                    .collect();
+                remote_names.sort();
+                if remote_names != local_names {
+                    return true;
+                }
+            }
+            // remote.files is None (list endpoint never includes it) and local wants files:
+            // delegate the real diff to sync_files()
+            None => {
+                if !local_names.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Fix A4: Detect topic changes.
+    // Same rationale as files: CTFd list endpoint never populates topics on the remote
+    // Challenge, so delegate the real diff to replace_topics() via update_challenge_phase1.
+    if let Some(local_topics) = &local.topics {
+        if !local_topics.is_empty() {
+            match &remote.topics {
+                Some(remote_topics) => {
+                    let mut rt: Vec<&str> = remote_topics.iter().map(|s| s.as_str()).collect();
+                    rt.sort();
+                    let mut lt: Vec<&str> = local_topics.iter().map(|s| s.as_str()).collect();
+                    lt.sort();
+                    if rt != lt {
+                        return true;
+                    }
+                }
+                // Remote topics are None (list endpoint never includes them) and local has
+                // topics defined — trigger update so replace_topics() can do the real diff.
+                None => return true,
+            }
+        }
+    }
+
     false
 }
 
@@ -532,6 +589,98 @@ mod tests {
         remote.instance = None;
         let mut local = base();
         local.instance = Some(base_instance_config());
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix A4: files — local has files, remote has None (typical: list endpoint never populates)
+    #[test]
+    fn local_files_remote_none_triggers_update() {
+        let remote = base(); // remote.files = None
+        let mut local = base();
+        local.files = Some(vec!["challenges/web/exploit.zip".to_string()]);
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix A4: files — both None, no update
+    #[test]
+    fn both_files_none_no_update() {
+        let remote = base();
+        let local = base();
+        assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix A4: files — local empty list, remote None, no update needed
+    #[test]
+    fn local_files_empty_remote_none_no_update() {
+        let remote = base();
+        let mut local = base();
+        local.files = Some(vec![]);
+        assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix A4: files — remote has same filenames (as CTFd location paths), no update
+    #[test]
+    fn files_same_basenames_no_update() {
+        let mut remote = base();
+        remote.files = Some(vec!["uploads/abc123/exploit.zip".to_string()]);
+        let mut local = base();
+        local.files = Some(vec!["challenges/web/exploit.zip".to_string()]);
+        assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix A4: files — remote has different filename, triggers update
+    #[test]
+    fn files_different_basenames_triggers_update() {
+        let mut remote = base();
+        remote.files = Some(vec!["uploads/abc123/old_file.zip".to_string()]);
+        let mut local = base();
+        local.files = Some(vec!["challenges/web/exploit.zip".to_string()]);
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix A4: topics — local has topics, remote has None (typical: list endpoint never populates)
+    #[test]
+    fn local_topics_remote_none_triggers_update() {
+        let remote = base(); // remote.topics = None
+        let mut local = base();
+        local.topics = Some(vec!["binary exploitation".to_string()]);
+        assert!(needs_update(&remote, &local));
+    }
+
+    // Fix A4: topics — both None, no update
+    #[test]
+    fn both_topics_none_no_update() {
+        let remote = base();
+        let local = base();
+        assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix A4: topics — local empty list, remote None, no update needed
+    #[test]
+    fn local_topics_empty_remote_none_no_update() {
+        let remote = base();
+        let mut local = base();
+        local.topics = Some(vec![]);
+        assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix A4: topics — remote has same topics, no update
+    #[test]
+    fn topics_same_no_update() {
+        let mut remote = base();
+        remote.topics = Some(vec!["web".to_string(), "sqli".to_string()]);
+        let mut local = base();
+        local.topics = Some(vec!["sqli".to_string(), "web".to_string()]); // different order
+        assert!(!needs_update(&remote, &local));
+    }
+
+    // Fix A4: topics — remote has different topics, triggers update
+    #[test]
+    fn topics_different_triggers_update() {
+        let mut remote = base();
+        remote.topics = Some(vec!["web".to_string()]);
+        let mut local = base();
+        local.topics = Some(vec!["pwn".to_string()]);
         assert!(needs_update(&remote, &local));
     }
 }

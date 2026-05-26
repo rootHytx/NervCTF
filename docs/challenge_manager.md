@@ -68,21 +68,68 @@ Public free function. Returns `true` if any significant field differs.
 
 **Fields compared:**
 
-| Field | Notes |
-|-------|-------|
-| `category`, `value`, `description`, `state` | exact match |
-| `connection_info`, `attempts` | exact match |
-| `extra` | JSON-serialized comparison |
-| `flags` | sorted list of `content` strings |
-| `tags` | sorted list of tag values |
-| `hints` | sorted list of `content` strings |
-| `requirements` | presence only (not deep comparison) |
+| Field | Comparison key | Notes |
+|-------|----------------|-------|
+| `category`, `value`, `description`, `state` | exact | |
+| `connection_info`, `attempts` | exact | |
+| `extra` | JSON-serialized | |
+| `flags` | sorted `(content, type, data)` tuples | type/data changes are detected |
+| `tags` | sorted tag value strings | |
+| `hints` | sorted `(content, cost)` tuples | cost changes are detected |
+| `requirements` | sorted prerequisite name/id list | |
+| `instance` | JSON-serialized | |
+| `files` | sorted basenames | triggers if local has files; remote never has this field populated |
+| `topics` | sorted topic strings | triggers if local has topics; remote never has this field populated |
 
-**Note:** CTFd's list endpoint never returns flags/tags/hints fields, so those comparisons
-only fire when both sides are `Some` (i.e. after fetching per-challenge detail).
+**Note on files and topics:** CTFd's `/challenges` list endpoint never includes `files` or
+`topics` on the response objects, so `remote.files` and `remote.topics` are always `None`.
+When local has files or topics defined, `needs_update` returns `true` unconditionally so that
+`update_challenge_phase1` runs — `sync_files()` and `replace_topics()` then perform the real
+idempotent diff against the live CTFd API and skip the update if nothing changed.
+
+**Note on flags/hints/tags:** CTFd's list endpoint also never returns these sub-resource
+fields, so flag/hint/tag comparisons only fire when both sides are `Some` (which happens
+in tests and when the deploy loop explicitly populates the remote struct from a detail call).
 
 The `ChallengeSynchronizer::needs_update()` method delegates directly to this free function
 to avoid code duplication. Both the `sync` command and the test suite call the free function.
+
+---
+
+## Sub-Resource Sync Strategy
+
+Sub-resources (flags, hints, tags, topics, files) are synced by `update_challenge_phase1()`
+in `main.rs` after the core challenge PATCH. Each sub-resource has its own replace helper.
+
+### Comparison keys per sub-resource
+
+| Sub-resource | Comparison key | Where compared |
+|--------------|----------------|----------------|
+| flags | sorted `(content, type, data)` tuples | `replace_flags()` + `needs_update()` |
+| hints | sorted `(content, cost)` tuples | `replace_hints()` + `needs_update()` |
+| tags | sorted value strings | `replace_tags()` + `needs_update()` |
+| topics | sorted value strings | `replace_topics()` (idempotent diff) + `needs_update()` |
+| files | sorted basenames | `sync_files()` (idempotent diff) + `needs_update()` |
+
+### Which sub-resources trigger `needs_update`
+
+All five sub-resources are checked in `needs_update()`. For flags, hints, tags, and
+requirements the check is symmetric (`if let (Some, Some)`). For files and topics the check
+is asymmetric: any non-empty local list returns `true` because the remote `Challenge` struct
+never has these fields populated from the list endpoint.
+
+### Replace function flow
+
+`replace_flags`, `replace_hints`, and `replace_tags` each follow the same pattern:
+1. Fetch the current remote sub-resources via a dedicated CTFd endpoint.
+2. Build sorted comparison vectors from both sides using the full comparison key.
+3. If the vectors are equal, return early (no-op).
+4. Otherwise, delete all existing remote sub-resources for this challenge.
+5. POST the full local set as replacements.
+
+`replace_topics` uses a differential approach (delete extras, add missing) because CTFd's
+topics endpoint does not support bulk delete. `sync_files` deletes all remote files and
+marks the challenge for phase-2 re-upload when the filename sets differ.
 
 ### `ChallengeSynchronizer`
 

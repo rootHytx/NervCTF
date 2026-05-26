@@ -18,6 +18,35 @@ use std::env;
 use std::io::Write;
 use std::path::PathBuf;
 
+/// The CTFd version that NervCTF is tested and validated against.
+/// Update this constant and re-run 'nervctf probe' when upgrading CTFd.
+const TESTED_CTFD_VERSION: &str = "3.7.3";
+
+/// Schema and capability data returned by the remote monitor's probe endpoint.
+#[derive(Debug, serde::Deserialize)]
+struct ProbeData {
+    probed_at: String,
+    ctfd_version_tag: Option<String>,
+    ctfd_version_source: String,
+    is_team_mode: Option<bool>,
+    challenges_cols: Vec<String>,
+    has_dynamic_table: bool,
+    dynamic_cols: Vec<String>,
+    has_next_id: bool,
+    has_attribution: bool,
+    has_logic: bool,
+    has_position: bool,
+    dynamic_inline: bool,
+    dynamic_partial: bool,
+    has_instance_table: bool,
+    cap_challenge_crud: String,
+    cap_dynamic_scoring: String,
+    cap_player_auth: String,
+    cap_instance_flags: String,
+    cap_redis_sync: String,
+    probe_notes: Vec<String>,
+}
+
 #[derive(Parser)]
 #[command(name = "nervctf")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
@@ -95,6 +124,17 @@ enum Commands {
         /// Show full field-by-field dictionary for every challenge
         #[arg(long)]
         debug: bool,
+    },
+
+    /// Probe the remote monitor for CTFd compatibility and display a capability matrix.
+    /// Exits with code 1 if any capability is 'broken'.
+    Probe {
+        /// Force a fresh probe even if a recent result is cached on the monitor.
+        #[arg(long, default_value_t = false)]
+        refresh: bool,
+        /// Output raw JSON instead of the formatted table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 }
 
@@ -225,6 +265,9 @@ async fn main() -> Result<()> {
         Commands::Scan { detailed } => {
             scan_challenges(&scanner, &effective_base_dir, detailed).await?;
         }
+        Commands::Probe { refresh, json } => {
+            run_probe(&client, refresh, json).await?;
+        }
         Commands::Setup { .. } | Commands::Fix { .. } | Commands::Validate { .. } => {
             unreachable!("handled before credential resolution")
         }
@@ -265,6 +308,145 @@ fn validate_command(base_dir: &PathBuf, debug: bool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+// ── probe ─────────────────────────────────────────────────────────────────────
+
+/// Call the monitor's probe endpoint, display a capability matrix, and exit with
+/// code 1 if any critical capability is reported as 'broken'.
+async fn run_probe(client: &CtfdClient, refresh: bool, json_output: bool) -> anyhow::Result<()> {
+    let endpoint = if refresh {
+        "/admin/probe?refresh=true"
+    } else {
+        "/admin/probe"
+    };
+
+    let probe: ProbeData = match client
+        .execute::<ProbeData, serde_json::Value>(
+            reqwest::Method::GET,
+            endpoint,
+            None::<&serde_json::Value>,
+        )
+        .await?
+    {
+        Some(p) => p,
+        None => anyhow::bail!("Empty response from probe endpoint"),
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&probe_as_json(&probe))?);
+        return Ok(());
+    }
+
+    print_probe_table(&probe);
+
+    // Exit 1 if any critical capability is broken
+    let has_broken = [
+        &probe.cap_challenge_crud,
+        &probe.cap_dynamic_scoring,
+        &probe.cap_player_auth,
+        &probe.cap_instance_flags,
+    ]
+    .iter()
+    .any(|s| s.as_str() == "broken");
+
+    if has_broken {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Serialize a `ProbeData` into a `serde_json::Value` for `--json` output.
+fn probe_as_json(probe: &ProbeData) -> serde_json::Value {
+    json!({
+        "probed_at": probe.probed_at,
+        "ctfd_version_tag": probe.ctfd_version_tag,
+        "ctfd_version_source": probe.ctfd_version_source,
+        "is_team_mode": probe.is_team_mode,
+        "challenges_cols": probe.challenges_cols,
+        "has_dynamic_table": probe.has_dynamic_table,
+        "dynamic_cols": probe.dynamic_cols,
+        "has_next_id": probe.has_next_id,
+        "has_attribution": probe.has_attribution,
+        "has_logic": probe.has_logic,
+        "has_position": probe.has_position,
+        "dynamic_inline": probe.dynamic_inline,
+        "dynamic_partial": probe.dynamic_partial,
+        "has_instance_table": probe.has_instance_table,
+        "cap_challenge_crud": probe.cap_challenge_crud,
+        "cap_dynamic_scoring": probe.cap_dynamic_scoring,
+        "cap_player_auth": probe.cap_player_auth,
+        "cap_instance_flags": probe.cap_instance_flags,
+        "cap_redis_sync": probe.cap_redis_sync,
+        "probe_notes": probe.probe_notes,
+    })
+}
+
+/// Print a human-readable capability matrix from a `ProbeData` response.
+fn print_probe_table(probe: &ProbeData) {
+    let version = probe.ctfd_version_tag.as_deref().unwrap_or("unknown");
+    let source = &probe.ctfd_version_source;
+    let mode = match probe.is_team_mode {
+        Some(true) => "team",
+        Some(false) => "user (WARNING: instance auth broken)",
+        None => "unknown",
+    };
+
+    println!("\nNervCTF <-> CTFd Compatibility Report");
+    println!("══════════════════════════════════════");
+    println!("CTFd version : {} (source: {})", version, source);
+    println!("CTFd mode    : {}", mode);
+    println!("Probed at    : {}", probe.probed_at);
+    println!();
+
+    let rows = [
+        ("Challenge CRUD",           &probe.cap_challenge_crud),
+        ("Dynamic scoring",          &probe.cap_dynamic_scoring),
+        ("Player authentication",    &probe.cap_player_auth),
+        ("Instance flag lifecycle",  &probe.cap_instance_flags),
+        ("Redis cache invalidation", &probe.cap_redis_sync),
+    ];
+
+    println!("{:<28}  {:<10}", "Capability", "Status");
+    println!("{}", "-".repeat(42));
+    for (name, status) in &rows {
+        let label = match status.as_str() {
+            "ok"       => "[ok]      ",
+            "degraded" => "[DEGRADED]",
+            "broken"   => "[BROKEN]  ",
+            _          => "[unknown] ",
+        };
+        println!("{:<28}  {}", name, label);
+    }
+
+    if !probe.challenges_cols.is_empty() {
+        println!();
+        println!("Schema fingerprint:");
+        println!("  challenges       : {}", probe.challenges_cols.join(", "));
+        if probe.has_dynamic_table {
+            let dyn_desc = if probe.dynamic_cols.len() == 1 {
+                format!(
+                    "{} (stub-only — scoring is inline in challenges)",
+                    probe.dynamic_cols.join(", ")
+                )
+            } else {
+                probe.dynamic_cols.join(", ")
+            };
+            println!("  dynamic_challenge: {}", dyn_desc);
+        } else {
+            println!("  dynamic_challenge: (table absent)");
+        }
+    }
+
+    if !probe.probe_notes.is_empty() {
+        println!();
+        println!("Warnings:");
+        for note in &probe.probe_notes {
+            println!("  • {}", note);
+        }
+    }
+    println!();
 }
 
 // ── deploy ────────────────────────────────────────────────────────────────────
@@ -397,6 +579,72 @@ async fn deploy_challenges(
         if input.trim().to_lowercase() != "y" {
             println!("aborted.");
             return Ok(());
+        }
+    }
+
+    // Fetch stored probe to check for blocking compatibility issues.
+    // Uses the cached result (no refresh) — fast, no extra MariaDB queries.
+    let probe_result = client
+        .execute::<ProbeData, serde_json::Value>(
+            reqwest::Method::GET,
+            "/admin/probe",
+            None::<&serde_json::Value>,
+        )
+        .await;
+
+    match probe_result {
+        Ok(Some(probe)) => {
+            // Gate: broken dynamic_scoring blocks deploy entirely
+            if probe.cap_dynamic_scoring == "broken" {
+                eprintln!(
+                    "[x] CTFd dynamic_challenge schema is in a partial migration state.\n    \
+                     Deploying dynamic challenges would cause runtime SQL errors.\n    \
+                     Fix the CTFd schema (complete or revert the migration) before deploying."
+                );
+                std::process::exit(1);
+            }
+            // Warning: broken player auth
+            if probe.cap_player_auth == "broken" {
+                eprintln!(
+                    "[!] CTFd is in user-mode. Instance challenges will not be accessible\n    \
+                     to players (all token authentication returns 403)."
+                );
+            }
+            // Summary line for degraded
+            let degraded: Vec<&str> = [
+                ("challenge_crud",  probe.cap_challenge_crud.as_str()),
+                ("dynamic_scoring", probe.cap_dynamic_scoring.as_str()),
+                ("player_auth",     probe.cap_player_auth.as_str()),
+                ("instance_flags",  probe.cap_instance_flags.as_str()),
+                ("redis_sync",      probe.cap_redis_sync.as_str()),
+            ]
+            .iter()
+            .filter(|(_, s)| *s == "degraded")
+            .map(|(n, _)| *n)
+            .collect();
+
+            if !degraded.is_empty() {
+                eprintln!(
+                    "[~] {} degraded capability(-ies): {}. Run 'nervctf probe' for details.",
+                    degraded.len(),
+                    degraded.join(", ")
+                );
+            }
+
+            // C8: Version drift detection
+            if let Some(ref tag) = probe.ctfd_version_tag {
+                if tag != TESTED_CTFD_VERSION {
+                    eprintln!(
+                        "[!] CTFd version mismatch: probe reports '{}', NervCTF tested against '{}'.\n    \
+                         Run 'nervctf probe --refresh' to update the compatibility report. Proceeding with caution.",
+                        tag, TESTED_CTFD_VERSION
+                    );
+                }
+            }
+        }
+        Ok(None) | Err(_) => {
+            // Probe unavailable — warn but do not block (monitor may be running an older version)
+            eprintln!("[~] Could not fetch CTFd compatibility probe. Run 'nervctf probe' to check compatibility.");
         }
     }
 
@@ -1037,14 +1285,25 @@ async fn replace_flags(
     match client.get_challenge_flags_endpoint(challenge_id).await {
         Ok(Some(existing)) => {
             let arr = existing.as_array().cloned().unwrap_or_default();
-            // Compare remote vs local content — skip if already identical
-            let mut remote: Vec<String> = arr.iter()
-                .filter_map(|f| f.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            // Compare (content, type, data) tuples so that a type or data change
+            // (e.g. static → regex, or case_sensitive → case_insensitive) is detected
+            // even when the flag content string is identical.
+            let mut remote: Vec<(String, String, String)> = arr.iter()
+                .filter_map(|f| {
+                    let content = f.get("content")?.as_str()?.to_string();
+                    let type_ = f.get("type").and_then(|v| v.as_str()).unwrap_or("static").to_string();
+                    let data = f.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    Some((content, type_, data))
+                })
                 .collect();
             remote.sort();
-            let mut local: Vec<String> = flags.as_ref().map(|fs| fs.iter().map(|f| match f {
-                FlagContent::Simple(s) => s.clone(),
-                FlagContent::Detailed { content, .. } => content.clone(),
+            let mut local: Vec<(String, String, String)> = flags.as_ref().map(|fs| fs.iter().map(|f| match f {
+                FlagContent::Simple(s) => (s.clone(), "static".to_string(), "".to_string()),
+                FlagContent::Detailed { content, type_, data, .. } => (
+                    content.clone(),
+                    type_.as_str().to_string(),
+                    data.as_ref().map(|d| d.as_str().to_string()).unwrap_or_default(),
+                ),
             }).collect()).unwrap_or_default();
             local.sort();
             if remote == local {
@@ -1114,13 +1373,20 @@ async fn replace_hints(
     match client.get_challenge_hints_endpoint(challenge_id).await {
         Ok(Some(existing)) => {
             let arr = existing.as_array().cloned().unwrap_or_default();
-            let mut remote: Vec<String> = arr.iter()
-                .filter_map(|h| h.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            // Compare (content, cost) tuples so that a cost change is not silently dropped
+            // when the hint text is unchanged — needs_update fires for the cost diff but
+            // the old content-only check here would skip the actual replace.
+            let mut remote: Vec<(String, u32)> = arr.iter()
+                .filter_map(|h| {
+                    let content = h.get("content")?.as_str()?.to_string();
+                    let cost = h.get("cost").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                    Some((content, cost))
+                })
                 .collect();
             remote.sort();
-            let mut local: Vec<String> = hints.as_ref().map(|hs| hs.iter().map(|h| match h {
-                HintContent::Simple(s) => s.clone(),
-                HintContent::Detailed { content, .. } => content.clone(),
+            let mut local: Vec<(String, u32)> = hints.as_ref().map(|hs| hs.iter().map(|h| match h {
+                HintContent::Simple(s) => (s.clone(), 0u32),
+                HintContent::Detailed { content, cost, .. } => (content.clone(), cost.unwrap_or(0)),
             }).collect()).unwrap_or_default();
             local.sort();
             if remote == local {

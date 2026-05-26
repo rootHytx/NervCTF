@@ -72,6 +72,55 @@ The monitor's SSH private key is bind-mounted at `/run/monitor_ssh_key` and copi
 
 ---
 
+## Schema Detection
+
+### `ChallengesSchema` struct
+
+`detect_challenges_schema()` is called inside every mutating challenge operation
+(`create_challenge`, `update_challenge`, `list_challenges_full`, `get_challenge_full`).
+It queries `information_schema.COLUMNS` to discover which optional columns exist in the
+running CTFd database. No result is cached — each call re-probes MariaDB.
+
+| Field | Meaning |
+|-------|---------|
+| `has_attribution` | `challenges.attribution` column present (added CTFd 3.7.0). Guarded in SELECT and UPDATE SET. |
+| `has_logic` | `challenges.logic` column present (added CTFd 3.7.x). Guarded in INSERT and UPDATE SET. |
+| `has_position` | `challenges.position` column present. Read in SELECT; value is discarded. |
+| `dynamic_in_challenges` | **All four** of `initial`, `minimum`, `decay`, `function` are present inline in `challenges` (newer CTFd). When false, scoring comes from the `dynamic_challenge` join table. |
+| `dynamic_partial` | One or more — but not all four — inline scoring columns are present. Indicates a partial schema migration. `dynamic_in_challenges` is `false` in this state, causing safe fallback to the join-table path. |
+| `has_next_id` | `challenges.next_id` column present (added CTFd 3.5.x). Guarded in SELECT (NULL placeholder), INSERT, and UPDATE SET. |
+| `has_dynamic_table` | `dynamic_challenge` join table exists. CTFd SQLAlchemy joined-table inheritance always requires a row here for `type='dynamic'` challenges. |
+| `dynamic_table_has_scoring` | `dynamic_challenge` has its own `initial/minimum/decay/function` columns (older CTFd). Newer CTFd uses a bare `(id)` stub. |
+
+#### NULL placeholder pattern
+
+Wherever a column is absent, `build_full_query()` substitutes a literal `NULL` at the same
+position in the SELECT column list. This keeps all column indices stable so `row_to_value()`
+can always dereference the same index (e.g., col 10 is always `next_id`, even when the
+column does not physically exist in the schema). `Option<i64>` and `Option<String>` fields
+deserialise `NULL` as `None`, which is correct behaviour.
+
+### `detect_ctfd_mode()`
+
+Runs **once at startup**, immediately after the MariaDB pool is created. Queries:
+
+```sql
+SELECT `value` FROM configs WHERE `key` = 'user_mode' LIMIT 1
+```
+
+| Result | `CtfdMode` | Logged as |
+|--------|------------|-----------|
+| `'1'` or `'true'` | `UserMode` | `WARN` — all player routes will return 403 |
+| `'0'`, `'false'`, `''`, or key absent | `TeamMode` | `INFO` — authentication will work |
+| Query error / table inaccessible | `Unknown` | `WARN` — operator should verify manually |
+
+When CTFd runs in user-mode, `validate_token()` returns `None` for every user because
+`users.team_id IS NULL`. All four player-facing instance routes (`/instance/request`,
+`/instance/info`, `/instance/renew`, `/instance/stop`) return HTTP 403. The startup warning
+lets the operator catch this misconfiguration before the CTF goes live.
+
+---
+
 ## Routes
 
 ### No auth
@@ -119,6 +168,7 @@ The monitor's SSH private key is bind-mounted at `/run/monitor_ssh_key` and copi
 | `GET` | `/api/v1/admin/attempts` | Flag attempt log (`?alerts_only=true` for sharing only) |
 | `GET` | `/api/v1/admin/solves` | Correct solves per team |
 | `GET` | `/api/v1/admin/config` | Runtime config dump (public_host, challenges_base_dir, runner mode, etc.) |
+| `GET` | `/api/v1/admin/probe` | CTFd compatibility probe result; `?refresh=true` forces a fresh probe |
 | `GET/POST` | `/api/v1/admin/tokens` | List or create operator tokens |
 | `DELETE` | `/api/v1/admin/tokens/:id` | Revoke an operator token |
 
@@ -309,6 +359,123 @@ CREATE TABLE sessions (
     expires_at  TEXT NOT NULL
 );
 ```
+
+---
+
+## Compatibility Probe
+
+### Overview
+
+At monitor startup — immediately after the CTFd mode check — the monitor runs a one-shot
+**compatibility probe** against the connected CTFd MariaDB. The probe fingerprints the
+database schema and computes a capability status for each NervCTF feature. The result is
+persisted to SQLite and exposed via a REST endpoint so operators can inspect it without
+restarting the monitor.
+
+### `ctfd_probe` SQLite table
+
+Singleton row (`id = 1`, enforced by `CHECK`). Overwritten on every probe run.
+
+```sql
+CREATE TABLE IF NOT EXISTS ctfd_probe (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    probed_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    ctfd_version_tag      TEXT,                          -- from configs.ctf_version, or NULL
+    ctfd_version_source   TEXT,                          -- "configs_table" | "inferred"
+    is_team_mode          INTEGER,                       -- 1=team, 0=user, NULL=unknown
+    challenges_cols       TEXT,                          -- comma-joined sorted column list
+    has_dynamic_table     INTEGER NOT NULL DEFAULT 0,
+    dynamic_cols          TEXT,                          -- comma-joined sorted column list
+    has_next_id           INTEGER NOT NULL DEFAULT 0,
+    has_attribution       INTEGER NOT NULL DEFAULT 0,
+    has_logic             INTEGER NOT NULL DEFAULT 0,
+    has_position          INTEGER NOT NULL DEFAULT 0,
+    dynamic_inline        INTEGER NOT NULL DEFAULT 0,    -- all four inline scoring cols present
+    dynamic_partial       INTEGER NOT NULL DEFAULT 0,    -- partial inline migration (broken)
+    has_instance_table    INTEGER NOT NULL DEFAULT 0,
+    cap_challenge_crud    TEXT NOT NULL DEFAULT 'unknown',
+    cap_dynamic_scoring   TEXT NOT NULL DEFAULT 'unknown',
+    cap_player_auth       TEXT NOT NULL DEFAULT 'unknown',
+    cap_instance_flags    TEXT NOT NULL DEFAULT 'unknown',
+    cap_redis_sync        TEXT NOT NULL DEFAULT 'degraded',
+    probe_notes           TEXT NOT NULL DEFAULT '[]'    -- JSON array of warning strings
+);
+```
+
+### `GET /api/v1/admin/probe`
+
+Auth: monitor token (same as all other `/api/v1/admin/` routes).
+
+Query parameters:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `refresh` | `false` | Set to `true` to force a fresh probe against MariaDB and overwrite the cache |
+
+Behaviour:
+- Without `?refresh=true`: returns the most recently cached result from SQLite. If no
+  cached result exists (first boot before the startup probe completes), runs a fresh probe.
+- With `?refresh=true`: always runs a fresh probe against MariaDB, persists the result, then
+  returns it. Returns HTTP 503 if the MariaDB connection is completely unavailable.
+
+Response envelope (matches all other CTFd-API-style endpoints):
+
+```json
+{
+  "success": true,
+  "data": {
+    "probed_at": "2026-05-26 14:32:11 UTC",
+    "ctfd_version_tag": "3.7.3",
+    "ctfd_version_source": "configs_table",
+    "is_team_mode": true,
+    "challenges_cols": ["attribution", "category", "connection_info", "decay", "description",
+                        "function", "id", "initial", "logic", "max_attempts", "minimum",
+                        "name", "next_id", "position", "requirements", "state", "type", "value"],
+    "has_dynamic_table": true,
+    "dynamic_cols": ["id"],
+    "has_next_id": true,
+    "has_attribution": true,
+    "has_logic": true,
+    "has_position": true,
+    "dynamic_inline": true,
+    "dynamic_partial": false,
+    "has_instance_table": true,
+    "cap_challenge_crud": "ok",
+    "cap_dynamic_scoring": "ok",
+    "cap_player_auth": "ok",
+    "cap_instance_flags": "ok",
+    "cap_redis_sync": "degraded",
+    "probe_notes": [
+      "Direct MariaDB writes bypass CTFd Redis cache — stale data may be served until CTFd restart or TTL expiry"
+    ]
+  }
+}
+```
+
+### Capability status values
+
+| Value | Meaning |
+|-------|---------|
+| `"ok"` | Feature works correctly with this CTFd instance |
+| `"degraded"` | Feature works with reduced functionality or with a known limitation |
+| `"broken"` | Feature will fail at runtime; operator action is required |
+| `"unknown"` | Probe has not yet run or the relevant tables were inaccessible |
+
+### Capability rules
+
+| Capability | `ok` condition | `degraded` condition | `broken` condition |
+|---|---|---|---|
+| `cap_challenge_crud` | `has_next_id` | `!has_next_id` (CTFd < 3.5.x) | — |
+| `cap_dynamic_scoring` | inline scoring or clean join-table path | — | `dynamic_partial` (broken migration) |
+| `cap_player_auth` | `is_team_mode == true` | mode unknown | `is_team_mode == false` (user-mode) |
+| `cap_instance_flags` | `has_instance_table` | plugin table absent | — |
+| `cap_redis_sync` | — | always (MariaDB writes bypass Redis) | — |
+
+### `probe_notes` field
+
+Machine-readable warning strings included when a capability is not `"ok"`. One entry is
+always present (`cap_redis_sync` note). The CLI (`nervctf probe` command, Wave 2B) reads
+this field to display warnings to the operator.
 
 ---
 

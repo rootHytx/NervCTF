@@ -262,15 +262,23 @@ class InstanceChallengeType(BaseChallenge):
         Challenges.query.filter_by(id=challenge.id).delete()
         db.session.commit()
 
+    # CTFd >= 3.4 returns ChallengeResponse with a .success attribute.
+    # CTFd <= 3.3 returns a (bool, str) tuple. We try .success first
+    # because namedtuples are subscriptable — catching TypeError alone
+    # does not distinguish between the two return types.
     @classmethod
     def attempt(cls, challenge, request):
         result = BaseChallenge.attempt(challenge, request)
-        # CTFd returns a tuple (bool, str) in older versions and a ChallengeResponse
-        # object in newer versions. Handle both without assuming attribute names.
         try:
-            is_correct = bool(result[0])
-        except TypeError:
-            is_correct = bool(getattr(result, "success", False))
+            # ChallengeResponse object (CTFd >= 3.4): prefer named attribute over index
+            # to be robust against namedtuple field-order changes.
+            is_correct = bool(result.success)
+        except AttributeError:
+            # Legacy (bool, str) tuple (CTFd <= 3.3): no .success attribute.
+            try:
+                is_correct = bool(result[0])
+            except (TypeError, IndexError):
+                is_correct = False
         json_data = request.get_json(silent=True) or {}
         submitted = (json_data.get("submission") or request.form.get("submission") or "").strip()
         team_id = _team_id()

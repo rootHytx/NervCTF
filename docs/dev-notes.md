@@ -85,6 +85,8 @@ axum 0.7 uses `http 1.x`; reqwest 0.11 uses `http 0.2.x`. They cannot share head
 
 ## CTFd Deployment Requirements (Operational)
 
+- **CTFd version pinning:** The setup playbook pins CTFd to 3.7.3 at initial install only. The upgrade playbook warns if the installed version differs from 3.7.3 but does not abort. After any CTFd upgrade, run `nervctf probe` to verify that all NervCTF capabilities are still functional.
+
 - **Challenge Visibility** must be "Public" (not "Private") before `nervctf deploy`.
   CTFd enforces visibility on `/api/v1/challenges` — Private mode redirects even valid API tokens to `/login`.
   Set via CTFd Admin → Config → Visibility.

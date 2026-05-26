@@ -24,6 +24,7 @@
 //!   GET  /api/v1/admin/instances         — list all active instances (monitor token)
 //!   GET  /api/v1/admin/attempts          — list flag attempts; ?alerts_only=true for sharing alerts (monitor token)
 //!   GET  /api/v1/admin/solves            — list correct solves (one per team+challenge) (monitor token)
+//!   GET  /api/v1/admin/probe             — CTFd compatibility probe result; ?refresh=true forces re-probe (monitor token)
 //!   POST /api/v1/plugin/attempt          — record flag submission attempt (monitor token)
 //!   POST /api/v1/instance/request        — provision instance (CTFd user token)
 //!   GET  /api/v1/instance/info           — get own instance (CTFd user token)
@@ -141,6 +142,67 @@ async fn main() -> Result<()> {
     }
 
     let ctfd_pool = ctfd_db::create_pool(&ctfd_db_url)?;
+
+    let ctfd_mode = ctfd_db::detect_ctfd_mode(&ctfd_pool).await;
+    match ctfd_mode {
+        ctfd_db::CtfdMode::UserMode => {
+            tracing::warn!(
+                "CTFd is running in USER-MODE. All player instance requests will return 403 \
+                 because token validation requires a non-null team_id. Switch CTFd to team-mode \
+                 or run 'nervctf probe' to see the full capability report."
+            );
+        }
+        ctfd_db::CtfdMode::Unknown => {
+            tracing::warn!(
+                "Could not determine CTFd mode (configs table inaccessible or key absent). \
+                 If CTFd is in user-mode, all player instance requests will fail with 403."
+            );
+        }
+        ctfd_db::CtfdMode::TeamMode => {
+            tracing::info!("CTFd mode: team (player authentication will work correctly)");
+        }
+    }
+
+    // Run the CTFd compatibility probe and persist the result to SQLite.
+    tracing::info!("Running CTFd compatibility probe...");
+    let probe_result = ctfd_db::run_probe(&ctfd_pool).await;
+    if let Err(e) = db::save_probe_result(&db, &probe_result) {
+        tracing::warn!("Failed to persist probe result: {}", e);
+    }
+    // Log a one-line summary; warn with per-note detail when any capability is broken.
+    let broken: Vec<&str> = [
+        ("challenge_crud", probe_result.cap_challenge_crud.as_str()),
+        ("dynamic_scoring", probe_result.cap_dynamic_scoring.as_str()),
+        ("player_auth",     probe_result.cap_player_auth.as_str()),
+        ("instance_flags",  probe_result.cap_instance_flags.as_str()),
+        ("redis_sync",      probe_result.cap_redis_sync.as_str()),
+    ]
+    .iter()
+    .filter(|(_, s)| *s == "broken")
+    .map(|(n, _)| *n)
+    .collect();
+
+    if broken.is_empty() {
+        tracing::info!(
+            "Probe: CTFd {} | mode:{} | CRUD={} dynamic={} auth={} flags={} redis={}",
+            probe_result.ctfd_version_tag.as_deref().unwrap_or("unknown"),
+            if probe_result.is_team_mode == Some(true) { "team" } else { "user/unknown" },
+            probe_result.cap_challenge_crud,
+            probe_result.cap_dynamic_scoring,
+            probe_result.cap_player_auth,
+            probe_result.cap_instance_flags,
+            probe_result.cap_redis_sync,
+        );
+    } else {
+        tracing::warn!(
+            "Probe: CTFd {} | BROKEN capabilities: {}",
+            probe_result.ctfd_version_tag.as_deref().unwrap_or("unknown"),
+            broken.join(", ")
+        );
+        for note in &probe_result.probe_notes {
+            tracing::warn!("  [probe] {}", note);
+        }
+    }
 
     let max_concurrent_provisions: usize = env::var("MAX_CONCURRENT_PROVISIONS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
@@ -304,6 +366,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/admin/attempts", get(admin_attempts_handler))
         .route("/api/v1/admin/solves", get(admin_solves_handler))
         .route("/api/v1/admin/config", get(admin_config_handler))
+        .route("/api/v1/admin/probe", get(admin_probe_handler))
         .route("/api/v1/admin/tokens", get(list_tokens_handler).post(create_token_handler))
         .route("/api/v1/admin/tokens/:id", delete(revoke_token_handler))
         // Plugin routes (monitor token + explicit team_id) — used by CTFd plugin
@@ -1789,6 +1852,76 @@ async fn admin_config_handler(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     Json(json!({ "ctfd_url": state.ctfd_url })).into_response()
+}
+
+/// `GET /api/v1/admin/probe[?refresh=true]`
+///
+/// Returns the CTFd compatibility probe result as a JSON object.
+/// Pass `?refresh=true` to force a fresh probe against MariaDB (default: return the
+/// cached row from SQLite).  If no cached result exists the probe always runs.
+///
+/// Response envelope: `{"success": true, "data": <ProbeResult>}`
+/// HTTP 503 if `refresh=true` and the MariaDB connection is unavailable.
+async fn admin_probe_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+
+    let force_refresh = params.get("refresh").map(|v| v == "true").unwrap_or(false);
+
+    // Try to load the cached result first (unless a fresh probe was requested).
+    if !force_refresh {
+        let db = Arc::clone(&state.db);
+        match tokio::task::spawn_blocking(move || db::load_probe_result(&db)).await {
+            Ok(Ok(Some(cached))) => {
+                return ctfd_ok(serde_json::to_value(&cached).unwrap_or_default());
+            }
+            Ok(Ok(None)) => {
+                // No cached result — fall through to run the probe.
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("admin_probe: failed to load cached result: {}", e);
+                // Fall through to run the probe.
+            }
+            Err(e) => {
+                tracing::warn!("admin_probe: spawn error loading cache: {}", e);
+                // Fall through to run the probe.
+            }
+        }
+    }
+
+    // Run a fresh probe against MariaDB.
+    let probe = ctfd_db::run_probe(&state.ctfd_pool).await;
+
+    // Persist the new result (best-effort — do not fail the request if SQLite is broken).
+    let db = Arc::clone(&state.db);
+    let probe_for_save = probe.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = db::save_probe_result(&db, &probe_for_save) {
+            tracing::warn!("admin_probe: failed to save probe result: {}", e);
+        }
+    }).await.ok();
+
+    // If the probe could not connect at all (all caps broken) return 503 when
+    // the caller explicitly requested a refresh — a cached non-broken result was
+    // unavailable and we could not produce a fresh one.
+    if force_refresh
+        && probe.cap_challenge_crud == "broken"
+        && probe.cap_player_auth == "broken"
+        && probe.cap_dynamic_scoring == "broken"
+        && probe.cap_instance_flags == "broken"
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"success": false, "errors": {"message": "Could not connect to CTFd MariaDB"}})),
+        ).into_response();
+    }
+
+    ctfd_ok(serde_json::to_value(&probe).unwrap_or_default())
 }
 
 async fn admin_instances_handler(

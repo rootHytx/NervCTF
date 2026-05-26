@@ -424,6 +424,37 @@ The CTFd plugin renders each entry as `<service>: <connection>` so players see c
 
 ---
 
+## Instance Provision Ordering
+
+When `flag_mode = "random"`, the monitor creates three persistent side-effects during
+provisioning: starting the container, inserting the SQLite `instances` row, and inserting
+the CTFd MariaDB `flags` row. The order matters for crash safety.
+
+**Order enforced by the code:**
+
+1. Start the container (docker/compose/lxc backend)
+2. `db::insert_instance(... ctfd_flag_id: None ...)` — write the SQLite row first, flag ID null
+3. `ctfd_db::create_flag(...)` — create the CTFd MariaDB flag row
+4. `db::set_ctfd_flag_id(...)` — update the SQLite row with the newly created flag ID
+
+**Why this order:**
+
+- A crash between steps 1 and 2 leaves no SQLite row and no MariaDB flag. Clean — nothing to tidy up.
+- A crash between steps 2 and 3 leaves a SQLite row with `ctfd_flag_id = NULL`. The expiry and
+  stop handlers already check `if let Some(flag_id) = ctfd_flag_id` before calling
+  `ctfd_db::delete_flag`, so the NULL row is safely cleaned up without attempting a phantom
+  MariaDB delete.
+- A crash between steps 3 and 4 leaves a CTFd MariaDB flag with no corresponding `ctfd_flag_id`
+  in SQLite. This is the remaining gap: the orphaned flag will not be deleted on instance expiry.
+  It is a narrower window than the previous ordering (where any crash after step 3 and before the
+  old combined step could orphan a flag) and can be addressed by a future reconciliation task that
+  cross-references MariaDB flags against active instances.
+
+**The cleanup path is already null-safe:** every call site in `main.rs` that reads `ctfd_flag_id`
+from SQLite wraps the delete in `if let Some(flag_id) = ctfd_flag_id { delete_flag(...) }`.
+
+---
+
 ## Player UI
 
 The monitor serves a minimal HTML page at `GET /instance/<challenge_name>`. Players enter

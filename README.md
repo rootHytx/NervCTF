@@ -13,14 +13,14 @@ NervCTF has two components that you deploy once and then leave running:
 ```
 Your machine                CTFd host (single-machine mode)
 ─────────────               ─────────────────────────────────────────────────
-                            ┌─ Docker Compose stack ──────────────────────┐
-nervctf CLI  ─── Token ──▶  │  remote-monitor:33133 ─── SQL ──▶ MariaDB   │
-                            │         │                 └──▶ uploads dir   │
-                            │   instance manager                           │
-                            │   (docker daemon, local)                     │
+                            ┌─ Docker Compose stack ────────────────────────┐
+nervctf CLI  ─── Token ──▶  │  remote-monitor:33133 ─── SQL ──▶ MariaDB     │
+                            │         │                 └──▶ uploads dir    │
+                            │   instance manager                            │
+                            │   (docker daemon, local)                      │
                             │                          CTFd (nginx+gunicorn)│
                             │                          nervctf plugin       │
-                            └─────────────────────────────────────────────┘
+                            └───────────────────────────────────────────────┘
 ```
 
 **`nervctf` (CLI)** — runs on your machine. Reads `challenge.yml` files, validates them, and syncs them to the remote monitor. Also runs `nervctf setup` to provision the server.

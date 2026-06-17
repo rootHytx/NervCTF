@@ -10,6 +10,12 @@ pub type Db = Arc<Mutex<Connection>>;
 pub fn open(path: &str) -> Result<Db> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    // synchronous=NORMAL: under WAL this fsyncs only at checkpoint, not on every
+    // commit, removing the per-write fsync that otherwise serialises all writes
+    // through the single connection at ~one-fsync-per-commit. Still crash-safe
+    // (no corruption; at most the last un-checkpointed commits are lost on power
+    // failure), which is acceptable for the monitor's instance/attempt state.
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
     init_schema(&conn)?;
     Ok(Arc::new(Mutex::new(conn)))

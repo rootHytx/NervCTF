@@ -1,0 +1,3 @@
+[submodule "ctfd-stress-tester"]
+	path = ctfd-stress-tester
+	url = https://github.com/rootHytx/ctfd-stress-tester

@@ -9,4 +9,4 @@ docs-extra
 dist/
 .claude
 CLAUDE.md
-thesis/
+#thesis/

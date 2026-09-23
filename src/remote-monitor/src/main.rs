@@ -659,6 +659,37 @@ struct RegisterRequest {
     config_json: String,
 }
 
+/// The CTFd plugin's `_register_with_monitor` only tracks `internal_port` (singular)
+/// and sends a config_json without `service_ports`/`internal_ports`, which would
+/// clobber a multi-service/multi-port config registered by the CLI. Preserve the
+/// existing multi-port fields when an incoming registration omits them.
+fn preserve_multi_port_config(db: &crate::db::Db, challenge_name: &str, incoming: &str) -> String {
+    let mut incoming_val: Value = match serde_json::from_str(incoming) {
+        Ok(v) => v,
+        Err(_) => return incoming.to_string(),
+    };
+    if incoming_val.get("service_ports").is_some() || incoming_val.get("internal_ports").is_some() {
+        return incoming.to_string();
+    }
+    let existing: Value = match db::get_config(db, challenge_name) {
+        Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_default(),
+        _ => Value::Null,
+    };
+    if let Value::Object(ref mut m) = incoming_val {
+        if !m.contains_key("service_ports") {
+            if let Some(sp) = existing.get("service_ports") {
+                m.insert("service_ports".to_string(), sp.clone());
+            }
+        }
+        if !m.contains_key("internal_ports") {
+            if let Some(ip) = existing.get("internal_ports") {
+                m.insert("internal_ports".to_string(), ip.clone());
+            }
+        }
+    }
+    serde_json::to_string(&incoming_val).unwrap_or_else(|_| incoming.to_string())
+}
+
 async fn instance_register_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -667,7 +698,8 @@ async fn instance_register_handler(
     if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
-    match db::upsert_config(&state.db, &body.challenge_name, body.ctfd_id, &body.backend, &body.config_json) {
+    let config_json = preserve_multi_port_config(&state.db, &body.challenge_name, &body.config_json);
+    match db::upsert_config(&state.db, &body.challenge_name, body.ctfd_id, &body.backend, &config_json) {
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }

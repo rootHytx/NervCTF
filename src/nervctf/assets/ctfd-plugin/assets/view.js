@@ -207,6 +207,10 @@ function renderConnectionInfo(connection, parent) {
       var code = document.createElement("code");
       code.textContent = "nc " + connection.host + " " + connection.port;
       parent.append(code);
+    } else if (connection.type === "udp") {
+      var code = document.createElement("code");
+      code.textContent = "nc -u " + connection.host + " " + connection.port;
+      parent.append(code);
     } else if (connection.type === "ssh") {
       var code = document.createElement("code");
       code.textContent =

@@ -1000,9 +1000,10 @@ fn build_connections(config: &Value, host: &str, port: u16, connection_type: &st
                 .and_then(|v| v.as_u64())
                 .map(|p| p as u16)
                 .unwrap_or(port);
+            let conn_type = if proto == "udp" { "udp" } else { connection_type };
             let mut entry = json!({
                 "label": svc,
-                "type": connection_type,
+                "type": conn_type,
                 "host": host,
                 "port": host_port
             });

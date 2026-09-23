@@ -97,12 +97,13 @@ pub async fn provision(
     let command = config["command"].as_str();
 
     // Parse internal_ports: accept array (new) or scalar (old config_json in DB).
-    let internal_ports: Vec<u32> = if let Some(arr) = config["internal_ports"].as_array() {
-        arr.iter().filter_map(|v| v.as_u64().map(|p| p as u32)).collect()
+    // Each element may be an integer (TCP) or a "port[/protocol]" string (UDP).
+    let internal_ports: Vec<(u32, String)> = if let Some(arr) = config["internal_ports"].as_array() {
+        arr.iter().filter_map(parse_port).collect()
     } else if let Some(p) = config["internal_port"].as_u64() {
-        vec![p as u32]
+        vec![(p as u32, "tcp".to_string())]
     } else {
-        vec![4000]
+        vec![(4000, "tcp".to_string())]
     };
     let port_count = internal_ports.len().max(1);
 
@@ -116,7 +117,7 @@ pub async fn provision(
 
             let used_ports = crate::db::get_used_ports(db)?;
             let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
-            let port_mappings: Vec<(u16, u32)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, &i)| (h, i)).collect();
+            let port_mappings: Vec<(u16, u32, String)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, (i, proto))| (h, *i, proto.clone())).collect();
             let host_port = host_ports[0];
             let cname = container_name_hint.clone().unwrap_or_else(|| container_name(challenge_name));
 
@@ -207,17 +208,17 @@ pub async fn provision(
                     let total_count = total_count.max(1);
                     let host_ports = docker::pick_free_ports(&used_ports, total_count)?;
                     let mut offset = 0usize;
-                    let mut map: std::collections::HashMap<String, Vec<(u16, u32)>> =
+                    let mut map: std::collections::HashMap<String, Vec<(u16, u32, String)>> =
                         std::collections::HashMap::new();
-                    let mut all_pairs: Vec<(u16, u32)> = Vec::new();
+                    let mut all_pairs: Vec<(u16, u32, String)> = Vec::new();
                     for (svc, ports_val) in svc_ports_obj {
-                        let iports: Vec<u32> = ports_val.as_array()
-                            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|p| p as u32)).collect())
+                        let iports: Vec<(u32, String)> = ports_val.as_array()
+                            .map(|a| a.iter().filter_map(parse_port).collect())
                             .unwrap_or_default();
                         let n = iports.len();
-                        let pairs: Vec<(u16, u32)> = host_ports[offset..offset + n].iter()
+                        let pairs: Vec<(u16, u32, String)> = host_ports[offset..offset + n].iter()
                             .zip(iports.iter())
-                            .map(|(&h, &i)| (h, i))
+                            .map(|(&h, (i, proto))| (h, *i, proto.clone()))
                             .collect();
                         all_pairs.extend_from_slice(&pairs);
                         map.insert(svc.clone(), pairs);
@@ -229,15 +230,15 @@ pub async fn provision(
                     } else {
                         map.keys().next().cloned().unwrap_or_else(|| "app".to_string())
                     };
-                    let hp = map.get(&primary).and_then(|v| v.first()).map(|(h, _)| *h)
+                    let hp = map.get(&primary).and_then(|v| v.first()).map(|(h, _, _)| *h)
                         .ok_or_else(|| anyhow!("service_ports: primary service '{}' has no ports", primary))?;
                     (map, primary, hp, all_pairs)
                 } else {
                     // Path B: single-service, existing behavior
                     let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
-                    let port_mappings: Vec<(u16, u32)> = host_ports.iter()
+                    let port_mappings: Vec<(u16, u32, String)> = host_ports.iter()
                         .zip(internal_ports.iter())
-                        .map(|(&h, &i)| (h, i))
+                        .map(|(&h, (i, proto))| (h, *i, proto.clone()))
                         .collect();
                     let hp = host_ports[0];
                     let svc_key = if compose_service.is_empty() { "app" } else { compose_service };
@@ -282,7 +283,7 @@ pub async fn provision(
             let cname = container_name(challenge_name);
             let used_ports = crate::db::get_used_ports(db)?;
             let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
-            let port_mappings: Vec<(u16, u32)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, &i)| (h, i)).collect();
+            let port_mappings: Vec<(u16, u32, String)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, (i, proto))| (h, *i, proto.clone())).collect();
             let host_port = host_ports[0];
             let flag = generate_flag(config);
             let cid = lxc::launch(lxc_image, &cname, &port_mappings, flag.as_deref()).await?;
@@ -311,7 +312,7 @@ pub async fn provision(
             let vm_name = container_name(challenge_name);
             let used_ports = crate::db::get_used_ports(db)?;
             let host_ports = docker::pick_free_ports(&used_ports, port_count)?;
-            let port_mappings: Vec<(u16, u32)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, &i)| (h, i)).collect();
+            let port_mappings: Vec<(u16, u32, String)> = host_ports.iter().zip(internal_ports.iter()).map(|(&h, (i, proto))| (h, *i, proto.clone())).collect();
             let host_port = host_ports[0];
             let (_, vm_id) = vagrant::up(vagrantfile, &vm_name, &port_mappings).await?;
             let extra_ports = build_extra_ports_json(&port_mappings);
@@ -327,15 +328,37 @@ pub async fn provision(
     }
 }
 
-/// Build a JSON object `{"<internal>": <host>}` for multi-port instances.
+/// Parse a config port value into `(port, protocol)`. Accepts an integer (TCP)
+/// or a string like `"5390"` (TCP) or `"5390/udp"` (UDP).
+pub fn parse_port(v: &Value) -> Option<(u32, String)> {
+    if let Some(n) = v.as_u64() {
+        return Some((n as u32, "tcp".to_string()));
+    }
+    if let Some(s) = v.as_str() {
+        let (num, proto) = match s.split_once('/') {
+            Some((n, p)) => (n.trim(), p.trim()),
+            None => (s.trim(), "tcp"),
+        };
+        if let Ok(port) = num.parse::<u32>() {
+            let protocol = if proto.eq_ignore_ascii_case("udp") { "udp" } else { "tcp" }.to_string();
+            return Some((port, protocol));
+        }
+    }
+    None
+}
+
+/// Build a JSON object `{"<internal>[/udp]": <host>}` for multi-port instances.
 /// Returns None for single-port instances (no extra info needed).
-fn build_extra_ports_json(port_mappings: &[(u16, u32)]) -> Option<String> {
+fn build_extra_ports_json(port_mappings: &[(u16, u32, String)]) -> Option<String> {
     if port_mappings.len() <= 1 {
         return None;
     }
     let map: serde_json::Map<String, Value> = port_mappings
         .iter()
-        .map(|(h, i)| (i.to_string(), serde_json::json!(*h as u64)))
+        .map(|(h, i, proto)| {
+            let key = if proto == "udp" { format!("{}/udp", i) } else { i.to_string() };
+            (key, serde_json::json!(*h as u64))
+        })
         .collect();
     serde_json::to_string(&map).ok()
 }

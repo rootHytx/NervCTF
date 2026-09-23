@@ -300,11 +300,11 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                     } else if has_service_ports {
                         issues.push(Issue::warn(name, "instance.internal_ports", "service_ports and internal_ports are mutually exclusive — internal_ports will be ignored"));
                     } else {
-                        for &p in &inst.internal_ports {
-                            if p == 0 {
+                        for p in &inst.internal_ports {
+                            if p.port == 0 {
                                 issues.push(Issue::error(name, "instance.internal_ports", "port 0 is not a valid port number"));
-                            } else if p > 65535 {
-                                issues.push(Issue::error(name, "instance.internal_ports", format!("port {} out of valid range (1–65535)", p)));
+                            } else if p.port > 65535 {
+                                issues.push(Issue::error(name, "instance.internal_ports", format!("port {} out of valid range (1–65535)", p.port)));
                             }
                         }
                     }
@@ -356,11 +356,11 @@ fn validate_one(c: &Challenge, all_names: &HashSet<&str>) -> Vec<Issue> {
                                             format!("service '{}': at least one port is required", svc),
                                         ));
                                     }
-                                    for &p in ports {
-                                        if p == 0 || p > 65535 {
+                                    for p in ports {
+                                        if p.port == 0 || p.port > 65535 {
                                             issues.push(Issue::error(
                                                 name, "instance.service_ports",
-                                                format!("service '{}': port {} out of valid range (1–65535)", svc, p),
+                                                format!("service '{}': port {} out of valid range (1–65535)", svc, p.port),
                                             ));
                                         }
                                     }

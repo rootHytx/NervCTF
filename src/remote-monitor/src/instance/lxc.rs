@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 pub async fn launch(
     lxc_image: &str,
     container_name: &str,
-    port_mappings: &[(u16, u32)],
+    port_mappings: &[(u16, u32, String)],
     flag: Option<&str>,
 ) -> Result<String> {
     let host_port = port_mappings.first().map(|p| p.0).unwrap_or(0);
@@ -41,7 +41,7 @@ pub async fn launch(
     }
 
     // Add proxy devices: one per port mapping (host_port → internal_port)
-    for (i, (hp, ip)) in port_mappings.iter().enumerate() {
+    for (i, (hp, ip, proto)) in port_mappings.iter().enumerate() {
         let device_name = format!("ctfport{}", i);
         let output = tokio::process::Command::new("lxc")
             .args([
@@ -49,8 +49,8 @@ pub async fn launch(
                 container_name,
                 &device_name,
                 "proxy",
-                &format!("listen=tcp:0.0.0.0:{}", hp),
-                &format!("connect=tcp:127.0.0.1:{}", ip),
+                &format!("listen={}:0.0.0.0:{}", proto, hp),
+                &format!("connect={}:127.0.0.1:{}", proto, ip),
             ])
             .output()
             .await

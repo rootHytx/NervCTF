@@ -150,7 +150,7 @@ pub async fn write_flag_file(flag_host_path: &str, flag_value: &str, runner_ssh:
 pub async fn run_container(
     image_tag: &str,
     container_name: &str,
-    port_mappings: &[(u16, u32)],
+    port_mappings: &[(u16, u32, String)],
     command: Option<&str>,
     env_vars: &[(String, String)],
     volumes: &[(String, String)],
@@ -163,9 +163,14 @@ pub async fn run_container(
         container_name.to_string(),
         "--restart=unless-stopped".to_string(),
     ];
-    for (hp, ip) in port_mappings {
+    for (hp, ip, proto) in port_mappings {
         docker_args.push("-p".to_string());
-        docker_args.push(format!("{}:{}", hp, ip));
+        let spec = if proto == "udp" {
+            format!("{}:{}/udp", hp, ip)
+        } else {
+            format!("{}:{}", hp, ip)
+        };
+        docker_args.push(spec);
     }
     for (k, v) in env_vars {
         docker_args.push("-e".to_string());

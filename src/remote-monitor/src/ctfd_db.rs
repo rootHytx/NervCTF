@@ -580,6 +580,19 @@ pub async fn delete_challenge(pool: &Pool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Extract the numeric port from a config value that is either an integer or a
+/// `"port[/protocol]"` string (e.g. `"5390/udp"` → 5390).
+fn port_number_from_value(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(s) = v.as_str() {
+        let num = s.split('/').next().unwrap_or(s).trim();
+        return num.parse::<i64>().ok();
+    }
+    None
+}
+
 async fn upsert_instance_row(conn: &mut mysql_async::Conn, id: i64, body: &Value) -> Result<()> {
     let backend = body["backend"].as_str().unwrap_or("docker").to_string();
     let image = body["image"].as_str().unwrap_or("").to_string();
@@ -588,7 +601,20 @@ async fn upsert_instance_row(conn: &mut mysql_async::Conn, id: i64, body: &Value
     let compose_service = body["compose_service"].as_str().unwrap_or("").to_string();
     let lxc_image = body["lxc_image"].as_str().unwrap_or("").to_string();
     let vagrantfile = body["vagrantfile"].as_str().unwrap_or("").to_string();
-    let internal_port = body["internal_port"].as_i64().unwrap_or(1337);
+    // The CLI serializes this as `internal_ports: [N]` (list) — the single
+    // `internal_port` column holds the first (primary) port. Accept both the
+    // legacy scalar form and the list form (whose elements may be integers or
+    // "port/protocol" strings) so the stored port matches the container's
+    // actual listening port instead of silently defaulting to 1337.
+    let internal_port = body["internal_port"]
+        .as_i64()
+        .or_else(|| {
+            body["internal_ports"]
+                .as_array()
+                .and_then(|a| a.first())
+                .and_then(port_number_from_value)
+        })
+        .unwrap_or(1337);
     let connection = body["connection"].as_str().unwrap_or("nc").to_string();
     let timeout_minutes = body["timeout_minutes"].as_i64().unwrap_or(45);
     let max_renewals = body["max_renewals"].as_i64().unwrap_or(3);
@@ -1116,6 +1142,72 @@ pub async fn sync_solves(pool: &Pool, db: &Db) -> Result<()> {
     }
     tracing::debug!("ctfd_db: sync_solves: replaced with {} rows", n);
     Ok(())
+}
+
+/// Recompute decayed point values for instance challenges that carry dynamic
+/// scoring config (initial/minimum/decay), writing the result back to CTFd's
+/// `challenges.value`. Mirrors CTFd's `dynamic_challenges/decay.py` formulas so
+/// instance challenges score identically to `dynamic` ones.
+pub async fn recompute_instance_decay(pool: &Pool) -> Result<()> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: get_conn: {}", e))?;
+
+    if !has_instance_table(&mut conn).await {
+        return Ok(());
+    }
+
+    let scored: Vec<(i64, i64, i64, i64, String)> = conn.exec(
+        "SELECT i.id, i.initial_value, i.minimum_value, i.decay_value, i.decay_function \
+         FROM nervctf_instance_challenge i \
+         WHERE i.initial_value IS NOT NULL AND i.minimum_value IS NOT NULL \
+           AND i.decay_value IS NOT NULL",
+        (),
+    ).await.map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: query: {}", e))?;
+
+    for (challenge_id, initial, minimum, decay, function) in scored {
+        let solve_count: i64 = conn.exec_first::<i64, _, _>(
+            "SELECT COUNT(*) FROM solves s \
+             JOIN teams t ON t.id = s.team_id \
+             WHERE s.challenge_id = ? AND t.hidden = 0 AND t.banned = 0",
+            (challenge_id,),
+        ).await
+            .map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: count: {}", e))?
+            .unwrap_or(0);
+
+        let value = decay_value(initial, minimum, decay, &function, solve_count);
+        conn.exec_drop(
+            "UPDATE challenges SET value = ? WHERE id = ?",
+            (value, challenge_id),
+        ).await.map_err(|e| anyhow!("ctfd_db: recompute_instance_decay: update: {}", e))?;
+
+        tracing::debug!(
+            "ctfd_db: decay challenge {} -> value {} ({} solves, {})",
+            challenge_id, value, solve_count, function
+        );
+    }
+    Ok(())
+}
+
+/// CTFd `dynamic_challenges/decay.py` formulas, mirrored.
+fn decay_value(initial: i64, minimum: i64, decay: i64, function: &str, solve_count: i64) -> i64 {
+    // First solver keeps max points (subtract 1 like CTFd).
+    let sc = if solve_count != 0 { solve_count - 1 } else { 0 } as f64;
+    let d = if decay == 0 { 1 } else { decay } as f64;
+    let initial_f = initial as f64;
+    let minimum_f = minimum as f64;
+
+    let value: f64 = if function == "linear" {
+        initial_f - (d * sc)
+    } else {
+        // CTFd's "logarithmic" (a quadratic in solve count).
+        ((minimum_f - initial_f) / (d * d)) * (sc * sc) + initial_f
+    };
+
+    let mut v = value.ceil() as i64;
+    if v < minimum {
+        v = minimum;
+    }
+    v
 }
 
 /// Sync teams and users from CTFd's MariaDB into the local name cache.

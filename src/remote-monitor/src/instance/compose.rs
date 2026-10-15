@@ -61,7 +61,7 @@ pub async fn compose_cmd() -> tokio::process::Command {
 pub async fn up(
     compose_file: &Path,
     project_name: &str,
-    service_mappings: &std::collections::HashMap<String, Vec<(u16, u32)>>,
+    service_mappings: &std::collections::HashMap<String, Vec<(u16, u32, String)>>,
     primary_service: &str,
     flag: Option<&str>,
     flag_delivery: &str,
@@ -73,7 +73,7 @@ pub async fn up(
     let host_port = service_mappings
         .get(svc_name)
         .and_then(|v| v.first())
-        .map(|(h, _)| *h)
+        .map(|(h, _, _)| *h)
         .ok_or_else(|| anyhow::anyhow!("service_mappings has no entry for primary service '{}'", svc_name))?;
 
     let compose_dir = compose_file.parent().unwrap_or(Path::new("."));
@@ -161,8 +161,13 @@ pub async fn up(
             if let Some(mappings) = service_mappings.get(svc) {
                 if !mappings.is_empty() {
                     override_content.push_str("    ports:\n");
-                    for (hp, ip) in mappings {
-                        override_content.push_str(&format!("      - \"{}:{}\"\n", hp, ip));
+                    for (hp, ip, proto) in mappings {
+                        let spec = if proto == "udp" {
+                            format!("{}:{}/udp", hp, ip)
+                        } else {
+                            format!("{}:{}", hp, ip)
+                        };
+                        override_content.push_str(&format!("      - \"{}\"\n", spec));
                     }
                 }
             }

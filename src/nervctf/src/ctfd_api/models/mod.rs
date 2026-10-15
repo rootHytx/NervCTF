@@ -1,21 +1,92 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Accept either a single port integer or a list of port integers.
+/// A port with an optional protocol.
+///
+/// Serializes as a bare integer for TCP (`5390`) and as a `"port/udp"` string
+/// for UDP. Deserializes from an integer, a bare port string, or a
+/// `"port/protocol"` string.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PortSpec {
+    pub port: u32,
+    /// "tcp" or "udp"
+    pub protocol: String,
+}
+
+impl PortSpec {
+    pub fn tcp(port: u32) -> Self {
+        PortSpec { port, protocol: "tcp".to_string() }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (num, proto) = match s.split_once('/') {
+            Some((n, p)) => (n.trim(), p.trim()),
+            None => (s.trim(), "tcp"),
+        };
+        let port: u32 = num.parse().map_err(|_| format!("invalid port number: {s:?}"))?;
+        let protocol = if proto.eq_ignore_ascii_case("udp") { "udp" } else { "tcp" }.to_string();
+        Ok(PortSpec { port, protocol })
+    }
+
+    pub fn is_udp(&self) -> bool { self.protocol == "udp" }
+}
+
+impl std::fmt::Display for PortSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_udp() {
+            write!(f, "{}/udp", self.port)
+        } else {
+            write!(f, "{}", self.port)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PortSpec {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{self, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = PortSpec;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a port number or a \"port[/protocol]\" string")
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<PortSpec, E> { Ok(PortSpec::tcp(v as u32)) }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<PortSpec, E> { Ok(PortSpec::tcp(v as u32)) }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<PortSpec, E> { PortSpec::parse(v).map_err(E::custom) }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<PortSpec, E> { PortSpec::parse(&v).map_err(E::custom) }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl Serialize for PortSpec {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.is_udp() {
+            s.serialize_str(&format!("{}/udp", self.port))
+        } else {
+            s.serialize_u32(self.port)
+        }
+    }
+}
+
+/// Accept either a single port or a list of ports.
 /// Allows challenge.yml files to use `internal_port: 1337` (old single-port form)
 /// or `internal_ports: [1337, 8080]` (new multi-port form) interchangeably.
-fn deserialize_ports<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u32>, D::Error> {
+/// Each port may be a bare number/string (TCP) or a `"port/udp"` string.
+fn deserialize_ports<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<PortSpec>, D::Error> {
     use serde::de::{self, Visitor};
     struct PortsVisitor;
     impl<'de> Visitor<'de> for PortsVisitor {
-        type Value = Vec<u32>;
+        type Value = Vec<PortSpec>;
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a port number or a list of port numbers")
+            f.write_str("a port number or a list of ports (optionally with a /udp suffix)")
         }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Vec<u32>, E> { Ok(vec![v as u32]) }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Vec<u32>, E> { Ok(vec![v as u32]) }
-        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u32>, A::Error> {
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Vec<PortSpec>, E> { Ok(vec![PortSpec::tcp(v as u32)]) }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Vec<PortSpec>, E> { Ok(vec![PortSpec::tcp(v as u32)]) }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Vec<PortSpec>, E> { PortSpec::parse(v).map(|p| vec![p]).map_err(E::custom) }
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Vec<PortSpec>, E> { PortSpec::parse(&v).map(|p| vec![p]).map_err(E::custom) }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<PortSpec>, A::Error> {
             let mut ports = Vec::new();
-            while let Some(p) = seq.next_element::<u32>()? { ports.push(p); }
+            while let Some(p) = seq.next_element::<PortSpec>()? { ports.push(p); }
             Ok(ports)
         }
     }
@@ -166,7 +237,7 @@ pub struct InstanceConfig {
     /// and `internal_ports: [1337, 8080]` (list, new form). First port is the primary one
     /// shown in the player connection string; all are randomly allocated at provision time.
     #[serde(alias = "internal_port", deserialize_with = "deserialize_ports", default)]
-    pub internal_ports: Vec<u32>,
+    pub internal_ports: Vec<PortSpec>,
     pub connection: String,
     pub timeout_minutes: Option<u32>,
     pub max_renewals: Option<u32>,
@@ -191,7 +262,7 @@ pub struct InstanceConfig {
     /// When set, replaces `compose_service` + `internal_ports` for port allocation.
     /// Mutually exclusive with `internal_ports` (validator warns if both set).
     #[serde(default)]
-    pub service_ports: Option<std::collections::HashMap<String, Vec<u32>>>,
+    pub service_ports: Option<std::collections::HashMap<String, Vec<PortSpec>>>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]

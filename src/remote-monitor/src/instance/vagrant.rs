@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 pub async fn up(
     _vagrantfile_dir: &str,
     _vm_name: &str,
-    _port_mappings: &[(u16, u32)],
+    _port_mappings: &[(u16, u32, String)],
 ) -> Result<(u16, String)> {
     Err(anyhow!(
         "Vagrant backend is not yet configured on this server. \

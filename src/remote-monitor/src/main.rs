@@ -237,6 +237,9 @@ async fn main() -> Result<()> {
             if let Err(e) = ctfd_db::sync_solves(&sync_pool, &sync_db).await {
                 warn!("ctfd sync solves: {}", e);
             }
+            if let Err(e) = ctfd_db::recompute_instance_decay(&sync_pool).await {
+                warn!("ctfd decay recompute: {}", e);
+            }
             if let Err(e) = ctfd_db::sync_users_and_teams(&sync_pool, &sync_db).await {
                 warn!("ctfd sync users/teams: {}", e);
             }
@@ -656,6 +659,37 @@ struct RegisterRequest {
     config_json: String,
 }
 
+/// The CTFd plugin's `_register_with_monitor` only tracks `internal_port` (singular)
+/// and sends a config_json without `service_ports`/`internal_ports`, which would
+/// clobber a multi-service/multi-port config registered by the CLI. Preserve the
+/// existing multi-port fields when an incoming registration omits them.
+fn preserve_multi_port_config(db: &crate::db::Db, challenge_name: &str, incoming: &str) -> String {
+    let mut incoming_val: Value = match serde_json::from_str(incoming) {
+        Ok(v) => v,
+        Err(_) => return incoming.to_string(),
+    };
+    if incoming_val.get("service_ports").is_some() || incoming_val.get("internal_ports").is_some() {
+        return incoming.to_string();
+    }
+    let existing: Value = match db::get_config(db, challenge_name) {
+        Ok(Some(j)) => serde_json::from_str(&j).unwrap_or_default(),
+        _ => Value::Null,
+    };
+    if let Value::Object(ref mut m) = incoming_val {
+        if !m.contains_key("service_ports") {
+            if let Some(sp) = existing.get("service_ports") {
+                m.insert("service_ports".to_string(), sp.clone());
+            }
+        }
+        if !m.contains_key("internal_ports") {
+            if let Some(ip) = existing.get("internal_ports") {
+                m.insert("internal_ports".to_string(), ip.clone());
+            }
+        }
+    }
+    serde_json::to_string(&incoming_val).unwrap_or_else(|_| incoming.to_string())
+}
+
 async fn instance_register_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -664,7 +698,8 @@ async fn instance_register_handler(
     if !check_any_auth(&headers, &state.db).await {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
-    match db::upsert_config(&state.db, &body.challenge_name, body.ctfd_id, &body.backend, &body.config_json) {
+    let config_json = preserve_multi_port_config(&state.db, &body.challenge_name, &body.config_json);
+    match db::upsert_config(&state.db, &body.challenge_name, body.ctfd_id, &body.backend, &config_json) {
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     }
@@ -988,20 +1023,26 @@ fn build_connections(config: &Value, host: &str, port: u16, connection_type: &st
         .unwrap_or_default();
     let mut connections: Vec<Value> = Vec::new();
     for (svc, ports_val) in svc_ports_obj {
-        let iports: Vec<u32> = ports_val.as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|p| p as u32)).collect())
+        let iports: Vec<(u32, String)> = ports_val.as_array()
+            .map(|a| a.iter().filter_map(instance::parse_port).collect())
             .unwrap_or_default();
-        for ip in &iports {
-            let host_port = extra.get(&ip.to_string())
+        for (ip, proto) in &iports {
+            let key = if proto == "udp" { format!("{}/udp", ip) } else { ip.to_string() };
+            let host_port = extra.get(&key)
                 .and_then(|v| v.as_u64())
                 .map(|p| p as u16)
                 .unwrap_or(port);
-            connections.push(json!({
+            let conn_type = if proto == "udp" { "udp" } else { connection_type };
+            let mut entry = json!({
                 "label": svc,
-                "type": connection_type,
+                "type": conn_type,
                 "host": host,
                 "port": host_port
-            }));
+            });
+            if proto == "udp" {
+                entry["protocol"] = json!("udp");
+            }
+            connections.push(entry);
         }
     }
     if connections.is_empty() { None } else { Some(json!(connections)) }
@@ -1525,8 +1566,9 @@ struct PluginSolveBody {
 /// Deletes the DB record immediately and returns 200, then tears down the
 /// container and CTFd flag in the background so the plugin doesn't time out
 /// waiting for `docker compose down`.
-/// Also records the correct solve in flag_attempts — this is the authoritative
-/// source since solve() is only called by CTFd for genuine correct submissions.
+/// NOTE: the correct solve is recorded by `plugin_attempt_handler` (which fires
+/// for every submission and performs flag-owner resolution). Recording it here
+/// too caused every correct solve to be double-logged in flag_attempts.
 async fn plugin_solve_handler(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1539,15 +1581,6 @@ async fn plugin_solve_handler(
         Ok(Some((container_id, ctfd_flag_id))) => {
             if let Some(flag_id) = ctfd_flag_id {
                 ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
-            }
-            // Record the correct solve. This happens after mark_instance_solved() purges
-            // incorrect attempts, so the correct row is always persisted.
-            if let (Some(flag), Some(uid)) = (&body.submitted_flag, body.user_id) {
-                if !flag.is_empty() {
-                    let _ = db::insert_flag_attempt(
-                        &state.db, &body.challenge_name, body.team_id, uid, flag, true, false, None,
-                    );
-                }
             }
             // Container teardown in background — compose down is slow.
             if let Some(cid) = container_id {
@@ -1617,12 +1650,14 @@ async fn plugin_attempt_handler(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
 
-    // Check for flag sharing: submitted flag belongs to a different team's instance
-    let owner = db::find_flag_owner(&state.db, &body.challenge_name, &body.submitted_flag, body.team_id);
-    let (is_flag_sharing, owner_team_id) = match owner {
-        Ok(Some(owner_id)) => (true, Some(owner_id)),
-        _ => (false, None),
+    // Resolve the flag's owning team (including the submitter themselves for a
+    // normal correct solve). Flag sharing = the owner is a different team.
+    let owner = db::find_flag_owner_any(&state.db, &body.challenge_name, &body.submitted_flag);
+    let owner_team_id = match owner {
+        Ok(Some(id)) => Some(id),
+        _ => None,
     };
+    let is_flag_sharing = owner_team_id.map_or(false, |id| id != body.team_id);
 
     if is_flag_sharing {
         warn!(

@@ -851,16 +851,15 @@ pub fn list_correct_solves(db: &Db) -> Result<Vec<Value>> {
     Ok(result)
 }
 
-/// Finds if a flag value belongs to a different team's instance (flag sharing detection).
-/// Returns Some(owner_team_id) if sharing is detected, None otherwise.
-/// Returns Some(owner_team_id) if the submitted flag was generated for a different team,
-/// even if that team's instance has already been stopped or expired.
-/// Queries `team_flags` (permanent) rather than `instances` (ephemeral).
-pub fn find_flag_owner(db: &Db, challenge_name: &str, submitted_flag: &str, submitting_team_id: i64) -> Result<Option<i64>> {
+/// Resolve the owning team for a flag regardless of the submitting team.
+/// Returns Some(owner_team_id) if the flag was generated for any team (including
+/// the submitter), None if the flag is not registered in `team_flags` (e.g. a
+/// wrong guess or a non-instance/static flag).
+pub fn find_flag_owner_any(db: &Db, challenge_name: &str, flag: &str) -> Result<Option<i64>> {
     let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
     let result = conn.query_row(
-        "SELECT team_id FROM team_flags WHERE challenge_name = ?1 AND flag = ?2 AND team_id != ?3",
-        params![challenge_name, submitted_flag, submitting_team_id],
+        "SELECT team_id FROM team_flags WHERE challenge_name = ?1 AND flag = ?2 LIMIT 1",
+        params![challenge_name, flag],
         |row| row.get::<_, i64>(0),
     );
     match result {

@@ -202,6 +202,55 @@ fn prompt_with_default(prompt: &str, default: Option<&str>) -> Result<String> {
     Ok(builder.interact_text()?)
 }
 
+/// Expand a leading `~/` to `$HOME`. `ssh -i` and Ansible's file lookups do not
+/// expand `~`, so a config value copied from the example (`~/.ssh/id_rsa`) must
+/// be made absolute before it is stored or used.
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest).to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
+
+/// `.nervctf.yml` stores the *private* SSH key: `nervctf deploy` passes it to
+/// `ssh`/`rsync` as `-i`. Older setups may have written the matching `*.pub`
+/// path instead, so normalise those back to the private key.
+fn private_key_path(path: &str) -> String {
+    path.strip_suffix(".pub").unwrap_or(path).to_string()
+}
+
+/// Contents of the public key matching `key`, where `key` is either a `*.pub`
+/// file or a private key that has a sibling `*.pub` (or can be derived from with
+/// `ssh-keygen -y`). Used by the setup playbook to authorise the key remotely.
+fn public_key_contents(key: &str) -> Result<String> {
+    let path = std::path::Path::new(key);
+    if path.extension().map(|e| e == "pub").unwrap_or(false) {
+        return fs::read_to_string(path)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| anyhow!("cannot read SSH public key '{}': {}", key, e));
+    }
+    let sibling = PathBuf::from(format!("{}.pub", key));
+    if sibling.exists() {
+        return fs::read_to_string(&sibling)
+            .map(|s| s.trim().to_string())
+            .map_err(|e| anyhow!("cannot read SSH public key '{}': {}", sibling.display(), e));
+    }
+    let out = Command::new("ssh-keygen")
+        .args(["-y", "-f", key])
+        .output()
+        .map_err(|e| anyhow!("failed to run `ssh-keygen -y -f {}`: {}", key, e))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "`ssh-keygen -y -f {}` failed: {}",
+            key,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn run_setup() -> Result<()> {
     println!("==============================================");
     println!(" NervCTF Setup: Automated CTFd Environment");
@@ -306,13 +355,18 @@ pub fn run_setup() -> Result<()> {
     };
 
     // ── SSH_KEY_PATH ──────────────────────────────────────────────────────────
-    let ssh_key_path = if let Some(ref key) = config.ssh_key_path {
-        println!("Using existing SSH public key: {}", key);
+    // `ssh_key_path` in .nervctf.yml is the PRIVATE key: `nervctf deploy` passes
+    // it to ssh/rsync as `-i`. The setup playbook instead needs the matching
+    // PUBLIC key to authorise it on the remote host, so resolve and pass both
+    // separately (passing the private key to `authorized_key` would insert a
+    // key that can never authenticate).
+    let selected_key_raw = if let Some(ref key) = config.ssh_key_path {
+        println!("Using existing SSH key: {}", key);
         key.clone()
     } else {
         let pubkeys = list_ssh_pubkeys();
         let key_path = if pubkeys.is_empty() {
-            println!("No SSH public keys found in ~/.ssh.");
+            println!("No SSH keys found in ~/.ssh.");
             let generate = Confirm::new()
                 .with_prompt("Generate a new SSH key?")
                 .default(true)
@@ -327,7 +381,7 @@ pub fn run_setup() -> Result<()> {
                 pubkeys.iter().map(|p| p.display().to_string()).collect();
             options.push("Generate new key".to_string());
             let selection = Select::new()
-                .with_prompt("Select SSH public key")
+                .with_prompt("Select SSH key")
                 .items(&options)
                 .default(0)
                 .interact()?;
@@ -339,6 +393,10 @@ pub fn run_setup() -> Result<()> {
         };
         key_path.to_string_lossy().to_string()
     };
+    // Neither `ssh -i` nor Ansible's file lookups expand `~`, so make it absolute.
+    let selected_key = expand_tilde(&selected_key_raw);
+    let ssh_key_path = private_key_path(&selected_key);
+    let ssh_pubkey = public_key_contents(&selected_key)?;
 
     // ── Save config before deployment ─────────────────────────────────────────
     config.challenges_path = Some(base_dir.clone());
@@ -378,7 +436,7 @@ pub fn run_setup() -> Result<()> {
 
     // ── Build ansible extra-vars ───────────────────────────────────────────────
     let mut evars: Vec<String> = vec![
-        format!("ssh_key={}", ssh_key_path),
+        format!("ssh_pubkey={}", ssh_pubkey),
         format!("ctfd_path={}", ctfd_path),
         format!("monitor_token={}", monitor_token),
         format!("monitor_port={}", monitor_port),

@@ -93,11 +93,13 @@
         create_home: yes
 
     # ── SSH key ────────────────────────────────────────────────────────────────
+    # `ssh_pubkey` (public key contents) is resolved by the CLI from the private
+    # `ssh_key_path` used by `nervctf deploy`.
     - name: Authorize SSH public key for docker user
       authorized_key:
         user: "{{ docker_user }}"
         state: present
-        key: "{{ lookup('file', ssh_key) }}"
+        key: "{{ ssh_pubkey }}"
 
     # ── CTFd clone ─────────────────────────────────────────────────────────────
     - name: Check if CTFd is already cloned

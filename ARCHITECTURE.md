@@ -1,177 +1,145 @@
-# NervCTF — Architecture & Implementation Reference
+# Architecture
 
-> Machine-readable context document for AI assistants. Covers the full system as of 2026-03-20.
-> Always prefer reading actual source files over trusting stale details here.
-> Workspace root: `/home/hytx/Desktop/CYBERSEC/tese/NervCTF`
+NervCTF runs CTF competitions on CTFd. It has three parts:
 
----
+- **`nervctf`** (CLI) reads `challenge.yml` files from a local directory tree, deploys and syncs them to CTFd through the remote monitor, and registers per-challenge instance configs.
+- **`remote-monitor`** (HTTP server) runs on the CTFd host. It writes CTFd data through MariaDB directly, manages ephemeral challenge containers and VMs per team, and serves an admin dashboard.
+- **`nervctf_instance`** (CTFd plugin, Python) is installed inside CTFd. It adds the `instance` challenge type and forwards player lifecycle requests to the monitor.
 
-## 1. PROJECT PURPOSE
-
-NervCTF is a two-binary Rust + Python toolchain for managing CTF competitions on top of CTFd:
-
-1. **`nervctf`** (CLI) — reads `challenge.yml` files from a local directory tree, deploys/syncs
-   them to a CTFd instance via the remote-monitor, and registers per-challenge instance configs.
-2. **`remote-monitor`** (HTTP server) — runs on the CTFd host, writes all CTFd data directly
-   via MariaDB SQL, manages ephemeral challenge containers/VMs per team.
-3. **CTFd plugin** (`nervctf_instance`, Python) — installed inside CTFd; adds the `instance`
-   challenge type and proxies player lifecycle requests to the remote-monitor.
+This document is the system reference. Where it disagrees with the source, trust the source.
 
 ---
 
-## 2. REPOSITORY LAYOUT
+## Repository layout
 
 ```
 NervCTF/
 ├── Cargo.toml                   # workspace manifest; members: src/nervctf, src/remote-monitor
 ├── Cargo.lock
-├── flake.nix                    # sole dev environment (provides rustc, cargo, ansible, openssl, …)
-├── flake.lock
+├── flake.nix                    # the only dev environment (rustc, cargo, ansible, openssl, …)
+├── RELEASE.md, bump-version.sh  # release tooling
 ├── ARCHITECTURE.md              # this file
-├── .nervctf.yml                 # local config (gitignored in practice)
 │
 ├── src/
 │   ├── nervctf/                 # CLI crate
-│   │   ├── Cargo.toml
 │   │   ├── src/
-│   │   │   ├── lib.rs           # re-exports: challenge_manager, ctfd_api, directory_scanner, fix, setup, validator, utils
-│   │   │   ├── main.rs          # clap CLI entry point + deploy/sync logic
-│   │   │   ├── utils.rs         # Config struct + load_config / save_config / find_config_path
-│   │   │   ├── setup.rs         # `nervctf setup` — interactive Ansible deployment
-│   │   │   ├── fix.rs           # `nervctf fix` — YAML issue fixer + container→instance migrator
-│   │   │   ├── validator.rs     # `nervctf validate` — schema/lint warnings for challenge.yml
-│   │   │   ├── directory_scanner.rs  # recursive challenge.yml finder (max_depth=5, no symlinks)
+│   │   │   ├── lib.rs           # re-exports the modules below
+│   │   │   ├── main.rs          # clap CLI, deploy/sync orchestration, probe
+│   │   │   ├── utils.rs         # Config struct and load/ save/ find_config_path
+│   │   │   ├── setup.rs         # `nervctf setup` and `setup --upgrade`
+│   │   │   ├── fix.rs           # `nervctf fix`
+│   │   │   ├── validator.rs     # `nervctf validate`
+│   │   │   ├── directory_scanner.rs  # recursive challenge.yml finder (depth 5, no symlinks)
 │   │   │   ├── challenge_manager/
 │   │   │   │   ├── mod.rs       # ChallengeManager: CRUD wrappers over CtfdClient
-│   │   │   │   └── sync.rs      # ChallengeSynchronizer + needs_update() + SyncAction enum
+│   │   │   │   └── sync.rs      # ChallengeSynchronizer, needs_update(), SyncAction
 │   │   │   └── ctfd_api/
-│   │   │       ├── mod.rs       # pub use CtfdClient, RequirementsQueue, models
-│   │   │       ├── client.rs    # CtfdClient (async reqwest), execute(), pagination helpers
-│   │   │       └── models/
-│   │   │           └── mod.rs   # all data types (Challenge, FlagContent, HintContent, …)
-│   │   │       endpoints/
-│   │   │           ├── challenges.rs
-│   │   │           ├── flags.rs
-│   │   │           ├── hints.rs
-│   │   │           ├── tags.rs
-│   │   │           └── files.rs
+│   │   │       ├── client.rs    # CtfdClient (async reqwest), execute(), pagination
+│   │   │       ├── models/mod.rs # data types (Challenge, FlagContent, HintContent, …)
+│   │   │       └── endpoints/   # challenges.rs, flags.rs, hints.rs, tags.rs, files.rs
 │   │   └── assets/
-│   │       ├── nervctf_playbook.yml     # Ansible playbook for full server setup
-│   │       ├── install_docker_on_remote.sh  # referenced by playbook (not embed in binary)
-│   │       └── ctfd-plugin/             # Python CTFd plugin (deployed via Ansible rsync)
-│   │           ├── __init__.py
-│   │           ├── models/
-│   │           │   ├── __init__.py
-│   │           │   └── challenge.py     # InstanceChallenge SQLAlchemy model
-│   │           └── assets/
-│   │               ├── view.{html,js}
-│   │               ├── create.{html,js}
-│   │               └── update.{html,js}
+│   │       ├── nervctf_playbook.yml           # full server setup
+│   │       ├── nervctf_upgrade_playbook.yml   # plugin/binary/image upgrade
+│   │       ├── nervctf_preflight_playbook.yml # pre-provision checks
+│   │       └── ctfd-plugin/                    # Python plugin, embedded into the binary
 │   │
 │   └── remote-monitor/          # HTTP server crate
-│       ├── Cargo.toml
-│       ├── assets/
-│       │   └── admin.html       # admin dashboard (embedded via include_str! at compile time)
+│       ├── assets/admin.html    # admin dashboard, embedded with include_str!
 │       └── src/
-│           ├── main.rs          # axum 0.7 server, all routes, AppState, background expiry
+│           ├── main.rs          # axum 0.7 server, routes, AppState, background tasks
 │           ├── db.rs            # SQLite via rusqlite; Db = Arc<Mutex<Connection>>
+│           ├── ctfd_db.rs       # MariaDB SQL for all CTFd data
 │           └── instance/
 │               ├── mod.rs       # provision(), cleanup_container(), generate_flag(), sanitize_name()
-│               ├── docker.rs    # pick_free_port(), run_container(), remove_container(), build_image()
-│               ├── compose.rs   # up(), down(), compose_cmd() — real implementation
-│               ├── lxc.rs       # launch(), delete() — real implementation
-│               └── vagrant.rs   # up() — stub (returns error)
+│               ├── docker.rs    # pick_free_ports(), run_container(), remove_container(), build_image()
+│               ├── compose.rs   # up(), down(), compose_cmd()
+│               ├── lxc.rs       # launch(), delete()
+│               └── vagrant.rs   # up() — stub
 │
-└── templates/                   # challenge.yml templates for authors
-    ├── standard/
-    ├── docker/
-    ├── compose/
-    ├── lxc/
-    └── vagrant/
+└── templates/                   # challenge.yml templates (standard, docker, compose, lxc, vagrant)
 ```
 
 ---
 
-## 3. DEV ENVIRONMENT
+## Dev environment
 
-**Always use Nix flake for any build/run command:**
+Run every build and test command through the Nix flake:
+
 ```
 nix develop .# --command cargo build
 nix develop .# --command cargo build --release -p remote-monitor
 nix develop .# --command cargo test
 ```
 
-The flake provides: `pkg-config`, `openssl`, `rustc`, `cargo`, `rustfmt`, `clippy`, `ansible`.
-`PKG_CONFIG_PATH` is set for openssl. There is no `shell.nix` — only `flake.nix`.
+The flake provides `pkg-config`, `openssl`, `rustc`, `cargo`, `rustfmt`, `clippy`, and `ansible`, and sets `PKG_CONFIG_PATH` for OpenSSL. There is no `shell.nix`.
 
-**Cross-compilation gotcha** (musl/mingw targets): Each cross-stdenv sets `CC` globally;
-pin each target via `CC_<triple>` env vars + reset `CC` to native gcc in shellHook to prevent
-the last cross-compiler from poisoning native builds.
+**Cross-compilation.** Each cross-stdenv sets `CC` globally. Pin each target with a `CC_<triple>` variable and reset `CC` to the native gcc in the shell hook, so the last cross-compiler cannot poison native builds. See `docs/dev-notes.md`.
 
 ---
 
-## 4. CONFIG SYSTEM
+## Configuration
 
-Priority (highest wins):
+Priority, highest first:
+
 1. CLI flags: `--monitor-url`, `--monitor-token`
-2. Env vars: `MONITOR_URL`, `MONITOR_TOKEN`
-3. `.nervctf.yml` / `.nervctf.yaml` (walked up from challenges_dir)
+2. Environment variables: `MONITOR_URL`, `MONITOR_TOKEN`
+3. `.nervctf.yml` or `.nervctf.yaml`, searched upward from the challenges directory
 
-**`Config` struct** (`utils.rs`):
+The `Config` struct (`utils.rs`):
+
 ```rust
 pub struct Config {
-    pub monitor_url:              Option<String>,
-    pub monitor_token:            Option<String>,
-    pub challenges_dir:           Option<String>,
-    pub target_ip:                Option<String>,   // setup only
-    pub target_user:              Option<String>,   // setup only
-    pub ssh_pubkey_path:          Option<String>,   // setup only
-    pub ctfd_remote_path:         Option<String>,   // setup only
-    pub monitor_port:             Option<String>,   // setup only
-    pub max_concurrent_provisions: Option<u32>,     // monitor tuning
-    pub max_instances_per_team:   Option<u32>,     // monitor tuning (0 = unlimited)
-    pub runner_ip:                Option<String>,   // split-machine mode
-    pub runner_user:              Option<String>,   // split-machine mode
+    pub monitor_ip:                Option<String>,
+    pub monitor_port:              Option<String>,
+    pub monitor_token:             Option<String>,
+    pub monitor_user:              Option<String>,   // setup: SSH user on the CTFd host
+    pub monitor_ctfd_path:         Option<String>,   // setup: CTFd install path
+    pub ssh_key_path:              Option<String>,   // setup/deploy: private key
+    pub challenges_path:           Option<String>,   // local challenges directory
+    pub max_concurrent_provisions: Option<u32>,      // monitor tuning
+    pub max_instances_per_team:    Option<u32>,      // monitor tuning (0 = unlimited)
+    pub ctfd_domain:               Option<String>,   // CTFd URL for dashboard links
+    pub runner_ip:                 Option<String>,   // split-machine mode
+    pub runner_user:               Option<String>,   // split-machine mode
+    pub runner_domain:             Option<String>,   // split-machine mode
 }
 ```
 
-`load_config(start_dir)` walks up directories looking for `.nervctf.yml`.
-`save_config(config, path)` serialises to YAML (skips `None` fields).
+`load_config(start_dir)` walks up looking for `.nervctf.yml`. `save_config(config, path)` serialises to YAML and skips `None` fields.
 
-**Split-machine mode**: when `runner_ip` + `runner_user` are set, `nervctf deploy` rsyncs
-challenge files directly to `{runner_user}@{runner_ip}:/home/docker/challenges/` instead of
-uploading via the monitor. After rsync, it calls `POST /api/v1/instance/build-compose-remote`
-to trigger image builds on the runner via SSH.
+In split-machine mode (`runner_ip` and `runner_user` set), `nervctf deploy` rsyncs challenge files to `{runner_user}@{runner_ip}` and the monitor runs container commands on the runner over SSH.
 
 ---
 
-## 5. DATA MODELS (`ctfd_api/models/mod.rs`)
+## Data models (`ctfd_api/models/mod.rs`)
 
 ### ChallengeType
+
 ```rust
 enum ChallengeType { Standard, Dynamic, Instance }
 // serde: "standard" | "dynamic" | "instance"
-// "instance" challenges deploy to CTFd as "standard" or "dynamic" depending on
-// whether extra.initial is set. CTFd itself never sees "instance" as the type.
 ```
 
-### Challenge (top-level YAML struct)
-Required fields: `name`, `category`, `value`, `type`
-Key optional fields:
-- `extra: Option<Extra>` — `{initial, decay, minimum}` for Dynamic scoring
-- `instance: Option<InstanceConfig>` — only for `type: instance`
-- `flags: Option<Vec<FlagContent>>`
-- `hints: Option<Vec<HintContent>>`
-- `tags: Option<Vec<Tag>>`
-- `files: Option<Vec<String>>` — relative paths from challenge dir
-- `requirements: Option<Requirements>`
-- `state: Option<State>` — `"hidden"` | `"visible"`
-- `connection_info: Option<String>`
-- `attempts: Option<u32>`
-- `source_path: String` — injected by scanner, not serialised; absolute path to challenge dir
-- `unknown_yaml_keys: Vec<String>` — injected by scanner for lint warnings
+`instance` challenges deploy to CTFd as `standard` or `dynamic`, depending on whether `extra.initial` is set. CTFd never receives `"instance"` as a challenge type; the `nervctf_instance` plugin registers that type separately.
 
-### FlagContent (untagged enum)
+### Challenge
+
+Required fields: `name`, `category`, `value`, `type`. Fields carried through:
+
+- `extra: Option<Extra>` — `{initial, decay, minimum}` for dynamic scoring
+- `instance: Option<InstanceConfig>` — only for `type: instance`
+- `flags: Option<Vec<FlagContent>>`, `hints: Option<Vec<HintContent>>`, `tags: Option<Vec<Tag>>`
+- `files: Option<Vec<String>>` — paths relative to the challenge directory
+- `requirements: Option<Requirements>`, `next: Option<String>`
+- `state: Option<State>` — `hidden` or `visible`
+- `connection_info: Option<String>`, `attempts: Option<u32>`
+- `source_path: String` — set by the scanner, not serialised
+- `unknown_yaml_keys: Vec<String>` — set by the scanner for lint warnings
+
+### FlagContent, HintContent, Tag, Requirements
+
+All four are untagged enums that accept a shorthand or a detailed form:
+
 ```rust
 enum FlagContent {
     Simple(String),
@@ -179,67 +147,57 @@ enum FlagContent {
 }
 // FlagType: "static" | "regex"
 // FlagData: "case_sensitive" | "case_insensitive"  (snake_case serde)
-```
 
-### HintContent (untagged enum)
-```rust
 enum HintContent {
     Simple(String),
     Detailed { content: String, cost: Option<u32>, title: Option<String> }
 }
-// .content_str() helper extracts content from either variant
-```
 
-### Tag (untagged enum)
-```rust
 enum Tag {
     Simple(String),
     Detailed { challenge_id, id, value: String }
 }
-// .value_str() helper
-```
 
-### Requirements (untagged enum)
-```rust
 enum Requirements {
-    Simple(Vec<serde_json::Value>),          // list of names or integer IDs
+    Simple(Vec<serde_json::Value>),          // names or integer IDs
     Advanced { prerequisites: Vec<Value>, anonymize: bool }
 }
-// .prerequisite_names() → Vec<String> (integers coerced to string)
+// .prerequisite_names() extracts every value as a string, coercing integers
 ```
 
 ### InstanceConfig
+
 ```rust
 pub struct InstanceConfig {
-    pub backend: InstanceBackend,  // docker | compose | lxc | vagrant
+    pub backend: InstanceBackend,          // docker | compose | lxc | vagrant
     pub image: Option<String>,
-    pub compose_file: Option<String>,    // default: "docker-compose.yml"
+    pub compose_file: Option<String>,      // default "docker-compose.yml"
     pub compose_service: Option<String>,
     pub lxc_image: Option<String>,
     pub vagrantfile: Option<String>,
-    pub internal_port: u32,
-    pub connection: String,              // "nc" | "http" | "ssh"
+    pub internal_ports: Vec<u32>,          // accepts scalar or array
+    pub service_ports: Option<HashMap<String, Vec<u32>>>,  // compose multi-service
+    pub connection: String,                // "nc" | "http" | "ssh"
     pub timeout_minutes: Option<u32>,
     pub max_renewals: Option<u32>,
     pub command: Option<String>,
-    pub flag_mode: Option<InstanceFlagMode>,    // "static" | "random"
+    pub flag_mode: Option<InstanceFlagMode>,   // "static" | "random"
     pub flag_prefix: Option<String>,
     pub flag_suffix: Option<String>,
     pub random_flag_length: Option<u32>,
     pub flag_delivery: Option<FlagDelivery>,   // "env" (default) | "file"
-    pub flag_file_path: Option<String>,        // absolute path inside container (file mode)
-    pub flag_service: Option<String>,          // compose service receiving flag file
+    pub flag_file_path: Option<String>,        // absolute path inside the container
+    pub flag_service: Option<String>,          // compose service receiving the flag file
 }
 ```
 
 ### RequirementsQueue
-Topological sorter for deploy ordering. Uses Kahn's algorithm.
-`resolve_dependencies(actions: Vec<SyncAction>) → Vec<SyncAction>` — returns Create/Update
-actions in dependency order, UpToDate/RemoteOnly appended after.
+
+A topological sorter for deploy order, built on Kahn's algorithm. `resolve_dependencies(actions)` returns `Create` and `Update` actions in dependency order and appends `UpToDate` and `RemoteOnly` afterwards.
 
 ---
 
-## 6. CLI COMMANDS (`main.rs`)
+## CLI commands
 
 ```
 nervctf [OPTIONS] <COMMAND>
@@ -251,57 +209,50 @@ Options:
   --monitor-token <TOKEN>
 
 Commands:
-  deploy [--dry-run] [--recreate]   create new challenges + update changed ones
-  list [--detailed]                 list local challenges
-  scan [--detailed]                 scan + print statistics
-  validate [--debug]                lint challenge.yml files (full view with --debug)
-  fix [--dry-run]                   interactive YAML fixer (state/author/version)
   setup [--upgrade]                 Ansible-based server deployment wizard
+  deploy [--dry-run] [--recreate] [--prune]
+  list [--detailed]
+  scan [--detailed]
+  validate [--debug]
+  probe [--refresh] [--json]
+  fix [--dry-run]
 ```
 
-`--recreate` forces all challenges into the update queue (skips up-to-date check, skips
-the `Proceed? (y/N)` prompt). Useful for re-syncing files to the runner or rebuilding images.
+`--recreate` forces every challenge into the update queue, skipping the up-to-date check and the confirmation prompt. Use it to re-sync files to the runner or rebuild images.
 
-### Deploy flow (key logic in `deploy_challenges`):
+### Deploy flow (`deploy_challenges` in `main.rs`)
 
-All API calls go to `remote-monitor`, which executes them against CTFd MariaDB directly.
+All API calls go to the remote monitor, which runs them against CTFd's MariaDB.
 
-1. Scan local challenges tree → `Vec<Challenge>`
-2. Run validator; abort if any errors
-3. `GET /api/v1/challenges` (paginated) → remote list
+1. Scan the local tree into `Vec<Challenge>`.
+2. Run the validator; abort on errors.
+3. `GET /api/v1/challenges` (paginated) for the remote list.
 4. For each local challenge:
-   - Not on remote → `create_challenge_phase1()` (`POST /challenges` → monitor → SQL INSERT)
-   - On remote + `needs_update()` or `--recreate` → `update_challenge_phase1()` (`PATCH /challenges/{id}` → monitor → SQL UPDATE)
-5. After all base creates/updates: flags, tags, files, hints, requirements, state patches
+   - not on the remote → `create_challenge_phase1()` (`POST /challenges`)
+   - on the remote and `needs_update()` or `--recreate` → `update_challenge_phase1()` (`PATCH /challenges/{id}`)
+5. After base creates and updates: flags, tags, topics, hints, files, requirements, and state patches.
 6. For `type: instance`:
-   - Deploy to CTFd as `standard` or `dynamic` (based on `extra.initial` presence)
-   - **Split-machine mode** (`runner_ip` set):
-     - rsync challenge dir to `{runner_user}@{runner_ip}:/home/docker/challenges/<name>/`
-     - `POST /api/v1/instance/build-compose-remote` → monitor SSHes to runner and runs `docker compose build`
-   - **Single-machine mode**:
-     - `POST /api/v1/instance/build` (docker, local image path) or `POST /api/v1/instance/build-compose` (compose) — uploads tar.gz
-   - `POST /api/v1/instance/register` — registers `InstanceConfig` on monitor
+   - deploy to CTFd as `standard` or `dynamic`, based on `extra.initial`;
+   - split-machine mode: rsync the challenge directory to the runner, then `POST /api/v1/instance/build-compose-remote`, which makes the monitor run `docker compose build` over SSH;
+   - single-machine mode: `POST /api/v1/instance/build` (docker) or `/instance/build-compose` (compose), uploading a tar.gz;
+   - `POST /api/v1/instance/register` to register the `InstanceConfig` on the monitor.
 
 ### `needs_update()` (`challenge_manager/sync.rs`)
-Free function (also used as method via delegation). Compares:
-`category`, `value`, `description`, `state`, `connection_info`, `attempts`,
-`extra` (JSON comparison), `flags` (sorted content strings), `tags` (sorted values),
-`hints` (sorted content strings), `requirements` (presence only, not deep comparison).
-Note: CTFd list endpoint never returns flags/tags/hints, so those comparisons only fire
-when both sides are `Some` (i.e. after a per-challenge detail fetch).
+
+A free function, also exposed as a method by delegation. It compares `category`, `value`, `description`, `state`, `connection_info`, `attempts`, `extra` (JSON), `flags` (sorted `(content, type, data)` tuples), `tags` (sorted values), `hints` (sorted `(content, cost)` tuples), and `requirements`. CTFd's list endpoint never returns flags, tags, or hints, so those comparisons fire only when both sides are `Some`.
 
 ### File uploads
-All files for a challenge must be sent in ONE multipart request (multiple `"file"` parts).
-One request per file → CTFd returns 500. Matches ctfcli's `_create_all_files()` pattern.
+
+Send all of a challenge's files in one multipart request (multiple `"file"` parts). One request per file returns 500. This matches ctfcli's `_create_all_files()`.
 
 ### CTFd requirements
-- Challenge Visibility must be "Public" (Admin → Config → Visibility). Private mode blocks
-  even valid API tokens from `GET /api/v1/challenges`.
-- Upload dir: `chown -R 1001:1001 <CTFd>/.data/CTFd/uploads` when using Docker.
+
+- Challenge visibility must be "Public" (Admin → Config → Visibility). Private mode blocks even valid API tokens from `GET /api/v1/challenges`.
+- The uploads directory needs `chown -R 1001:1001 <CTFd>/.data/CTFd/uploads` when using Docker.
 
 ---
 
-## 7. CTFD API CLIENT (`ctfd_api/client.rs`)
+## CTFd API client (`ctfd_api/client.rs`)
 
 ```rust
 pub struct CtfdClient {
@@ -311,137 +262,108 @@ pub struct CtfdClient {
 }
 ```
 
-All API calls go to `remote-monitor` (`{monitor_url}/api/v1/...`), which handles them via
-direct MariaDB SQL. Response shape is CTFd-compatible (`{"success": true, "data": ...}`).
-No `CTFD_URL` or `CTFD_API_KEY` — the monitor is the sole gateway.
+Every call goes to the remote monitor at `{monitor_url}/api/v1/...`, which handles it with direct MariaDB SQL. Responses are CTFd-compatible (`{"success": true, "data": ...}`). There is no `CTFD_URL` or `CTFD_API_KEY`; the monitor is the only gateway.
 
-- `execute(method, path, body) → Result<Option<Value>>`
-- `get_challenges()` — paginated via `meta.pagination.next`; loops until no next page
-- `get_challenge_id(name)` — scans all challenges for matching name
-- `create_challenge`, `update_challenge`, `delete_challenge`
-- `create_flag`, `delete_flag`, `get_challenge_flags_endpoint`
-- `create_tag`, `delete_tag`, `get_challenge_tags_endpoint`
-- `create_hint`, `delete_hint`, `get_challenge_hints_endpoint`
-- `create_file` (multipart/form-data), `delete_file`, `get_challenge_files_endpoint`
-- `parse_response` — private; unwraps `{"success": true, "data": ...}` envelope
+Methods include `execute`, `get_challenges` (paginated through `meta.pagination.next`), `get_challenge_id`, `create_challenge`/`update_challenge`/`delete_challenge`, the flag/tag/hint create/delete/list helpers, and `create_file` (multipart). `parse_response` unwraps the `{"success": true, "data": ...}` envelope.
 
-**Dependency conflict**: axum 0.7 uses `http 1.x`; reqwest 0.11 uses `http 0.2.x`.
-Bridge via string conversion (`.as_str()` / `.as_bytes()`). Do not mix HeaderMap types.
+**Dependency conflict.** axum 0.7 uses `http 1.x`; reqwest 0.11 uses `http 0.2.x`. Bridge the two with string conversion (`.as_str()`, `.as_bytes()`) and do not mix `HeaderMap` types.
 
 ---
 
-## 8. REMOTE-MONITOR SERVER (`remote-monitor/src/main.rs`)
+## Remote monitor
 
 ### AppState
+
 ```rust
 pub struct AppState {
-    pub monitor_token: String,          // MONITOR_TOKEN
-    pub public_host: String,            // PUBLIC_HOST
-    pub db: Db,                         // Arc<Mutex<Connection>> (SQLite)
-    pub ctfd_pool: mysql_async::Pool,   // CTFd MariaDB pool
-    pub challenges_base_dir: String,    // CHALLENGES_BASE_DIR
-    pub ctfd_uploads_dir: String,       // CTFD_UPLOADS_DIR
-    pub runner_ssh_target: Option<String>,  // RUNNER_SSH_TARGET (split-machine mode)
-    pub provision_sem: Arc<Semaphore>,  // MAX_CONCURRENT_PROVISIONS
-    pub max_instances_per_team: u64,   // MAX_INSTANCES_PER_TEAM (0 = unlimited)
+    pub monitor_token: String,             // MONITOR_TOKEN
+    pub public_host: String,               // PUBLIC_HOST
+    pub db: Db,                            // Arc<Mutex<Connection>> (SQLite)
+    pub ctfd_pool: mysql_async::Pool,      // CTFd MariaDB pool
+    pub challenges_base_dir: String,       // CHALLENGES_BASE_DIR
+    pub ctfd_uploads_dir: String,          // CTFD_UPLOADS_DIR
+    pub runner_ssh_target: Option<String>, // RUNNER_SSH_TARGET
+    pub provision_sem: Arc<Semaphore>,     // MAX_CONCURRENT_PROVISIONS
+    pub max_instances_per_team: u64,       // MAX_INSTANCES_PER_TEAM (0 = unlimited)
 }
 ```
 
-### Environment variables consumed by remote-monitor
-| Var | Default | Purpose |
-|-----|---------|---------|
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
 | `CTFD_DB_URL` | required | MariaDB URL (`mysql://user:pass@host/db`) |
 | `MONITOR_TOKEN` | required | Admin auth token |
 | `PUBLIC_HOST` | required | Hostname returned to players in connection strings |
-| `CTFD_UPLOADS_DIR` | `""` | Absolute path to CTFd uploads dir (for file writes) |
+| `CTFD_UPLOADS_DIR` | `""` | Absolute path to the CTFd uploads directory |
 | `CHALLENGES_BASE_DIR` | `/opt/nervctf/challenges` | Root for challenge files |
-| `RUNNER_SSH_TARGET` | `""` | SSH target for split-machine mode (e.g. `docker@192.168.1.50`) |
+| `RUNNER_SSH_TARGET` | `""` | SSH target for split-machine mode |
 | `MONITOR_PORT` | `33133` | TCP bind port |
 | `MONITOR_BIND` | `0.0.0.0` | TCP bind address |
 | `DB_PATH` | `./monitor.db` | SQLite file path |
-| `MAX_CONCURRENT_PROVISIONS` | `4` | Semaphore limit for concurrent docker/compose ops |
-| `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team across all challenges (0 = unlimited) |
-| `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd MariaDB → SQLite sync cycles |
+| `MAX_CONCURRENT_PROVISIONS` | `4` | Semaphore limit for concurrent docker/compose operations |
+| `MAX_INSTANCES_PER_TEAM` | `0` | Max active instances per team (0 = unlimited) |
+| `CTFD_DB_SYNC_INTERVAL` | `30` | Seconds between CTFd-to-SQLite sync cycles |
+| `CTFD_DOMAIN` | `""` | CTFd URL shown in dashboard links |
 
 ### Admin dashboard
 
-`GET /admin?token=<MONITOR_TOKEN>` — self-contained HTML (no CDN; air-gap safe).
-Token via `?token=` query param or `Authorization: Token` header.
-
-Three auto-refreshing tables:
-- **Flag sharing alerts** (15 s) — flag submitted to wrong team's challenge instance
-- **Active instances** (15 s) — all running containers with team/user/host:port/expiry
-- **Recent flag attempts** (30 s) — last 200 attempts across all teams
+`GET /admin` serves a self-contained HTML page (no CDN, so it works air-gapped). The token comes from the `?token=` query parameter, an `Authorization: Token` header, or a session cookie. Three tables refresh themselves: flag-sharing alerts (15 s), active instances (15 s), and recent flag attempts (30 s).
 
 ### Routes
 
 **No auth:**
+
 - `GET /health` → `{"status": "ok"}`
-- `GET /instance/:name` → HTML player UI page (inline, no CDN)
+- `GET /` → login page; redirects to `/admin` when the session cookie is valid
+- `GET /instance/:name` → HTML player page
 
-**Admin (`Authorization: Token <MONITOR_TOKEN>` or `?token=`):**
-- `GET /admin` → serves admin dashboard HTML
+**Session auth (cookie `nervctf_session`):**
 
-**Admin (`Authorization: Token <MONITOR_TOKEN>`):**
-- `POST /api/v1/instance/build` — multipart `challenge_name` + `context` (tar.gz); builds docker image
-- `POST /api/v1/instance/build-compose` — multipart; wipes dir first, extracts tar.gz, builds compose images (single-machine)
-- `POST /api/v1/instance/build-compose-remote` — JSON `{challenge_name, compose_file?, challenges_dir?}`; SSHes to runner and runs `docker compose build` (split-machine)
-- `POST /api/v1/instance/register` — `{challenge_name, ctfd_id, backend, config_json}`
-- `GET /api/v1/instance/list` → registered configs
-- `GET /api/v1/admin/instances` → all active instances as JSON
-- `GET /api/v1/admin/attempts[?alerts_only=true]` → flag attempt log (200 max) or sharing alerts
-- `GET /api/v1/admin/solves` → correct solves per team (from ctfd_solves cache)
-- CTFd CRUD (all via MariaDB SQL):
-  - `GET/POST /api/v1/challenges`, `GET/PATCH/DELETE /api/v1/challenges/{id}`
-  - `GET/POST /api/v1/flags`, `DELETE /api/v1/flags/{id}`
-  - `GET/POST /api/v1/hints`, `DELETE /api/v1/hints/{id}`
-  - `GET/POST /api/v1/tags`, `DELETE /api/v1/tags/{id}`
-  - `GET/POST /api/v1/files`, `DELETE /api/v1/files/{id}` (disk + DB)
-  - `POST /api/v1/topics`
+- `POST /auth/login`, `POST /auth/logout`
 
-**Plugin auth** (admin token + explicit `team_id` in body — called by CTFd plugin):
-- `GET /api/v1/plugin/info?challenge_name=X&team_id=N`
-- `POST /api/v1/plugin/request` → provisions instance
-- `POST /api/v1/plugin/renew` → extends expiry
-- `DELETE /api/v1/plugin/stop` → destroys one team's instance
-- `DELETE /api/v1/plugin/stop_all` → destroys all instances for a challenge
-- `POST /api/v1/plugin/solve` → marks solved + tears down instance
-- `POST /api/v1/plugin/attempt` → records flag submission; detects sharing via `team_flags` table
+**Admin auth (`Authorization: Token <MONITOR_TOKEN>`, `?token=`, or session cookie):**
 
-**Player auth** (CTFd user token validated via direct MariaDB lookup):
-- `POST /api/v1/instance/request` → provisions instance
-- `GET /api/v1/instance/info?challenge_name=X`
-- `POST /api/v1/instance/renew`
-- `DELETE /api/v1/instance/stop`
+- `GET /admin`
+
+**Admin auth (`Authorization: Token <MONITOR_TOKEN>`):**
+
+- `POST /api/v1/instance/build`, `/instance/build-compose`, `/instance/build-compose-remote`
+- `POST /api/v1/instance/register`, `GET /api/v1/instance/list`
+- CTFd CRUD over SQL: `/api/v1/challenges`, `/flags`, `/hints`, `/tags`, `/files`, `/topics`
+- `GET /api/v1/admin/instances`, `/admin/attempts`, `/admin/solves`, `/admin/config`, `/admin/probe`
+- `GET/POST /api/v1/admin/tokens`, `DELETE /api/v1/admin/tokens/:id`
+
+**Plugin auth (admin token plus explicit `team_id`, called by the CTFd plugin):**
+
+- `/api/v1/plugin/{info, request, renew, stop, stop_all, solve, attempt}`
+
+**Player auth (CTFd user token validated against MariaDB):**
+
+- `/api/v1/instance/{request, info, renew, stop}`
 
 ### Background tasks
 
-**Expiry task** — every 30 s:
-- `get_expired_instances()` → for each: `cleanup_container(id, runner_ssh)` + `delete_instance()` + `delete_flag(ctfd_flag_id)`
-- Orphan cleanup: `list_ctf_projects()` (compose) → stop any not in DB
+**Expiry task** (every 30 s): `get_expired_instances()` returns expired running instances and stuck provisioning instances (older than 30 minutes, measured from `created_at`). For each, delete the SQLite row, delete the CTFd flag, and clean up the container. The task also stops orphaned `ctf-*` compose projects and marks instances dead when the container is gone from both `docker ps` and `docker compose ls`.
 
-**CTFd sync task** — every `CTFD_DB_SYNC_INTERVAL` s (default 30):
-- `ctfd_db::sync_solves()` — full-replace `ctfd_solves` SQLite cache from MariaDB `submissions`; reverts solved instances where submission was deleted; removes stale `is_correct=1` flag_attempts
-- `ctfd_db::sync_users_and_teams()` — full-replace `ctfd_teams` + `ctfd_users` caches
+**CTFd sync task** (every `CTFD_DB_SYNC_INTERVAL` s): `sync_solves()` full-replaces the `ctfd_solves` cache from MariaDB `submissions`, reverts solved instances whose submission was deleted, and removes stale correct attempts. `sync_users_and_teams()` full-replaces the name caches.
 
-### `check_monitor_auth(headers, expected_token) → bool`
-Checks `Authorization: Token <value>` header. Used for all admin and plugin routes.
+### Auth helpers
 
-### `validate_ctfd_token(pool, token) → Option<i64>`
-Direct MariaDB query on `users` table (`SELECT team_id FROM users WHERE token = ? AND banned = 0 AND hidden = 0`).
-Returns `None` if invalid/no team. Used for player routes.
+- `check_monitor_auth(headers, expected_token) -> bool` reads `Authorization: Token <value>` and gates every admin and plugin route.
+- `validate_ctfd_token(pool, token) -> Option<i64>` runs `SELECT team_id FROM users WHERE token = ? AND banned = 0 AND hidden = 0` and returns `None` when invalid or teamless. Player routes use it.
 
 ---
 
-## 9. SQLITE SCHEMA (`remote-monitor/src/db.rs`)
+## SQLite schema (`remote-monitor/src/db.rs`)
 
 ```sql
 CREATE TABLE instance_configs (
     challenge_name  TEXT PRIMARY KEY,
     ctfd_id         INTEGER NOT NULL,
-    backend         TEXT NOT NULL,    -- "docker"|"compose"|"lxc"|"vagrant"
-    config_json     TEXT NOT NULL,    -- full InstanceConfig as JSON
-    image_tag       TEXT,             -- resolved after build
+    backend         TEXT NOT NULL,       -- "docker"|"compose"|"lxc"|"vagrant"
+    config_json     TEXT NOT NULL,       -- full InstanceConfig as JSON
+    image_tag       TEXT,
     updated_at      TEXT DEFAULT (datetime('now'))
 );
 
@@ -449,17 +371,17 @@ CREATE TABLE instances (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     challenge_name  TEXT NOT NULL,
     team_id         INTEGER NOT NULL,
-    user_id         INTEGER,          -- CTFd user who requested
-    container_id    TEXT,             -- docker ID, compose project name, or LXC name
+    user_id         INTEGER,
+    container_id    TEXT,
     host            TEXT NOT NULL,
     port            INTEGER NOT NULL,
     connection_type TEXT NOT NULL,
-    status          TEXT NOT NULL,    -- "running"|"provisioning"|"solved"
-    flag            TEXT,             -- per-team random flag (null for static)
-    ctfd_flag_id    INTEGER,          -- CTFd flag ID for cleanup on stop/expire
+    status          TEXT NOT NULL,       -- "running"|"provisioning"|"solved"
+    flag            TEXT,
+    ctfd_flag_id    INTEGER,
     renewals_used   INTEGER DEFAULT 0,
     created_at      TEXT DEFAULT (datetime('now')),
-    expires_at      TEXT NOT NULL,    -- "YYYY-MM-DD HH:MM:SS" UTC
+    expires_at      TEXT NOT NULL,
     UNIQUE(challenge_name, team_id)
 );
 
@@ -469,14 +391,13 @@ CREATE TABLE flag_attempts (
     team_id         INTEGER NOT NULL,
     user_id         INTEGER NOT NULL,
     submitted_flag  TEXT NOT NULL,
-    is_correct      INTEGER NOT NULL DEFAULT 0,    -- 0|1 boolean
-    is_flag_sharing INTEGER NOT NULL DEFAULT 0,    -- 1 = flag belonged to a different team
-    owner_team_id   INTEGER,           -- team whose instance generated this flag (if sharing)
+    is_correct      INTEGER NOT NULL DEFAULT 0,
+    is_flag_sharing INTEGER NOT NULL DEFAULT 0,
+    owner_team_id   INTEGER,
     timestamp       TEXT DEFAULT (datetime('now'))
 );
 
--- Permanent flag history for sharing detection (never deleted on instance stop)
-CREATE TABLE team_flags (
+CREATE TABLE team_flags (   -- permanent; used for sharing detection after stop
     challenge_name  TEXT NOT NULL,
     team_id         INTEGER NOT NULL,
     flag            TEXT NOT NULL,
@@ -484,8 +405,7 @@ CREATE TABLE team_flags (
     PRIMARY KEY (challenge_name, team_id, flag)
 );
 
--- Read-only cache of correct solves synced from CTFd MariaDB submissions
-CREATE TABLE ctfd_solves (
+CREATE TABLE ctfd_solves (  -- read-only cache of correct CTFd submissions
     challenge_name  TEXT NOT NULL,
     team_id         INTEGER NOT NULL,
     user_id         INTEGER,
@@ -493,139 +413,156 @@ CREATE TABLE ctfd_solves (
     PRIMARY KEY (challenge_name, team_id)
 );
 
--- Cached team/user names from CTFd for display
 CREATE TABLE ctfd_teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
 CREATE TABLE ctfd_users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, team_id INTEGER);
+
+CREATE TABLE operator_tokens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    label        TEXT NOT NULL,
+    token_hash   TEXT NOT NULL UNIQUE,   -- SHA-256 hex of the raw token
+    created_at   TEXT DEFAULT (datetime('now')),
+    last_used_at TEXT
+);
+
+CREATE TABLE sessions (
+    session_id  TEXT PRIMARY KEY,
+    operator_id INTEGER NOT NULL REFERENCES operator_tokens(id) ON DELETE CASCADE,
+    created_at  TEXT DEFAULT (datetime('now')),
+    expires_at  TEXT NOT NULL
+);
+
+CREATE TABLE ctfd_probe (   -- singleton row (id = 1)
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    probed_at             TEXT NOT NULL DEFAULT (datetime('now')),
+    ctfd_version_tag      TEXT,
+    ctfd_version_source   TEXT,
+    is_team_mode          INTEGER,
+    challenges_cols       TEXT,
+    has_dynamic_table     INTEGER NOT NULL DEFAULT 0,
+    dynamic_cols          TEXT,
+    has_next_id           INTEGER NOT NULL DEFAULT 0,
+    has_attribution       INTEGER NOT NULL DEFAULT 0,
+    has_logic             INTEGER NOT NULL DEFAULT 0,
+    has_position          INTEGER NOT NULL DEFAULT 0,
+    dynamic_inline        INTEGER NOT NULL DEFAULT 0,
+    dynamic_partial       INTEGER NOT NULL DEFAULT 0,
+    has_instance_table    INTEGER NOT NULL DEFAULT 0,
+    cap_challenge_crud    TEXT NOT NULL DEFAULT 'unknown',
+    cap_dynamic_scoring   TEXT NOT NULL DEFAULT 'unknown',
+    cap_player_auth       TEXT NOT NULL DEFAULT 'unknown',
+    cap_instance_flags    TEXT NOT NULL DEFAULT 'unknown',
+    cap_redis_sync        TEXT NOT NULL DEFAULT 'degraded',
+    probe_notes           TEXT NOT NULL DEFAULT '[]'
+);
 ```
 
-`Db = Arc<Mutex<Connection>>`. WAL mode enabled. Migrations are run on every `open()`.
+`Db = Arc<Mutex<Connection>>`. WAL mode is enabled and migrations run on every `open()`.
 
-Key functions:
-- `upsert_config / get_config / get_image_tag / update_image_tag / list_configs`
-- `insert_provisioning_stub` — INSERT OR IGNORE placeholder row (`status='provisioning'`)
-- `insert_instance` — UPSERT (resets `renewals_used=0`); also writes to `team_flags`
-- `get_instance / delete_instance / mark_instance_solved`
-- `delete_all_instances_for_challenge` — used on challenge delete
-- `get_used_ports → HashSet<u16>` / `get_expired_instances` / `list_all_instances`
-- `insert_flag_attempt / list_flag_attempts(limit) / list_sharing_alerts`
-- `find_flag_owner` — queries `team_flags` (permanent); returns `Some(owner_team_id)` if flag sharing
-- `replace_ctfd_solves` — full DELETE + INSERT cycle (so deleted submissions are reflected)
-- `revert_unsolved_instances` — sets `status='running'` where `status='solved'` but no ctfd_solve entry
-- `delete_stale_correct_attempts` — removes `is_correct=1` flag_attempts with no matching ctfd_solve
-- `replace_ctfd_teams_and_users` — full-replace name caches
-- `has_correct_solve / list_correct_solves`
+Functions include `upsert_config`, `get_config`, `get_image_tag`, `update_image_tag`, `list_configs`, `insert_provisioning_stub`, `insert_instance` (UPSERT that also writes `team_flags`), `get_instance`, `delete_instance`, `mark_instance_solved`, `delete_all_instances_for_challenge`, `get_used_ports`, `get_expired_instances`, `list_all_instances`, `insert_flag_attempt`, `list_flag_attempts`, `list_sharing_alerts`, `find_flag_owner`, `replace_ctfd_solves`, `revert_unsolved_instances`, `delete_stale_correct_attempts`, `replace_ctfd_teams_and_users`, `has_correct_solve`, and `list_correct_solves`.
 
 ---
 
-## 10. INSTANCE BACKENDS (`remote-monitor/src/instance/`)
+## Instance backends (`remote-monitor/src/instance/`)
 
-### `mod.rs` — central dispatch
+### `mod.rs`
 
-`provision(db, challenge_name, team_id, user_id, config, public_host, ctfd_pool, runner_ssh) → (host, port, conn_type, expires_at)`
+`provision(db, challenge_name, team_id, user_id, config, public_host, ctfd_pool, runner_ssh) -> (host, port, conn_type, expires_at)`.
 
-- `generate_flag(config)` → `Option<String>` — `None` unless `flag_mode = "random"`; generates `<prefix><N chars><suffix>`
-- `sanitize_name(name)` — lowercase, non-alphanumeric/hyphen → hyphen, trim
-- container naming: `ctf-<sanitized>-t<team_id>`
-- `expires_at_string(minutes)` → `"YYYY-MM-DD HH:MM:SS"` UTC (no chrono dep)
-- `cleanup_container(container_id, runner_ssh: Option<&str>)` — tries compose::down, lxc::delete, docker::remove_container
+- `generate_flag(config) -> Option<String>` returns `None` unless `flag_mode = "random"`, otherwise `<prefix><N chars><suffix>`.
+- `sanitize_name(name)` lowercases, turns non-alphanumeric characters into hyphens, and trims.
+- Container naming is `ctf-<sanitized>-t<team_id>`.
+- `expires_at_string(minutes)` returns `"YYYY-MM-DD HH:MM:SS"` UTC without a chrono dependency.
+- `cleanup_container(container_id, runner_ssh)` tries `compose::down`, `lxc::delete`, and `docker::remove_container`.
 
-All docker/compose/lxc functions accept `runner_ssh: Option<&str>`. When set, commands are
-executed on the runner via `ssh -o BatchMode=yes <target> <cmd>`.
+Every docker, compose, and lxc function takes `runner_ssh: Option<&str>`. When set, commands run on the runner through `ssh -o BatchMode=yes <target> <cmd>`.
 
 ### `docker.rs`
-- `pick_free_port(used_ports) → u16` — random in 40000–60000
-- `run_container(..., runner_ssh) → String` — `docker run -d -p host:internal ...`
-- `remove_container(id, runner_ssh)` — `docker rm -f`
-- `build_image(context_tar_path, image_tag, runner_ssh)` — `docker build -t <tag>`
+
+- `pick_free_ports(used, count) -> Vec<u16>` allocates atomically in the 40000–60000 range.
+- `run_container(..., runner_ssh)` runs `docker run -d -p host:internal ...`.
+- `remove_container(id, runner_ssh)` runs `docker rm -f`.
+- `build_image(context_tar_path, image_tag, runner_ssh)` runs `docker build -t <tag>`.
 
 ### `compose.rs`
-- `up(..., runner_ssh) → (u16, String)`
-  - Writes `<project_name>.override.yml` (port mapping + optional flag file bind-mount)
-  - In split-machine mode: writes files to runner via `ssh mkdir -p && cat > file`
-  - `flag_delivery = "env"`: injects `FLAG=<value>` env var; challenge compose uses `${FLAG}`
-  - `flag_delivery = "file"`: writes `<project_name>.flag` + bind-mount override for `flag_service`
-  - Runs: `DOCKER_BUILDKIT=1 docker compose -f <compose_file> -f <override> -p <project_name> up -d --force-recreate`
-- `down(project_name, runner_ssh?)` — `docker compose -p <name> down -v`
-- `build(compose_file, runner_ssh?)` — `docker compose -f <file> build`
-- `list_ctf_projects()` — lists running `ctf-*` compose projects (for orphan cleanup)
+
+- `up(..., runner_ssh) -> (u16, String)` writes `<project_name>.override.yml` with port mappings and an optional flag-file bind mount. In split-machine mode it writes the files to the runner over SSH. `flag_delivery: env` injects `FLAG=<value>`; `flag_delivery: file` writes `<project_name>.flag` and a bind mount for `flag_service`. It then runs `DOCKER_BUILDKIT=1 docker compose -f <compose_file> -f <override> -p <project_name> up -d --force-recreate`.
+- `down(project_name, runner_ssh?)` runs `docker compose -p <name> down -v`.
+- `build(compose_file, runner_ssh?)` runs `docker compose -f <file> build`.
+- `list_ctf_projects()` lists running `ctf-*` projects for orphan cleanup.
 
 ### `lxc.rs`
-- `launch(lxc_image, name, host_port, internal_port, flag)` — `lxc launch` → wait → proxy port → flag injection
-- `delete(name)` — `lxc stop --force` + `lxc delete --force`
+
+- `launch(lxc_image, name, host_port, internal_port, flag)` runs `lxc launch`, waits for `Running`, adds a port proxy, and injects the flag.
+- `delete(name)` runs `lxc stop --force` and `lxc delete --force`.
 
 ### `vagrant.rs`
-- `up(...)` — stub, returns error
+
+`up(...)` is a stub that returns an error.
 
 ---
 
-## 11. CTFD PLUGIN (`src/nervctf/assets/ctfd-plugin/`)
+## CTFd plugin (`src/nervctf/assets/ctfd-plugin/`)
 
-Plugin name: `nervctf_instance`. Installed to `CTFd/plugins/nervctf_instance/`.
+Plugin name `nervctf_instance`, installed to `CTFd/plugins/nervctf_instance/`. The CLI embeds it and extracts it on demand.
 
 ### `__init__.py` — `InstanceChallengeType(BaseChallenge)`
-Registered as `CHALLENGE_CLASSES["instance"]`. CTFd routes it via polymorphic `type = "instance"`.
 
-Key methods:
-- `create(request)` — creates `InstanceChallenge` row, calls `_register_with_monitor()`
-- `read(challenge)` — returns challenge data + backend/connection/timeout/flag_mode
-- `update(challenge, request)` — updates fields, re-registers with monitor
-- `delete(challenge)` — calls `_stop_all_instances()` then cascades DB deletes
-- `solve(user, team, challenge, request)` — delegates to `BaseChallenge.solve()`, then calls
-  `POST /api/v1/plugin/solve` on monitor to tear down the team's instance
-- `attempt(challenge, request)` — delegates to `BaseChallenge.attempt()` for verdict
-  (returns a `ChallengeResponse` object with `.success` bool attribute, not a tuple);
-  then fire-and-forgets `POST /api/v1/plugin/attempt` to monitor (timeout=0.5s, swallowed)
-  with `{challenge_name, team_id, user_id, submitted_flag, is_correct}`.
-  Never blocks the CTFd flag submission response.
+Registered as `CHALLENGE_CLASSES["instance"]`. CTFd routes `type = "instance"` challenges to it through polymorphic dispatch.
 
-### `_register_with_monitor(challenge)`
-POSTs `{challenge_name, ctfd_id, backend, config_json}` to monitor's
-`POST /api/v1/instance/register`. Called on create and update.
+- `create(request)` creates the `InstanceChallenge` row and calls `_register_with_monitor()`.
+- `read(challenge)` returns challenge data plus backend, connection, timeout, and flag mode.
+- `update(challenge, request)` updates fields and re-registers with the monitor.
+- `delete(challenge)` calls `_stop_all_instances()` and cascades DB deletes.
+- `solve(user, team, challenge, request)` delegates to `BaseChallenge.solve()` and then calls `POST /api/v1/plugin/solve` on the monitor to tear down the team's instance.
+- `attempt(challenge, request)` delegates to `BaseChallenge.attempt()` for the verdict and then fires `POST /api/v1/plugin/attempt` with `{challenge_name, team_id, user_id, submitted_flag, is_correct}`. The call uses a 0.5 s timeout and is swallowed, so it never blocks the CTFd flag submission response.
 
-### Blueprint routes (all `@authed_only`):
-All use `get_current_team()` to get `team_id`. Forward to monitor's `/api/v1/plugin/*`
-routes using admin token + explicit `team_id` in body/params (players never get admin token).
+`_register_with_monitor(challenge)` posts `{challenge_name, ctfd_id, backend, config_json}` to `POST /api/v1/instance/register`.
+
+### Blueprint routes (all `@authed_only`)
+
+Each uses `get_current_team()` for `team_id` and forwards to the monitor's `/api/v1/plugin/*` routes with the admin token plus an explicit `team_id`; players never see the admin token.
+
 - `GET /api/v1/containers/info/<challenge_id>`
 - `POST /api/v1/containers/request` — also sends `user_id` from `get_current_user()`
 - `POST /api/v1/containers/renew`
 - `POST /api/v1/containers/stop`
 
 ### `models/challenge.py` — `InstanceChallenge(Challenges)`
-SQLAlchemy polymorphic model (`__mapper_args__ = {"polymorphic_identity": "instance"}`).
-Extra columns: `backend`, `image`, `command`, `compose_file`, `compose_service`,
-`lxc_image`, `vagrantfile`, `internal_port`, `connection`, `timeout_minutes`,
-`max_renewals`, `flag_mode`, `flag_prefix`, `flag_suffix`, `random_flag_length`,
-`initial_value`, `minimum_value`, `decay_value`, `decay_function`.
+
+A SQLAlchemy polymorphic model with `__mapper_args__ = {"polymorphic_identity": "instance"}`. Extra columns: `backend`, `image`, `command`, `compose_file`, `compose_service`, `lxc_image`, `vagrantfile`, `internal_port`, `connection`, `timeout_minutes`, `max_renewals`, `flag_mode`, `flag_prefix`, `flag_suffix`, `random_flag_length`, `initial_value`, `minimum_value`, `decay_value`, and `decay_function`.
+
+`load(app)` creates the table with `db.create_all()` so `nervctf_instance_challenge` exists.
 
 ### `assets/view.js`
-DOM API only (no innerHTML). Fetch/Extend/Terminate buttons call `/api/v1/containers/*`.
-Displays connection string and countdown timer when instance is running.
-`expires_at` from monitor is `"YYYY-MM-DD HH:MM:SS"` UTC; plugin converts to ms in
-`_sqlite_to_ms()` before sending to JS (which treats it as Unix ms).
+
+Uses the DOM API only (no `innerHTML`). Fetch, Extend, and Terminate buttons call `/api/v1/containers/*`. It shows the connection string and a countdown when an instance is running. The monitor returns `expires_at` as `"YYYY-MM-DD HH:MM:SS"` UTC; the plugin converts it to milliseconds in `_sqlite_to_ms()` before passing it to JavaScript.
 
 ---
 
-## 12. ANSIBLE PLAYBOOK (`assets/nervctf_playbook.yml`)
+## Ansible playbooks
 
-Idempotent. Target group `ctfd`. Key extra vars: `ssh_key`, `ctfd_path`, `monitor_token`,
-`monitor_port`; optional: `monitor_binary`, `plugin_src`, `ctfd_api_key`.
+### `nervctf_preflight_playbook.yml`
 
-Tasks in order:
-1. Install Docker (if `docker --version` fails)
-2. Create `docker` group + user, authorize SSH pubkey
-3. Clone CTFd (if not present), start via `docker compose up --build -d --no-recreate`
-4. Install LXD via snap + `lxd init --auto`
-5. Install Vagrant via HashiCorp apt repo
-6. Add `docker` user to `lxd` and `libvirt` groups
-7. Deploy plugin: rsync `plugin_src/` to `ctfd_path/CTFd/plugins/nervctf_instance/`
-8. Create `/data/challenges` on host (owned by docker user)
-9. Copy remote-monitor binary + write Dockerfile + `docker build -t nervctf-monitor:latest`
-10. Write `docker-compose.override.yml` injecting `remote-monitor` service + CTFd env vars:
-    - `NERVCTF_MONITOR_URL=http://remote-monitor:<port>`
-    - `NERVCTF_MONITOR_TOKEN=<token>`
-11. `docker compose up -d --force-recreate`
+Runs before provisioning with `gather_facts: false` and `become: false`, using the `raw` module so it works without Python on the target. It checks passwordless sudo (`sudo -n true`), `python3`, `rsync`, and `git` (CTFd host only) and stops with a message naming any missing item.
 
-### docker-compose.override.yml (written by playbook)
+### `nervctf_playbook.yml`
+
+Idempotent, target group `ctfd` (and optionally `runner`). Extra vars include `ssh_pubkey`, `ctfd_path`, `monitor_token`, `monitor_port`, and optionally `monitor_binary`, `plugin_src`, `ctfd_domain`, `runner_*`. Tasks in order:
+
+1. Install Docker when `docker --version` fails.
+2. Create the docker group and user and authorise the SSH public key.
+3. Clone CTFd when it is absent and start it with `docker compose up --build -d --no-recreate`.
+4. Install LXD via snap and run `lxd init --auto` (errors ignored).
+5. Install Vagrant from the HashiCorp apt repo (errors ignored).
+6. Add the docker user to the `lxd` and `libvirt` groups (errors ignored).
+7. Deploy the plugin: rsync `plugin_src/` to `<ctfd_path>/CTFd/plugins/nervctf_instance/`.
+8. Create the monitor data directory on the host.
+9. Copy the remote-monitor binary, write its Dockerfile, and run `docker build -t nervctf-monitor:latest`.
+10. Write `docker-compose.override.yml` with the `remote-monitor` service and CTFd environment (`NERVCTF_MONITOR_URL=http://remote-monitor:<port>`, `NERVCTF_MONITOR_TOKEN=<token>`).
+11. Resolve CTFd's published HTTP port, then `docker compose up -d --force-recreate` and wait for the CTFd and monitor health endpoints.
+
+### `docker-compose.override.yml` (written by the playbook)
+
 ```yaml
 services:
   ctfd:
@@ -641,109 +578,83 @@ services:
     environment:
       - CTFD_DB_URL=mysql://ctfd:<db_password>@db/ctfd
       - CTFD_UPLOADS_DIR=<ctfd_path>/.data/CTFd/uploads
-      - CTFD_URL=http://ctfd:8000
       - MONITOR_TOKEN=<token>
-      - PUBLIC_HOST=<ansible_host>
+      - PUBLIC_HOST=<runner_domain | runner_ip | ansible_host>
       - MONITOR_PORT=33133
-      - DB_PATH=/data/monitor.db
-      - CHALLENGES_BASE_DIR=/data/challenges
+      - DB_PATH=<ctfd_path>/remote-monitor/data/monitor.db
+      - CHALLENGES_BASE_DIR=<ctfd_path>/remote-monitor/data/challenges
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock      # single-machine mode only
       - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
-      - remote_monitor_data:/data
-      - /data/challenges:/data/challenges
+      - <ctfd_path>/remote-monitor/data:<ctfd_path>/remote-monitor/data
       - <ctfd_path>/.data/CTFd/uploads:<ctfd_path>/.data/CTFd/uploads
     ports:
       - "33133:33133"
 networks:
   internal: {}
-volumes:
-  remote_monitor_data:
 ```
 
-**Network note**: CTFd's `db` service is on an `internal: true` network. The override
-adds `remote-monitor` to that network so it can reach MariaDB at hostname `db`.
+**Networks.** CTFd's `db` service sits on an `internal: true` network. The override puts `remote-monitor` on that network so it can reach MariaDB at the hostname `db`.
 
-**Critical path constraint**: `/data/challenges` must use identical absolute paths on the host
-and inside the monitor container. Challenge docker-compose.yml files reference files like
-`/data/challenges/my-challenge/certs/server.pem`. The monitor container accesses the same
-path via the bind mount, and the host Docker daemon resolves those paths when the monitor
-instructs it to launch challenge containers (Docker-outside-of-Docker via socket mount).
+**Path constraint.** `CHALLENGES_BASE_DIR` must be the same absolute path on the host and inside the monitor container. Challenge compose files reference files like `<ctfd_path>/<challenge>/certs/server.pem`; the monitor reads the same path through the bind mount, and the host Docker daemon resolves those paths when the monitor tells it to launch challenge containers (Docker outside of Docker over the socket mount).
 
----
+### `nervctf_upgrade_playbook.yml`
 
-## 13. SETUP COMMAND (`setup.rs`)
-
-Interactive wizard:
-1. Prompts: base_dir, target_ip, target_user, ctfd_remote_path (default `/home/docker/CTFd`),
-   monitor_port (default `33133`)
-2. Generates or reuses `monitor_token` (32 hex bytes from `/dev/urandom`)
-3. Lists `~/.ssh/*.pub` keys; offers to generate new keypair
-4. Saves config to `.nervctf.yml` before running playbook
-5. TCP-checks port 80 on target; if already up, confirms redeploy
-6. Locates `remote-monitor` binary (prefers musl targets in target/ tree or next to exe)
-7. Locates `ctfd-plugin` dir (next to exe, or in workspace `src/nervctf/assets/ctfd-plugin/`)
-8. Writes playbook + inventory to tmpdir, runs `ansible-playbook`
-9. If `ansible-playbook` not in PATH: falls back to `nix develop <flake_dir> --command ansible-playbook`
+Syncs the plugin, copies the new monitor binary, rebuilds the image, and restarts the monitor and CTFd. It does not re-provision CTFd or regenerate the token. It warns when the installed CTFd version differs from 3.7.3.
 
 ---
 
-## 14. VALIDATOR (`validator.rs`)
+## Setup command (`setup.rs`)
 
-`validate_challenges(base_dir, fix_mode) → Result<()>`
+`nervctf setup` runs an interactive wizard:
 
-Runs `DirectoryScanner` + lint checks. Reports errors (block deploy) and warnings (advisory).
+1. Check the controller for `ansible-playbook` (respecting `ANSIBLE_PLAYBOOK`), `ssh`, and `rsync`.
+2. Prompt for the challenges directory, monitor IP, SSH user, runner IP and user, CTFd path, monitor port, token, and SSH key.
+3. Reuse an existing `monitor_token` or generate one (32 bytes from `/dev/urandom`).
+4. Store the private key path in `ssh_key_path` and pass the matching public key to the playbook.
+5. Save `.nervctf.yml`.
+6. Locate the remote-monitor binary (musl targets preferred) and the CTFd plugin (on disk or the embedded copy).
+7. Run the preflight playbook, then the main playbook.
 
-Error conditions:
-- Missing required fields: `name`, `category`, `value`, `type`
-- `type: instance` without `instance:` block
-- `type: instance` without `instance.internal_port`
-- `type: instance` without `instance.connection`
-- `type: dynamic` without `extra.initial`
-
-Warning conditions:
-- Unknown YAML keys (captured in `unknown_yaml_keys` by scanner)
-- `type: instance` with `flag_mode: random` but also has static `flags:` list
-- `type: instance, backend: compose` with no `compose_service` set
-- `type: instance, flag_delivery: file` without `flag_file_path`
-- `value: 0` on non-dynamic challenges
-- Missing `state` / `author` / `version` fields
-- Empty `flags` list
-- Duplicate challenge names
-
-`RENDERED` constant: set of field paths that are expected (suppresses unknown-key warnings for known fields like `instance.flag_delivery`, `instance.flag_file_path`, etc.).
+`nervctf setup --upgrade` reads everything from `.nervctf.yml`, confirms, runs the preflight, and runs the upgrade playbook.
 
 ---
 
-## 15. FIX COMMAND (`fix.rs`)
+## Validator (`validator.rs`)
 
-### `run_fix(base_dir, dry_run)`
-Scans all `challenge.yml` for missing `state`, `author`, `version` fields.
-Uses `has_field()` (top-level key detection, column-0 check) and `inject_field()`
-(inject after specific sibling key, with fallback).
+`validate_challenges(challenges) -> ValidationReport` runs per-challenge and cross-challenge checks and returns a report with errors (which block deploy) and warnings.
+
+Error conditions include missing `name`, `category`, `value`, or `type`; `type: instance` without an `instance` block, `internal_ports`, or `connection`; `type: dynamic` without `extra.initial`; duplicate names; files that do not exist; and self-referencing requirements or `next` pointers.
+
+Warning conditions include unknown YAML keys; `flag_mode: random` alongside a static `flags` list; a compose backend with no `compose_service`; `flag_delivery: file` without `flag_file_path`; `value: 0` on non-dynamic challenges; and missing `state`, `author`, or `version`.
+
+The `RENDERED` set lists every known field path so unknown-key warnings fire only for genuinely unrecognised keys.
 
 ---
 
-## 16. DIRECTORY SCANNER (`directory_scanner.rs`)
+## Fix command (`fix.rs`)
 
-`DirectoryScanner::new(base_path)` — scans `base_path/challenges/<category>/<challenge>/challenge.yml`.
+`run_fix(base_dir, dry_run)` scans every `challenge.yml` for missing `state`, `author`, and `version` fields. `has_field()` checks for a top-level key at column 0; `inject_field()` inserts after a chosen sibling key, with a fallback.
 
-Constants:
+---
+
+## Directory scanner (`directory_scanner.rs`)
+
+`DirectoryScanner::new(base_path)` scans `base_path/challenges/<category>/<challenge>/challenge.yml`.
+
 ```rust
 const CHALLENGE_PATTERNS: &[&str] = &["challenge.yml", "challenge.yaml", "challenge.json"];
 const CHALLENGE_EXTENSIONS: &[&str] = &["yml", "yaml", "json"];
 ```
 
-Max depth: 5. Does not follow symlinks.
-
-Uses `serde_yaml::Value` for initial parse to extract unknown keys, then re-parses as `Challenge`.
-`source_path` and `unknown_yaml_keys` are injected after parse (both marked `#[serde(skip)]`).
+Maximum depth is 5, and symlinks are not followed. It parses with `serde_yaml::Value` first to capture unknown keys, then re-parses as `Challenge`, injecting `source_path` and `unknown_yaml_keys` (both `#[serde(skip)]`).
 
 ---
 
-## 17. CHALLENGE YAML FORMAT
+## Challenge YAML
 
-Minimal example:
+Minimal standard challenge:
+
 ```yaml
 name: My Challenge
 category: web
@@ -758,11 +669,12 @@ description: |
   Find the flag hidden in the page source.
 ```
 
-Instance challenge example:
+Instance challenge with random flags:
+
 ```yaml
 name: My Container Challenge
 category: pwn
-value: 0         # 0 for dynamic scoring
+value: 0
 type: instance
 version: '0.3'
 author: Author Name
@@ -774,8 +686,8 @@ extra:
   minimum: 100
 instance:
   backend: docker
-  image: .           # "." = local build from challenge dir; or registry image
-  internal_port: 1337
+  image: .           # "." builds from the challenge directory; or a registry image
+  internal_ports: [1337]
   connection: nc
   flag_mode: random
   flag_prefix: "CTF{"
@@ -785,100 +697,65 @@ instance:
   max_renewals: 3
 ```
 
-Compose backend example:
+Compose backend:
+
 ```yaml
 instance:
   backend: compose
-  compose_file: docker-compose.yml  # relative to challenge dir
-  compose_service: app              # service name that exposes the port
-  internal_port: 8080
+  compose_file: docker-compose.yml  # relative to the challenge directory
+  compose_service: app
+  internal_ports: [8080]
   connection: http
   flag_mode: random
   flag_delivery: env                # default: FLAG env var for ${FLAG} substitution
-  # flag_delivery: file             # alternative: write flag to file in container
+  # flag_delivery: file             # alternative: write the flag to a file in the container
   # flag_file_path: /challenge/flag # required for file delivery
-  # flag_service: flag-receiver     # optional: service receiving flag file (defaults to compose_service)
+  # flag_service: flag-receiver     # optional; defaults to compose_service
   timeout_minutes: 60
 ```
 
 ---
 
-## 18. KEY BUGS FIXED (for historical context)
+## Past bugs, kept for context
 
-1. **Hints `value` vs `cost`**: CTFd API uses `cost`; old code sent `value` → hints had 0 cost
-2. **Flag `data` field optional**: CTFd returns omitted `data`; required field caused parse failures
-3. **Requirements untagged enum**: supports simple list `["name"]`, int list `[1,2]`, and
-   advanced object `{prerequisites: [...], anonymize: bool}`
-4. **FlagData serialization**: must be `snake_case` ("case_insensitive"), not "caseinsensitive"
-5. **CTFd pagination**: `GET /api/v1/challenges` returns 20/page max; must loop via `meta.pagination.next`
-6. **File uploads**: all files must be in one multipart request
-7. **Compose files not reaching server**: CLI must upload tar.gz via `build-compose` endpoint;
-   monitor wipes existing dir before extraction to prevent Docker placeholder directories
-   (Docker creates empty dirs at bind-mount source paths when they don't exist at startup)
-8. **Docker placeholder dirs blocking tar**: if Docker ran before files existed, certs/etc.
-   become root-owned dirs; fixed by `remove_dir_all` before `create_dir_all` in build handler
-9. **Hardcoded `container_name:` in compose files**: prevents multi-team instances; challenge
-   authors must not set `container_name:` in their docker-compose.yml
+1. Hints used `value` instead of `cost`, so hints had zero cost.
+2. The flag `data` field was treated as required, but CTFd omits it, which broke parsing.
+3. The requirements untagged enum now accepts a simple list, an integer list, and the advanced object.
+4. `FlagData` must serialise as `snake_case` (`case_insensitive`).
+5. `GET /api/v1/challenges` returns at most 20 per page; the client loops through `meta.pagination.next`.
+6. All files for a challenge must go in one multipart request.
+7. Compose files reach the server as a tar.gz through `build-compose`; the monitor wipes the directory before extracting so Docker placeholder directories do not block extraction.
+8. Those placeholder directories (created when Docker ran before the files existed) needed `remove_dir_all` before `create_dir_all` in the build handler.
+9. A hardcoded `container_name:` in a compose file prevents multi-team instances; challenge authors must not set it.
 
 ---
 
-## 19. CARGO DEPENDENCIES (notable)
+## Cargo dependencies
 
-### nervctf
-- `clap 4` (derive) — CLI
-- `reqwest 0.11` (blocking, multipart, json, rustls-tls) — HTTP client
-- `tokio 1` (full) — async runtime
-- `serde 1`, `serde_json`, `serde_yaml` — serialisation
-- `anyhow 1` — error handling
-- `walkdir 2` — directory traversal
-- `dialoguer` — interactive prompts (setup/fix)
-- `tempfile 3` — temp dir for Ansible assets
+**nervctf:** `clap 4` (derive), `reqwest 0.11` (multipart, json, rustls-tls), `tokio 1`, `serde`/`serde_json`/`serde_yaml`, `anyhow 1`, `walkdir 2`, `dialoguer`, `tempfile 3`.
 
-### remote-monitor
-- `axum 0.7` (multipart) — HTTP server
-- `reqwest 0.11` — outbound HTTP (CTFd proxy + token validation)
-- `tokio 1` (full) — async runtime
-- `serde 1`, `serde_json` — serialisation
-- `rusqlite 0.31` (bundled) — SQLite
-- `rand 0.8` — random flag generation + port selection
-- `anyhow 1` — error handling
-- `tower-http 0.4` (trace) — request tracing middleware
-- `tracing 0.1`, `tracing-subscriber 0.3` (env-filter) — structured logging
-- `shlex 1` — shell argument quoting
-- `tempfile 3` — temp files for docker build
+**remote-monitor:** `axum 0.7` (multipart), `reqwest 0.11`, `tokio 1`, `serde`/`serde_json`, `rusqlite 0.31` (bundled), `rand 0.8`, `anyhow 1`, `tower-http 0.4` (trace), `tracing`/`tracing-subscriber`, `shlex 1`, `tempfile 3`.
 
 ---
 
-## 20. BUILD & RELEASE
+## Build and release
 
 ```bash
-# Dev build (both crates)
 nix develop .# --command cargo build
-
-# Release build for Linux musl (deployable to server without NixOS interpreter)
 nix develop .# --command cargo build --release --target x86_64-unknown-linux-musl -p remote-monitor
-
-# Run tests
 nix develop .# --command cargo test
-
-# Run tests for one crate
 nix develop .# --command cargo test -p nervctf
 ```
 
-Deployment of remote-monitor:
-1. Build musl release binary
-2. Run `nervctf setup` — playbook copies binary, builds Docker image, starts service
-3. Or manually: `scp target/x86_64-unknown-linux-musl/release/remote-monitor user@host:~`
-   then trigger playbook with `monitor_binary` extra-var
+To deploy the monitor: build the musl release binary, then run `nervctf setup`. The playbook copies the binary, builds the image, and starts the service. Alternatively, copy the binary manually with `scp` and trigger the playbook with the `monitor_binary` extra var.
 
 ---
 
-## 21. KNOWN LIMITATIONS / FUTURE WORK
+## Known limitations
 
-- Vagrant backend is a stub (returns error); `lxc::destroy` not called on cleanup (only `lxc::delete`)
-- Per-team instance cap is global (`MAX_INSTANCES_PER_TEAM` env var), not per-challenge
-- `sync` command asks for confirmation interactively; not scriptable
-- No authentication on player HTML page (`GET /instance/:name`) — token entered client-side
-- Challenge requirements comparison is shallow (presence only, not prerequisite identity)
-- CTFd API key for dynamic scoring challenges: `extra.initial` triggers Dynamic type but
-  CTFd's Dynamic plugin must be installed; base CTFd does not include it by default
+- The Vagrant backend is a stub; `lxc::destroy` is not called during cleanup, only `lxc::delete`.
+- The per-team instance cap is global (`MAX_INSTANCES_PER_TEAM`), not per challenge.
+- `nervctf deploy` asks for confirmation interactively, which makes it awkward to script.
+- The player HTML page at `GET /instance/:name` has no server-side auth; the token is entered in the browser.
+- The requirements comparison is shallow: it checks presence, not prerequisite identity.
+- Dynamic scoring needs CTFd's Dynamic plugin, which stock CTFd does not include.

@@ -1,18 +1,14 @@
-# `challenge_manager` Module Documentation
+# The `challenge_manager` module
 
 ## Overview
 
-The `challenge_manager` module provides the mid-level orchestration layer for CTFd challenge
-operations. It wraps `CtfdClient` to offer a unified API for scanning local files, fetching
-remote state, and performing CRUD operations.
+`challenge_manager` is the mid-level orchestration layer for CTFd challenge operations. It wraps `CtfdClient` to give one API for scanning local files, fetching remote state, and running CRUD operations.
 
-The primary deploy workflow lives in `src/main.rs` (`deploy_challenges()`), which uses
-`CtfdClient` directly for maximum control over the 4-phase deployment order.
-`ChallengeManager` is used for programmatic access and by the `ChallengeSynchronizer`.
+The primary deploy workflow lives in `src/main.rs` (`deploy_challenges()`), which uses `CtfdClient` directly for full control over the four-phase order. `ChallengeManager` is used for programmatic access and by `ChallengeSynchronizer`.
 
 ---
 
-## Module Structure
+## Module structure
 
 ```
 src/challenge_manager/
@@ -27,109 +23,99 @@ src/challenge_manager/
 ### Fields
 
 | Field | Type | Description |
-|-------|------|-------------|
-| `client` | `CtfdClient` | Async API client (targets remote-monitor, which proxies to CTFd MariaDB) |
+|---|---|---|
+| `client` | `CtfdClient` | Async API client (targets the remote monitor, which writes to CTFd's MariaDB) |
 | `base_path` | `PathBuf` | Root directory for local challenge files |
 | `requirements_queue` | `RequirementsQueue` | Dependency tracking for sync order |
 
-### Key Methods
+### Key methods
 
 #### `new(client: CtfdClient, base_path: &Path) -> Self`
 
 #### `scan_local_challenges(&self) -> Result<Vec<Challenge>>`
-Recursively walks `base_path/challenges/` for `challenge.yml` files, parses each, and sets
-`source_path`. Parse failures are printed to stderr and skipped (non-fatal).
+
+Recursively walks `base_path/challenges/` for `challenge.yml` files, parses each, and sets `source_path`. Parse failures are printed to stderr and skipped.
 
 #### `get_all_challenges(&self) -> Result<Option<Vec<Challenge>>>`
+
 Fetches all challenges from CTFd via `GET /api/v1/challenges` (paginated).
 
 #### `create_challenge(&self, data: &Challenge) -> Result<Option<Challenge>>`
-POSTs core fields to CTFd. Returns the created challenge with its `id`. Flags, hints, tags,
-and files are added separately.
+
+POSTs the core fields to CTFd and returns the created challenge with its `id`. Flags, hints, tags, and files are added separately.
 
 #### `update_challenge(&self, id: u32, data: &Challenge) -> Result<Option<Challenge>>`
-Full update: deletes all existing flags/tags/hints/files first, then recreates from config.
-Also patches requirements and state.
+
+Full update: deletes existing flags, tags, hints, and files, then recreates them from the config. It also patches requirements and state.
 
 #### `delete_challenge(&self, id: u32) -> Result<()>`
 
 #### `generate_requirements_list(&mut self, challenges: Vec<Challenge>)`
-Populates `requirements_queue` with dependency info for topological ordering.
+
+Fills `requirements_queue` with dependency information for topological ordering.
 
 #### `synchronizer(&self) -> sync::ChallengeSynchronizer`
 
 ---
 
-## `sync` Submodule
+## The `sync` submodule
 
 ### `needs_update(remote: &Challenge, local: &Challenge) -> bool`
 
-Public free function. Returns `true` if any significant field differs.
+A public free function. Returns `true` when any significant field differs.
 
 **Fields compared:**
 
 | Field | Comparison key | Notes |
-|-------|----------------|-------|
+|---|---|---|
 | `category`, `value`, `description`, `state` | exact | |
 | `connection_info`, `attempts` | exact | |
 | `extra` | JSON-serialized | |
-| `flags` | sorted `(content, type, data)` tuples | type/data changes are detected |
+| `flags` | sorted `(content, type, data)` tuples | detects type and data changes |
 | `tags` | sorted tag value strings | |
-| `hints` | sorted `(content, cost)` tuples | cost changes are detected |
-| `requirements` | sorted prerequisite name/id list | |
+| `hints` | sorted `(content, cost)` tuples | detects cost changes |
+| `requirements` | sorted prerequisite name/ID list | |
 | `instance` | JSON-serialized | |
-| `files` | sorted basenames | triggers if local has files; remote never has this field populated |
-| `topics` | sorted topic strings | triggers if local has topics; remote never has this field populated |
+| `files` | sorted basenames | triggers when local has files; the remote never has this field populated |
+| `topics` | sorted topic strings | triggers when local has topics; the remote never has this field populated |
 
-**Note on files and topics:** CTFd's `/challenges` list endpoint never includes `files` or
-`topics` on the response objects, so `remote.files` and `remote.topics` are always `None`.
-When local has files or topics defined, `needs_update` returns `true` unconditionally so that
-`update_challenge_phase1` runs — `sync_files()` and `replace_topics()` then perform the real
-idempotent diff against the live CTFd API and skip the update if nothing changed.
+**Files and topics.** CTFd's `/challenges` list endpoint never includes `files` or `topics`, so `remote.files` and `remote.topics` are always `None`. When local has files or topics, `needs_update` returns `true` unconditionally so `update_challenge_phase1` runs; `sync_files()` and `replace_topics()` then do the real idempotent diff against the live CTFd API and skip the update when nothing changed.
 
-**Note on flags/hints/tags:** CTFd's list endpoint also never returns these sub-resource
-fields, so flag/hint/tag comparisons only fire when both sides are `Some` (which happens
-in tests and when the deploy loop explicitly populates the remote struct from a detail call).
+**Flags, hints, and tags.** The list endpoint does not return these sub-resources either, so their comparisons fire only when both sides are `Some`, which happens in tests and when the deploy loop populates the remote struct from a detail call.
 
-The `ChallengeSynchronizer::needs_update()` method delegates directly to this free function
-to avoid code duplication. Both the `sync` command and the test suite call the free function.
+`ChallengeSynchronizer::needs_update()` delegates to this free function to avoid duplication. Both the `sync` command and the test suite call the free function.
 
 ---
 
-## Sub-Resource Sync Strategy
+## Sub-resource sync strategy
 
-Sub-resources (flags, hints, tags, topics, files) are synced by `update_challenge_phase1()`
-in `main.rs` after the core challenge PATCH. Each sub-resource has its own replace helper.
+`update_challenge_phase1()` in `main.rs` syncs sub-resources (flags, hints, tags, topics, files) after the core challenge PATCH. Each has its own replace helper.
 
 ### Comparison keys per sub-resource
 
 | Sub-resource | Comparison key | Where compared |
-|--------------|----------------|----------------|
-| flags | sorted `(content, type, data)` tuples | `replace_flags()` + `needs_update()` |
-| hints | sorted `(content, cost)` tuples | `replace_hints()` + `needs_update()` |
-| tags | sorted value strings | `replace_tags()` + `needs_update()` |
-| topics | sorted value strings | `replace_topics()` (idempotent diff) + `needs_update()` |
-| files | sorted basenames | `sync_files()` (idempotent diff) + `needs_update()` |
+|---|---|---|
+| flags | sorted `(content, type, data)` tuples | `replace_flags()` and `needs_update()` |
+| hints | sorted `(content, cost)` tuples | `replace_hints()` and `needs_update()` |
+| tags | sorted value strings | `replace_tags()` and `needs_update()` |
+| topics | sorted value strings | `replace_topics()` (idempotent diff) and `needs_update()` |
+| files | sorted basenames | `sync_files()` (idempotent diff) and `needs_update()` |
 
 ### Which sub-resources trigger `needs_update`
 
-All five sub-resources are checked in `needs_update()`. For flags, hints, tags, and
-requirements the check is symmetric (`if let (Some, Some)`). For files and topics the check
-is asymmetric: any non-empty local list returns `true` because the remote `Challenge` struct
-never has these fields populated from the list endpoint.
+All five are checked. For flags, hints, tags, and requirements the check is symmetric (`if let (Some, Some)`). For files and topics it is asymmetric: any non-empty local list returns `true`, because the remote `Challenge` never has those fields populated from the list endpoint.
 
-### Replace function flow
+### Replace-function flow
 
-`replace_flags`, `replace_hints`, and `replace_tags` each follow the same pattern:
-1. Fetch the current remote sub-resources via a dedicated CTFd endpoint.
+`replace_flags`, `replace_hints`, and `replace_tags` all follow the same pattern:
+
+1. Fetch the current remote sub-resources from a dedicated CTFd endpoint.
 2. Build sorted comparison vectors from both sides using the full comparison key.
-3. If the vectors are equal, return early (no-op).
-4. Otherwise, delete all existing remote sub-resources for this challenge.
+3. Return early when the vectors are equal.
+4. Otherwise delete every existing remote sub-resource for the challenge.
 5. POST the full local set as replacements.
 
-`replace_topics` uses a differential approach (delete extras, add missing) because CTFd's
-topics endpoint does not support bulk delete. `sync_files` deletes all remote files and
-marks the challenge for phase-2 re-upload when the filename sets differ.
+`replace_topics` uses a differential approach (delete extras, add missing), because CTFd's topics endpoint has no bulk delete. `sync_files` deletes all remote files and marks the challenge for phase-2 re-upload when the filename sets differ.
 
 ### `ChallengeSynchronizer`
 
@@ -139,7 +125,7 @@ pub struct ChallengeSynchronizer {
 }
 ```
 
-`sync(&mut self, show_diff: bool)` orchestrates the full compare-and-apply cycle:
+`sync(&mut self, show_diff: bool)` runs the full compare-and-apply cycle:
 
 ```rust
 pub enum SyncAction<'a> {
@@ -152,31 +138,30 @@ pub enum SyncAction<'a> {
 
 Actions are topologically sorted by `RequirementsQueue::resolve_dependencies()` (Kahn's algorithm).
 
-**Note:** The 4-phase deploy in `main.rs` supersedes the synchronizer for the primary workflow.
-The synchronizer is used internally by `deploy` for diff computation.
+The four-phase deploy in `main.rs` supersedes the synchronizer for the primary workflow. The synchronizer is used internally by `deploy` to compute the diff.
 
-### Dependency Resolution (`RequirementsQueue`)
+### Dependency resolution (`RequirementsQueue`)
 
 Kahn's topological sort:
-1. Build `HashMap<name, HashSet<prereq_names>>` from all `Create`/`Update` actions.
-2. Seed ready-queue with nodes that have no dependencies.
-3. Process queue: for each resolved node, remove from others' dep sets, enqueue newly unblocked.
+
+1. Build `HashMap<name, HashSet<prereq_names>>` from all `Create` and `Update` actions.
+2. Seed the ready queue with nodes that have no dependencies.
+3. Process the queue: for each resolved node, remove it from the other nodes' dependency sets and enqueue anything newly unblocked.
 4. Append `UpToDate` and `RemoteOnly` actions at the end.
 
-Circular dependencies cause the sort to silently drop involved challenges. Use `nervctf validate` first.
+Circular dependencies make the sort drop the challenges involved, silently. Run `nervctf validate` first.
 
 ---
 
-## `utils` Submodule (inline)
+## The inline `utils` submodule
 
 ### `validate_challenge_config(config: &Challenge) -> Result<()>`
 
-Lightweight legacy check: `name`, `category`, `value` non-empty/non-zero, at least one flag.
-Predates the full `validator` module; prefer `validator::validate_challenges()` for comprehensive checks.
+A lightweight legacy check: `name`, `category`, and `value` non-empty and non-zero, plus at least one flag. It predates the full `validator` module; prefer `validator::validate_challenges()`.
 
 ---
 
-## Deploy Workflow
+## Deploy workflow
 
 ```
 1. scan_directory()           — find all challenge.yml files
@@ -189,37 +174,39 @@ Predates the full `validator` module; prefer `validator::validate_challenges()` 
 ── Phase 2 ──────────────────────────────────────────────────────────────
 7. POST /files                — all files per challenge in one batched multipart request
 ── Phase 3 ──────────────────────────────────────────────────────────────
-8. PATCH /challenges/{id}     — set requirements (names → IDs resolved)
+8. PATCH /challenges/{id}     — set requirements (names resolved to IDs)
 ── Phase 4 ──────────────────────────────────────────────────────────────
-9. PATCH /challenges/{id}     — set next_id (names → IDs resolved)
+9. PATCH /challenges/{id}     — set next_id (names resolved to IDs)
 ── Instance ─────────────────────────────────────────────────────────────
 10. POST /instance/build[-compose]  — upload build context to monitor
 11. POST /instance/register         — register config on monitor
 ```
 
-Phases 3 and 4 run after all challenges exist so forward-references always resolve.
+Phases 3 and 4 run after every challenge exists, so forward references always resolve.
 
 ---
 
-## Error Handling
+## Error handling
 
-- `Result<Option<T>>` distinguishes "not found" (`Ok(None)`) from API/IO errors (`Err`).
-- Single broken YAML does not abort the full scan (logged to stderr, skipped).
-- Partial updates are safe to retry — `needs_update()` detects incomplete state on next deploy.
+- `Result<Option<T>>` separates "not found" (`Ok(None)`) from API and IO errors (`Err`).
+- A single broken YAML file does not abort the scan; it is logged to stderr and skipped.
+- Partial updates are safe to retry. `needs_update()` detects the incomplete state on the next deploy.
 
 ---
 
 ## Extending
 
 **New challenge fields:**
-1. Add to `Challenge` in `models/mod.rs`.
-2. Include in payload in `create_challenge_phase1()` / `update_challenge_phase1()` in `main.rs`.
-3. Add comparison in `needs_update()` in `sync.rs`.
-4. Optionally add validation in `validator.rs`.
+
+1. Add the field to `Challenge` in `models/mod.rs`.
+2. Include it in the payload in `create_challenge_phase1()` and `update_challenge_phase1()` in `main.rs`.
+3. Add it to the comparison in `needs_update()` in `sync.rs`.
+4. Optionally add a validation rule in `validator.rs`.
 
 **New challenge types:**
-1. Extend `ChallengeType` enum in `models/mod.rs`.
-2. Handle type-specific payload differences in `create_challenge_phase1()`.
+
+1. Extend the `ChallengeType` enum in `models/mod.rs`.
+2. Handle the type-specific payload differences in `create_challenge_phase1()`.
 
 ---
 
@@ -228,5 +215,5 @@ Phases 3 and 4 run after all challenges exist so forward-references always resol
 - `src/nervctf/src/challenge_manager/mod.rs`
 - `src/nervctf/src/challenge_manager/sync.rs`
 - `src/nervctf/src/main.rs` — primary deploy orchestration
-- [CTFd API Documentation](https://docs.ctfd.io/docs/api/redoc/)
+- [CTFd API documentation](https://docs.ctfd.io/docs/api/redoc/)
 - [Kahn's algorithm](https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm)

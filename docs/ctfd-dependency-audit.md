@@ -1,190 +1,194 @@
-# NervCTF — CTFd Dependency Audit
+# CTFd dependency audit
 
-> Covers all NervCTF operations against CTFd.
+This audit covers every NervCTF operation that reaches CTFd.
 
 ---
 
-## Architecture Summary
+## Architecture summary
 
-NervCTF touches CTFd through three distinct layers:
+NervCTF touches CTFd through three layers:
 
 | Layer | Who | How | Bypasses CTFd logic? |
 |---|---|---|---|
-| Direct MariaDB SQL | `remote-monitor` | mysql_async | **Yes** — all challenge/flag/hint/tag/topic CRUD goes directly to the DB |
-| Out-of-band filesystem | `remote-monitor` + Ansible | `std::fs::write`, rsync | **Yes** — uploads written directly; plugin files rsynced |
-| CTFd Python plugin | `nervctf_instance` plugin | In-process Flask routes, SQLAlchemy ORM | No — runs inside CTFd |
+| Direct MariaDB SQL | `remote-monitor` | mysql_async | Yes — all challenge, flag, hint, tag, and topic CRUD goes straight to the database |
+| Out-of-band filesystem | `remote-monitor` and Ansible | `std::fs::write`, rsync | Yes — uploads are written directly and plugin files are rsynced |
+| CTFd Python plugin | `nervctf_instance` | In-process Flask routes, SQLAlchemy ORM | No — it runs inside CTFd |
 
-The CLI (`nervctf`) never calls CTFd's HTTP API directly. All CLI operations go to the remote-monitor's REST facade (`/api/v1/...`), which translates them to direct MariaDB SQL.
+The CLI never calls CTFd's HTTP API directly. Every CLI operation goes to the monitor's REST facade (`/api/v1/...`), which translates it into MariaDB SQL.
 
 ---
 
-## 1. Complete MariaDB Table / Operation Matrix
+## 1. MariaDB table and operation matrix
 
-### Tables Always Accessed (no detection guard)
+### Tables always accessed
 
-| Table | Operations | Key Columns | Notes |
+| Table | Operations | Columns | Notes |
 |---|---|---|---|
-| `challenges` | SELECT, INSERT, UPDATE, DELETE | `id, name, description, category, value, type, state, max_attempts, connection_info, requirements, next_id` | Primary CRUD table |
-| `flags` | SELECT, INSERT, DELETE | `id, challenge_id, type, content, data` | `type` hardcoded `'static'` on insert |
-| `hints` | SELECT, INSERT, DELETE | `id, challenge_id, content, cost, type` | `type` hardcoded `'standard'` on insert |
-| `tags` | SELECT, INSERT, DELETE | `id, challenge_id, value` | Full-replace strategy on update |
-| `files` | SELECT, INSERT, DELETE | `id, challenge_id, type, location` | `type` hardcoded `'challenge'`; file written to disk separately |
-| `topics` | SELECT, INSERT IGNORE | `id, value` | Canonical topic row |
+| `challenges` | SELECT, INSERT, UPDATE, DELETE | `id, name, description, category, value, type, state, max_attempts, connection_info, requirements, next_id` | Main CRUD table |
+| `flags` | SELECT, INSERT, DELETE | `id, challenge_id, type, content, data` | `type` is hardcoded `'static'` on insert |
+| `hints` | SELECT, INSERT, DELETE | `id, challenge_id, content, cost, type` | `type` is hardcoded `'standard'` on insert |
+| `tags` | SELECT, INSERT, DELETE | `id, challenge_id, value` | Full-replace on update |
+| `files` | SELECT, INSERT, DELETE | `id, challenge_id, type, location` | `type` is hardcoded `'challenge'`; the file is written to disk separately |
+| `topics` | SELECT, INSERT IGNORE | `id, value` | Canonical topic rows |
 | `challenge_topics` | SELECT, INSERT IGNORE, DELETE | `challenge_id, topic_id` | Junction table |
-| `users` | SELECT | `token, banned, hidden, team_id, id, name` | Token auth + user name cache |
+| `users` | SELECT | `token, banned, hidden, team_id, id, name` | Token auth and name cache |
 | `teams` | SELECT | `id, name` | Team name cache |
-| `submissions` | SELECT (read-only) | `team_id, user_id, challenge_id, date, type` | Solve sync; only `type='correct'` rows read |
+| `submissions` | SELECT (read-only) | `team_id, user_id, challenge_id, date, type` | Solve sync; only `type='correct'` rows are read |
 
-### Tables Conditionally Accessed (schema-detected at runtime)
+### Tables accessed conditionally (schema-detected at runtime)
 
-| Table | Detection query | Columns used | Condition |
+| Table or column | Detection | Used columns | Condition |
 |---|---|---|---|
-| `challenges.attribution` | `information_schema.COLUMNS` | `attribution` | UPDATE SET, SELECT — added CTFd 3.7.0 |
-| `challenges.logic` | `information_schema.COLUMNS` | `logic` | INSERT, UPDATE SET — added CTFd 3.7.x |
-| `challenges.position` | `information_schema.COLUMNS` | `position` | SELECT only (value discarded in code) |
-| `challenges.initial/minimum/decay/function` | `information_schema.COLUMNS` (presence of `initial`) | All four inline | Newer CTFd moved scoring inline |
-| `dynamic_challenge` | `information_schema.COLUMNS` (table empty = absent) | `id` ± scoring cols | Older CTFd join table; stub-or-full insert |
-| `nervctf_instance_challenge` | `information_schema.tables` | 19 columns | NervCTF plugin table; LEFT JOIN when absent |
+| `challenges.attribution` | `information_schema.COLUMNS` | `attribution` | UPDATE SET and SELECT; added in CTFd 3.7.0 |
+| `challenges.logic` | `information_schema.COLUMNS` | `logic` | INSERT and UPDATE SET; added in CTFd 3.7.x |
+| `challenges.position` | `information_schema.COLUMNS` | `position` | SELECT only; the value is discarded |
+| `challenges.initial/minimum/decay/function` | `information_schema.COLUMNS` (all four) | inline scoring | Newer CTFd moved scoring inline |
+| `dynamic_challenge` | `information_schema.COLUMNS` | `id` plus optional scoring columns | Older CTFd join table; stub-or-full insert |
+| `nervctf_instance_challenge` | `information_schema.tables` | 19 columns | Plugin table; LEFT JOIN when absent |
 
-### Two schema-detection probes run on every mutating call:
+Two schema probes run on every mutating call:
 
 ```sql
--- Probe 1: challenges columns
 SELECT COLUMN_NAME FROM information_schema.COLUMNS
-WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'challenges'
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'challenges';
 
--- Probe 2: dynamic_challenge columns
 SELECT COLUMN_NAME FROM information_schema.COLUMNS
-WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dynamic_challenge'
+WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'dynamic_challenge';
 ```
 
 ---
 
-## 2. Hardcoded Discriminator / Polymorphic Strings
+## 2. Hardcoded polymorphic strings
 
 | String | Column | Table | Purpose |
 |---|---|---|---|
-| `'static'` | `type` | `flags` | All flags inserted by monitor are static |
-| `'standard'` | `type` | `hints` | All hints inserted by monitor are standard |
-| `'challenge'` | `type` | `files` | All file records inserted by monitor |
-| `'correct'` | `type` | `submissions` | Solve sync filter |
-| `'standard'` | `type` | `challenges` | Default challenge type / fallback |
-| `'dynamic'` | `type` | `challenges` | Gates `dynamic_challenge` insert |
-| `'instance'` | `type` | `challenges` | Gates `nervctf_instance_challenge` upsert |
+| `'static'` | `type` | `flags` | Every flag the monitor inserts is static |
+| `'standard'` | `type` | `hints` | Every hint the monitor inserts is standard |
+| `'challenge'` | `type` | `files` | Every file record the monitor inserts |
+| `'correct'` | `type` | `submissions` | Solve-sync filter |
+| `'standard'` | `type` | `challenges` | Default challenge type and fallback |
+| `'dynamic'` | `type` | `challenges` | Gates the `dynamic_challenge` insert |
+| `'instance'` | `type` | `challenges` | Gates the `nervctf_instance_challenge` upsert |
 | `'linear'` | `function` | `dynamic_challenge` / `challenges` | Default decay function |
 
 ---
 
-## 3. HTTP API Endpoints (CLI → remote-monitor facade)
+## 3. HTTP endpoints (CLI to monitor facade)
 
-The CLI talks to the remote-monitor which translates to SQL. The remote-monitor's facade mirrors CTFd's API path structure:
+The monitor's facade mirrors CTFd's API path structure:
 
 | Endpoint | Method | Purpose |
 |---|---|---|
-| `/api/v1/challenges` | GET (paginated `?page=N`), POST | List / create challenges |
-| `/api/v1/challenges/{id}` | PATCH, DELETE | Update / delete |
-| `/api/v1/flags` | GET (`?challenge_id=N`), POST | List / create flags |
-| `/api/v1/flags/{id}` | DELETE | Delete flag |
-| `/api/v1/hints` | GET, POST | List / create hints |
-| `/api/v1/hints/{id}` | DELETE | Delete hint |
-| `/api/v1/tags` | GET, POST | List / create tags |
-| `/api/v1/tags/{id}` | DELETE | Delete tag |
-| `/api/v1/files` | GET (`?challenge_id=N`), POST (multipart) | List / upload files |
-| `/api/v1/files/{id}` | DELETE | Delete file |
-| `/api/v1/topics` | GET, POST | List / create topics |
-| `/api/v1/topics/{id}` | DELETE | Delete topic |
-| `/api/v1/instance/register` | POST | Register instance challenge config to SQLite |
+| `/api/v1/challenges` | GET (paginated `?page=N`), POST | List or create challenges |
+| `/api/v1/challenges/{id}` | PATCH, DELETE | Update or delete |
+| `/api/v1/flags` | GET (`?challenge_id=N`), POST | List or create flags |
+| `/api/v1/flags/{id}` | DELETE | Delete a flag |
+| `/api/v1/hints` | GET, POST | List or create hints |
+| `/api/v1/hints/{id}` | DELETE | Delete a hint |
+| `/api/v1/tags` | GET, POST | List or create tags |
+| `/api/v1/tags/{id}` | DELETE | Delete a tag |
+| `/api/v1/files` | GET (`?challenge_id=N`), POST (multipart) | List or upload files |
+| `/api/v1/files/{id}` | DELETE | Delete a file |
+| `/api/v1/topics` | GET, POST | List or create topics |
+| `/api/v1/topics/{id}` | DELETE | Delete a topic |
+| `/api/v1/instance/register` | POST | Register an instance config to SQLite |
 | `/api/v1/instance/request` | POST | Provision a container |
 | `/api/v1/instance/info` | GET | Get running instance info |
-| `/api/v1/instance/renew` | POST | Extend instance TTL |
-| `/api/v1/instance/stop` | POST | Stop container |
-| `/api/v1/plugin/*` | POST | CTFd-plugin-facing routes (same as instance/* but uses plugin token + CTFd-validated team_id) |
+| `/api/v1/instance/renew` | POST | Extend the instance TTL |
+| `/api/v1/instance/stop` | POST | Stop a container |
+| `/api/v1/plugin/*` | POST | Plugin-facing routes; same as `instance/*` but with the plugin token and a CTFd-validated `team_id` |
 
-**Key gap:** No pagination is implemented for sub-resources (flags, hints, tags, files, topics). All sub-resource list calls use `?challenge_id=N` without paging — this works only because CTFd's default page size is large enough for typical challenge data.
+**Gap:** sub-resources (flags, hints, tags, files, topics) are not paginated. Their list calls use `?challenge_id=N` with no paging, which works only because CTFd's default page size is large enough for typical challenge data.
 
-**Response parsing:** Only the `data` key is extracted from responses. The `errors` envelope key is never parsed. The `success` boolean field is never checked.
+**Response parsing:** only the `data` key is extracted. The `errors` key is never parsed and the `success` boolean is never checked.
 
 ---
 
-## 4. Authentication Flows
+## 4. Authentication flows
 
-### 4a. CLI → remote-monitor
+### CLI to monitor
+
 ```
 Authorization: Token <MONITOR_TOKEN (plaintext)>
 → SHA-256 hashed and compared against operator_tokens.token_hash (SQLite)
 ```
-Header format: `Token xxx` (NOT `Bearer xxx` — monitor explicitly rejects Bearer scheme).
 
-### 4b. CTFd plugin → remote-monitor
+The header format is `Token xxx`, not `Bearer xxx`; the monitor rejects the Bearer scheme.
+
+### CTFd plugin to monitor
+
 ```
 Authorization: Token <NERVCTF_MONITOR_TOKEN (env var)>
 Body: {challenge_name, team_id, user_id}
 ```
-The `team_id` and `user_id` in the body come from CTFd's `get_current_team()` / `get_current_user()` — they are trusted by the monitor without re-validation. Only the monitor token itself is checked.
 
-### 4c. Player browser → remote-monitor (direct path, `/instance/:name`)
+`team_id` and `user_id` come from CTFd's `get_current_team()` and `get_current_user()` and are trusted without re-validation. Only the monitor token is checked.
+
+### Player browser to monitor (`/instance/:name`)
+
 ```
 Authorization: Token <CTFd user API token (plaintext)>
 → SELECT team_id FROM users WHERE token = ? AND banned = 0 AND hidden = 0
 ```
-The CTFd `users.token` column stores plaintext API tokens. Comparison is plaintext-to-plaintext. No expiry. Token belongs to the **users table's `token` column**, not CTFd's `tokens` application-token table.
+
+CTFd's `users.token` column holds plaintext API tokens and the comparison is plaintext-to-plaintext with no expiry. This is the `users` table's `token` column, not CTFd's `tokens` application-token table.
 
 ---
 
-## 5. Plugin Internal API Surface (CTFd Python)
+## 5. Plugin internal API surface
 
-| Import / Call | Stability Risk |
+| Import or call | Stability risk |
 |---|---|
 | `from CTFd.models import ChallengeFiles, Challenges, Fails, Flags, Hints, Solves, Tags, db` | Low — stable since CTFd 3.x |
-| `from CTFd.plugins.challenges import CHALLENGE_CLASSES, BaseChallenge` | **Medium-High** — `BaseChallenge` method signatures have changed between minor versions |
+| `from CTFd.plugins.challenges import CHALLENGE_CLASSES, BaseChallenge` | Medium-high — `BaseChallenge` method signatures changed between minor versions |
 | `from CTFd.utils.user import get_current_team, get_current_user` | Low |
 | `from CTFd.utils.decorators import authed_only` | Low |
-| `BaseChallenge.attempt(challenge, request)` return type | **HIGH** — returns `(bool, str)` tuple in CTFd ≤3.3, `ChallengeResponse` object in ≥3.4. Dual-path code catches `TypeError` but `ChallengeResponse` is subscriptable — the fallback `getattr(result, "success", False)` may never trigger, silently misreporting correct submissions |
+| `BaseChallenge.attempt(challenge, request)` return type | High — `(bool, str)` in CTFd ≤3.3, `ChallengeResponse` object in ≥3.4. The dual-path code catches `TypeError`, but `ChallengeResponse` is subscriptable, so the `getattr(result, "success", False)` fallback may never fire and a correct submission can be misreported |
 | `BaseChallenge.solve(user, team, challenge, request)` | Medium — 4-arg form assumed |
 | `BaseChallenge.fail(user, team, challenge, request)` | Medium |
-| `db.create_all()` in `load()` | Low-Medium — additive only; column additions to `nervctf_instance_challenge` on upgrade skip automatically |
+| `db.create_all()` in `load()` | Low-medium — additive only; column additions to `nervctf_instance_challenge` are skipped on upgrade |
 
 ---
 
-## 6. Challenge Lifecycle
+## 6. Challenge lifecycle
 
-### Deploy Phases (in order)
+### Deploy phases (in order)
 
 | Phase | Action | Why this order |
 |---|---|---|
-| 1 — cores | POST/PATCH challenge row + flags/tags/topics/hints | Challenges must exist before files or cross-references |
-| 2 — file upload | POST multipart to `/files` | Challenge ID required; separated from phase 1 for error isolation |
-| 3 — requirements | Re-fetch all IDs, PATCH `requirements.prerequisites` (array of integer IDs) | Prerequisite IDs only known after all phase 1 creates complete |
+| 1 — cores | POST or PATCH the challenge row, then flags, tags, topics, hints | Challenges must exist before files or cross-references |
+| 2 — file upload | POST multipart to `/files` | Needs the challenge ID; separated from phase 1 for error isolation |
+| 3 — requirements | Re-fetch all IDs, PATCH `requirements.prerequisites` (array of integer IDs) | Prerequisite IDs are known only after phase 1 completes |
 | 4 — next pointers | PATCH `next_id` | Same reason as phase 3 |
-| 5 — prune (optional, `--prune`) | DELETE orphaned remote challenges | Done last to avoid breaking requirements of live challenges |
+| 5 — prune (optional, `--prune`) | DELETE orphaned remote challenges | Done last, so it cannot break the requirements of live challenges |
 
-### `needs_update` Comparison Field List
+### `needs_update` comparison fields
 
-Fields compared: `category`, `value` (skipped for dynamic), `description`, `state`, `connection_info`, `attempts`, `extra` (JSON value), `flags` (sorted `(content, type, data)` tuples), `tags` (sorted strings), `hints` (sorted `(content, cost)` tuples), `requirements` (sorted names).
+Compared: `category`, `value` (skipped for dynamic), `description`, `state`, `connection_info`, `attempts`, `extra` (JSON), `flags` (sorted `(content, type, data)` tuples), `tags` (sorted strings), `hints` (sorted `(content, cost)` tuples), `requirements` (sorted names).
 
-Fields NOT compared (never trigger update): `name` (identity key), `files`, `topics`, `next`, `author`, `image`, `protocol`, `host`, `healthcheck`, `version`.
+Not compared, so they never trigger an update on their own: `name` (identity), `files`, `topics`, `next`, `author`, `image`, `protocol`, `host`, `healthcheck`, `version`.
 
-**Critical gap:** A challenge where only `files` or `topics` changed is never detected as needing an update unless `--recreate` is forced.
+**Gap:** a challenge where only `files` or `topics` changed is not detected as needing an update unless `--recreate` is used.
 
-### Sub-Resource Sync Strategy
+### Sub-resource sync strategy
 
 | Sub-resource | Strategy | Comparison key |
 |---|---|---|
-| Flags | Full replace (delete all → insert all) | `content` in `replace_flags`; `(content, type, data)` in `needs_update` — **inconsistency**: flag type changes pass `needs_update` but are silently dropped by `replace_flags` |
+| Flags | Full replace (delete all, insert all) | `content` in `replace_flags`; `(content, type, data)` in `needs_update`. Inconsistent: a flag type change passes `needs_update` but is dropped by `replace_flags` |
 | Tags | Full replace | `value` string |
-| Hints | Full replace | `content` string only — cost changes pass `needs_update` but are dropped by `replace_hints` |
+| Hints | Full replace | `content` only. A cost change passes `needs_update` but is dropped by `replace_hints` |
 | Topics | True diff (delete extras, add missing) | `value` string |
-| Files | Delete all, re-upload in phase 2 | filename (last URL segment) |
+| Files | Delete all, re-upload in phase 2 | Filename (last URL segment) |
 
-### Type Change Handling
+### Type changes
 
-Type changes (e.g., `standard` → `dynamic`) trigger **delete + recreate** rather than PATCH. Reason: CTFd's PATCH endpoint updates `challenges.type` but does not create the required joined-table row (`dynamic_challenge`/`nervctf_instance_challenge`), causing CTFd 500 on next access. The delete+recreate loses the challenge's numeric ID, breaking any hard-coded numeric prerequisite references.
+A type change (for example `standard` to `dynamic`) triggers delete and recreate rather than PATCH. CTFd's PATCH endpoint updates `challenges.type` but does not create the required joined-table row (`dynamic_challenge` or `nervctf_instance_challenge`), which causes a 500 on the next access. The delete and recreate loses the challenge's numeric ID, breaking any hardcoded numeric prerequisite references.
 
 ---
 
-## 7. Instance Challenge Lifecycle
+## 7. Instance challenge lifecycle
 
-### State Machine
+### State machine
 
 ```
 NONEXISTENT
@@ -192,16 +196,16 @@ NONEXISTENT
     ▼ POST /api/v1/plugin/request or /instance/request
 PROVISIONING ← insert_provisioning_stub() (status='provisioning', port=0)
     │
-    ▼ Background Tokio task (under semaphore):
+    ▼ Background Tokio task (under the semaphore):
     │  1. Read config from SQLite instance_configs
-    │  2. Allocate port from get_used_ports()
+    │  2. Allocate a port from get_used_ports()
     │  3. docker/compose/lxc up
     │  4. [if flag_mode=random] ctfd_db::create_flag() → INSERT INTO flags
     │  5. db::insert_instance() → UPDATE instances: status='running'
     │
 RUNNING
     │
-    ├─[renew]─────────────────────────── extends expires_at (no CTFd DB ops)
+    ├─[renew]─────────────────────────── extends expires_at (no CTFd DB writes)
     │
     ├─[explicit stop / expiry]──────────┐
     │                                   ▼
@@ -217,73 +221,73 @@ RUNNING
     │
 SOLVED
     │
-    ├─[solve deleted in CTFd]─────────── revert_unsolved_instances() → back to RUNNING
+    ├─[solve deleted in CTFd]─────────── revert_unsolved_instances() → RUNNING
     │
-[PROVISIONING stuck >30min] → expiry task deletes it (same as stop)
+[PROVISIONING stuck >30 min] → expiry task deletes it (same as stop)
 [Orphan compose project] → compose::down()
-[Container externally killed] → db::delete_instance() + delete_flag()
+[Container killed externally] → db::delete_instance() + delete_flag()
 ```
 
-### CTFd Tables Touched During Game Play (not CRUD)
+### CTFd tables touched during gameplay
 
 | Table | Operation | Trigger |
 |---|---|---|
 | `flags` | INSERT `(challenge_id, 'static', content, '')` | Provision with `flag_mode=random` |
-| `flags` | DELETE `WHERE id = ?` | Stop / expiry / solve / orphan / health |
-| `submissions` | SELECT (read-only, sync) | Background sync every N seconds |
-| `challenges` | SELECT (via join in sync) | Background sync |
+| `flags` | DELETE `WHERE id = ?` | Stop, expiry, solve, orphan, or health |
+| `submissions` | SELECT (read-only) | Background sync every N seconds |
+| `challenges` | SELECT (joined in sync) | Background sync |
 | `users` | SELECT `team_id WHERE token = ?` | Every player request (auth) |
 | `users` | SELECT `id, name, team_id` | Background sync (name cache) |
 | `teams` | SELECT `id, name` | Background sync (name cache) |
 
-### Background Tasks
+### Background tasks
 
 | Task | Interval | CTFd tables | Purpose |
 |---|---|---|---|
-| `sync_solves` | `CTFD_DB_SYNC_INTERVAL` (default 30s) | `submissions` (R), `challenges` (R) | Full-replace ctfd_solves SQLite cache; triggers revert + stale-attempt cleanup |
-| `sync_users_and_teams` | Same | `teams` (R), `users` (R) | Full-replace team/user name caches |
-| Expiry + orphan + health | 30s hardcoded | `flags` (W: DELETE) | Expire instances, kill orphan compose projects, clean dead containers |
+| `sync_solves` | `CTFD_DB_SYNC_INTERVAL` (default 30 s) | `submissions` (R), `challenges` (R) | Full-replace the `ctfd_solves` cache; triggers revert and stale-attempt cleanup |
+| `sync_users_and_teams` | Same | `teams` (R), `users` (R) | Full-replace the team and user name caches |
+| Expiry, orphan, health | 30 s | `flags` (W: DELETE) | Expire instances, kill orphan compose projects, clean dead containers |
 
 ---
 
-## 8. Out-of-Band CTFd Filesystem Writes
+## 8. Out-of-band filesystem writes
 
 | Write | Mechanism | Path | Trigger |
 |---|---|---|---|
-| Plugin files | Ansible `synchronize` (rsync, `delete: yes`) | `<ctfd_path>/CTFd/plugins/nervctf_instance/` | `nervctf setup` / `nervctf upgrade` |
-| Docker Compose override | Ansible `copy` (generated YAML) | `<ctfd_path>/docker-compose.override.yml` | `nervctf setup` |
-| Remote-monitor binary | Ansible `copy` | `<ctfd_path>/remote-monitor/remote-monitor` | `nervctf setup` / `nervctf upgrade` |
-| Challenge files (upload) | Monitor `std::fs::write` | `<CTFD_UPLOADS_DIR>/<random-32-hex>/<filename>` | `POST /api/v1/files` (CLI deploy) |
+| Plugin files | Ansible `synchronize` (rsync, `delete: yes`) | `<ctfd_path>/CTFd/plugins/nervctf_instance/` | `nervctf setup` / `setup --upgrade` |
+| Docker Compose override | Ansible `copy` | `<ctfd_path>/docker-compose.override.yml` | `nervctf setup` |
+| Remote-monitor binary | Ansible `copy` | `<ctfd_path>/remote-monitor/remote-monitor` | `nervctf setup` / `setup --upgrade` |
+| Challenge files | Monitor `std::fs::write` | `<CTFD_UPLOADS_DIR>/<random-32-hex>/<filename>` | `POST /api/v1/files` |
 | Per-instance compose override | Monitor SSH `cat >` or `std::fs::write` | `<challenges_dir>/<challenge>/<project>.override.yml` | Instance provision |
-| Per-instance flag file | Monitor SSH `cat >` or `std::fs::write` | `<challenges_dir>/<challenge>/<project>.flag` | Instance provision (file delivery mode) |
+| Per-instance flag file | Monitor SSH `cat >` or `std::fs::write` | `<challenges_dir>/<challenge>/<project>.flag` | Instance provision (file delivery) |
 
-**CTFd upload bypass:** When `CTFD_UPLOADS_DIR` is set, the monitor writes challenge files directly to disk and inserts the DB record manually. CTFd's nginx serves files directly from this directory. No cache invalidation is performed after writes. If the DB insert fails after a successful disk write, the file is orphaned on disk.
+**Upload bypass.** With `CTFD_UPLOADS_DIR` set, the monitor writes challenge files to disk and inserts the DB record by hand. CTFd's nginx serves them from that directory. No cache invalidation happens after a write, and a failed DB insert after a successful disk write leaves an orphaned file.
 
-**No Redis interaction:** NervCTF never touches CTFd's Redis cache. All direct MariaDB writes bypass cache invalidation, meaning stale data may be served until the Redis TTL expires or CTFd restarts.
+**No Redis interaction.** NervCTF never touches CTFd's Redis cache, so direct MariaDB writes can serve stale data until the TTL expires or CTFd restarts.
 
 ---
 
-## 9. Configuration Surface
+## 9. Configuration surface
 
-### Key `.nervctf.yml` Fields and How They Flow
+### `.nervctf.yml` fields and how they flow
 
 | Field | Used by | Wired to |
 |---|---|---|
-| `monitor_ip` | CLI | Base URL for all API calls |
+| `monitor_ip` | CLI | Base URL for API calls |
 | `monitor_port` | CLI | Base URL |
 | `monitor_token` | CLI | `Authorization: Token` header |
-| `ssh_key_path` | CLI | `-i <key>` in SSH mkdir + rsync commands to runner |
-| `runner_ip` / `runner_user` | CLI | `RunnerTarget.ssh_target` for SSH/rsync |
-| `ctfd_path` | Ansible | Plugin install path, `.env` location, compose override |
-| `monitor_ctfd_path` | Ansible | Bind-mount for uploads dir |
+| `ssh_key_path` | CLI | `-i <key>` in SSH mkdir and rsync commands to the runner |
+| `runner_ip` / `runner_user` | CLI | `RunnerTarget.ssh_target` for SSH and rsync |
+| `monitor_ctfd_path` | Ansible | Plugin install path, `.env` location, compose override |
+| `ctfd_domain` / `runner_domain` | Monitor | Dashboard links and player-facing host |
 
-### Env Vars Read by Remote-Monitor at Startup
+### Environment variables read by the monitor at startup
 
-| Env var | Required? | Default |
+| Variable | Required | Default |
 |---|---|---|
-| `CTFD_DB_URL` | **Required** | none |
+| `CTFD_DB_URL` | Yes | none |
 | `MONITOR_TOKEN` | Optional | none |
-| `PUBLIC_HOST` | **Required** | none |
+| `PUBLIC_HOST` | Yes | none |
 | `MONITOR_PORT` | Optional | `33133` |
 | `DB_PATH` | Optional | `./monitor.db` |
 | `CHALLENGES_BASE_DIR` | Optional | `/opt/nervctf/challenges` |
@@ -293,71 +297,75 @@ SOLVED
 | `MAX_INSTANCES_PER_TEAM` | Optional | `0` (unlimited) |
 | `CTFD_DB_SYNC_INTERVAL` | Optional | `30` |
 
-**MariaDB credential sharing:** The Ansible playbook reads CTFd's `.env` file, strips the `+pymysql` driver qualifier from `DATABASE_URL`, and injects it as `CTFD_DB_URL` for the monitor. The monitor uses the same database user/password as CTFd with full read/write access.
+**MariaDB credential sharing.** The playbook reads CTFd's `.env`, strips the `+pymysql` qualifier from `DATABASE_URL`, and injects it as `CTFD_DB_URL`. The monitor uses the same database user and password as CTFd, with full read and write access.
 
 ---
 
-## 10. Version Compatibility Matrix
+## 10. Version compatibility matrix
 
-| Feature | Detection? | Risk level | Notes |
+| Feature | Detected? | Risk | Notes |
 |---|---|---|---|
-| CTFd version pin | Static git tag only | **High** | `3.7.3` pin only on first setup; upgrade playbook has no version guard |
-| `challenges.attribution` | Yes — info_schema | Low | Added 3.7.0; gracefully absent |
-| `challenges.logic` | Yes — info_schema | Low | Default insert is `""` not NULL |
-| `challenges.position` | Yes — info_schema | Low | Read but discarded |
-| `challenges.initial/minimum/decay/function` (inline) | Yes — single-column proxy for `initial` | **High** | Other 3 columns not verified; partial migration causes silent NULL reads |
-| `challenges.next_id` | **No** | Medium | Assumed always present; absent on CTFd <3.5.x breaks all CRUD |
-| `dynamic_challenge` table | Yes — column count | Medium | Correct for MariaDB |
-| `dynamic_challenge.function` column name | No | Medium | Hardcoded `function`; a rename would cause runtime SQL error |
-| `nervctf_instance_challenge` table | Yes — info_schema | Low | LEFT JOIN fallback |
-| `BaseChallenge.attempt()` return type | Partial (TypeError catch) | **High** | Dual-path has logic gap for subscriptable ChallengeResponse |
+| CTFd version pin | Static git tag only | High | `3.7.3` pinned at first setup only; the upgrade playbook has no version guard |
+| `challenges.attribution` | Yes, info_schema | Low | Added 3.7.0; absent gracefully |
+| `challenges.logic` | Yes, info_schema | Low | Default insert is `""`, not NULL |
+| `challenges.position` | Yes, info_schema | Low | Read but discarded |
+| `challenges.initial/minimum/decay/function` (inline) | Yes, all four columns | Medium | Requires all four; a partial migration is detected and falls back |
+| `challenges.next_id` | Yes, `has_next_id` | Medium | Absent on CTFd <3.5.x; the NULL placeholder keeps indices stable |
+| `dynamic_challenge` table | Yes | Medium | Correct for MariaDB |
+| `dynamic_challenge.function` column name | No | Medium | Hardcoded `function`; a rename causes a runtime SQL error |
+| `nervctf_instance_challenge` table | Yes, info_schema | Low | LEFT JOIN fallback |
+| `BaseChallenge.attempt()` return type | Partial (`TypeError` catch) | High | The dual path has a gap for a subscriptable `ChallengeResponse` |
 | `BaseChallenge.solve/fail` signatures | No | Medium | 4-arg form assumed |
-| Team-mode vs user-mode | **No** | **Critical** | User-mode CTFd: all players get 403, no operator warning |
+| Team versus user mode | Yes, at startup | Medium | User-mode warns at startup and returns 403 on player routes |
 | CTFd uploads path `.data/CTFd/uploads` | No | Medium | Hardcoded Docker volume convention |
-| Plugin path `CTFd/plugins/nervctf_instance/` | No | Medium | Assumes CTFd source layout |
+| Plugin path `CTFd/plugins/nervctf_instance/` | No | Medium | Assumes CTFd's source layout |
 | Redis cache invalidation | N/A | Medium | Never invalidated after direct DB writes |
 
 ---
 
-## 11. Critical Risks (Ranked)
+## 11. Risks, ranked
 
-### Rank 1 — CRITICAL: User-mode CTFd silently denies all instance access
-`validate_token()` treats `users.team_id IS NULL` as unauthorized and returns `None`. All player-facing instance routes return 403 "Not in a team". The operator gets no warning during `nervctf setup`. **Affects:** `ctfd_db.rs:59`, `__init__.py:63-64`, all four player routes.
-**Status: Fixed in v2.3.1** — `detect_ctfd_mode()` queries `configs WHERE key='user_mode'` immediately after pool creation and logs a `WARN` if user-mode is detected, giving the operator an early signal before the CTF goes live.
+### 1. Critical — user-mode CTFd denies all instance access
 
-### Rank 2 — HIGH: `BaseChallenge.attempt()` return-type dual-path has a logic gap
-The plugin catches `TypeError` (non-subscriptable) and falls back to `getattr(result, "success", False)`. If CTFd returns a `ChallengeResponse` namedtuple (which IS subscriptable), the fallback never fires. A correct flag submission could be reported to the monitor as incorrect, silently breaking flag-sharing detection and solve-triggered instance teardown. **Affects:** `__init__.py:267-272`.
+`validate_token()` treats `users.team_id IS NULL` as unauthorised and returns `None`, so every player instance route returns 403 "Not in a team". The operator gets no warning. **Affects:** `ctfd_db.rs:59`, `__init__.py:63-64`, all four player routes.
+**Fixed in v2.3.1:** `detect_ctfd_mode()` queries `configs WHERE key='user_mode'` right after pool creation and logs a `WARN` when user-mode is detected.
 
-### Rank 3 — HIGH: Single-column proxy for inline scoring migration
-`detect_challenges_schema()` uses presence of `challenges.initial` to conclude that all four scoring columns are inline. A partial migration (only `initial` added) causes the SELECT to emit non-existent column references, producing runtime SQL errors or silent NULLs. **Affects:** `ctfd_db.rs:153, 168-176`.
-**Status: Fixed in v2.3.1** — `dynamic_in_challenges` now requires all four columns (`initial`, `minimum`, `decay`, `function`) via a four-way AND. A new `dynamic_partial` field is set when only some columns are present, enabling safe fallback to the join-table path without generating invalid SQL.
+### 2. High — `BaseChallenge.attempt()` dual-path gap
 
-### Rank 4 — HIGH: CTFd version only pinned at initial setup
-The `version: "3.7.3"` git tag is only applied when CTFd is not yet cloned. The upgrade playbook has no version guard. A manual `git pull` on the server silently drifts all schema assumptions. **Affects:** `nervctf_playbook.yml:108-115`.
-**Partial mitigation in v2.4.0:** `nervctf probe` reports the live CTFd version detected via the `configs` table (`ctfd_version_tag` / `ctfd_version_source`). `nervctf deploy` compares this tag against the `TESTED_CTFD_VERSION` constant (`3.7.3` in `src/nervctf/src/main.rs`) and emits a warning if a mismatch is detected. Run `nervctf probe --refresh` after any CTFd upgrade to update the cached report. The deploy does not block on version drift alone — the probe's capability fields (`cap_dynamic_scoring`, etc.) provide the authoritative compatibility signal.
+The plugin catches `TypeError` (non-subscriptable) and falls back to `getattr(result, "success", False)`. When CTFd returns a `ChallengeResponse` namedtuple, which is subscriptable, the fallback never fires. A correct submission can be reported to the monitor as incorrect, which breaks flag-sharing detection and solve-triggered teardown. **Affects:** `__init__.py:267-272`.
 
-### Rank 5 — MEDIUM: `challenges.next_id` assumed always present
-All INSERT/UPDATE/SELECT statements include `next_id` with no schema detection. Absent on CTFd <3.5.x; every challenge operation fails with "Unknown column". **Affects:** `ctfd_db.rs` throughout.
-**Status: Fixed in v2.3.1** — `has_next_id` field added to `ChallengesSchema`; `build_full_query()` substitutes a `NULL` placeholder at column index 10 when the column is absent (preserving all downstream indices in `row_to_value()`), and `create_challenge()`/`update_challenge()` omit the column and its binding entirely when `has_next_id` is false.
+### 3. High — inline scoring was detected from one column (fixed)
 
-### Rank 6 — MEDIUM: CTFd flag orphaned if monitor crashes mid-provision
-`ctfd_db::create_flag()` runs before `db::insert_instance()`. A crash between these two leaves a `flags` row in MariaDB with no `ctfd_flag_id` reference in SQLite — it will never be deleted and remains a valid submission target indefinitely.
+`detect_challenges_schema()` inferred inline scoring from `challenges.initial` alone. A partial migration then produced SELECTs against columns that did not exist. **Affects:** `ctfd_db.rs:153, 168-176`.
+**Fixed in v2.3.1:** `dynamic_in_challenges` now requires all four columns, and `dynamic_partial` marks the partial state so the code falls back to the join table.
 
-### Rank 7 — MEDIUM: No Redis cache invalidation after direct DB writes
-All challenge/flag/hint/tag/file/topic writes bypass CTFd's HTTP API and go directly to MariaDB. CTFd's Redis cache is never invalidated, so stale data may be served to players until the TTL expires or CTFd is restarted.
+### 4. High — CTFd version pinned only at first setup
 
-### Rank 8 — LOW: `needs_update` misses `files` and `topics` changes
-A challenge where only files or topics changed is never detected as needing an update. The operator must run `--recreate` to force re-sync of these sub-resources.
+The `version: "3.7.3"` git tag applies only when CTFd is not cloned yet, and the upgrade playbook has no version guard. A manual `git pull` on the server drifts every schema assumption. **Affects:** `nervctf_playbook.yml`.
+**Partly addressed in v2.4.0:** `nervctf probe` reports the live version from the `configs` table, and `nervctf deploy` compares it against `TESTED_CTFD_VERSION` (`3.7.3`), warning on a mismatch. Deploy does not block on version drift alone; the probe's capability fields are the compatibility signal.
 
-### Rank 9 — LOW: `replace_flags` / `replace_hints` compare only `content`
-`needs_update` triggers on `(content, type, data)` tuple changes, but the replacement function only compares content strings. A flag type change (`static` → `regex`) correctly triggers `needs_update` but is then silently dropped by `replace_flags`. The flag type remains unchanged on CTFd after deploy.
+### 5. Medium — `challenges.next_id` assumed present (fixed)
+
+Statements included `next_id` with no detection, so CTFd <3.5.x failed every operation with "Unknown column". **Fixed in v2.3.1:** `has_next_id` gates a NULL placeholder in SELECT and omits the column in INSERT and UPDATE.
+
+### 6. Medium — CTFd flag orphaned if the monitor crashes mid-provision
+
+`ctfd_db::create_flag()` runs before `db::insert_instance()`. A crash between them leaves a MariaDB flag with no `ctfd_flag_id` in SQLite, so it is never deleted. The provision-ordering change in `instance-challenges.md` narrows this window.
+
+### 7. Medium — no Redis cache invalidation
+
+All challenge, flag, hint, tag, file, and topic writes go straight to MariaDB. CTFd's Redis cache is never invalidated, so stale data can reach players until the TTL expires or CTFd restarts.
+
+### 8. Low — `needs_update` misses `files` and `topics` changes
+
+A challenge where only files or topics changed is never detected. Run `--recreate` to force a re-sync.
+
+### 9. Low — `replace_flags` and `replace_hints` compare only `content`
+
+`needs_update` triggers on a `(content, type, data)` change, but the replacement function compares content strings only, so a flag type change is silently dropped and the type stays unchanged on CTFd.
 
 ---
 
-## 12. Known Working CTFd Version
+## 12. Tested CTFd version
 
-**CTFd 3.7.3** — only version officially tested and deployed. The schema detection guards give partial forward/backward compatibility but none are validated at startup. Running against any other version is untested.
-
----
-
-*Generated: 2026-05-26 | 8 parallel audit agents | NervCTF v2.3.1*
+**CTFd 3.7.3** is the only version officially tested and deployed. The schema detection guards give partial forward and backward compatibility, but none of it is validated at startup. Other versions are untested.

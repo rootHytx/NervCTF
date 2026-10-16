@@ -1,23 +1,20 @@
-# NervCTF — Developer Notes
+# Developer notes
 
-Operational knowledge, architectural constraints, and gotchas not obvious from reading the code.
-See `ARCHITECTURE.md` for the system overview and `docs/` for feature documentation.
+Operational knowledge, architectural constraints, and gotchas that are not obvious from reading the code. See `ARCHITECTURE.md` for the system overview and `docs/` for feature documentation.
 
 ---
 
-## Build Environment
+## Build environment
 
-Always use the Nix flake devShell for all cargo/build commands:
+Run every cargo and build command through the Nix flake devShell:
 
 ```bash
 nix develop .# --command <cmd>
 ```
 
-`flake.nix` provides: rustc, cargo, rustfmt, clippy, pkg-config, openssl, ansible.
-`shell.nix` has been removed — flake.nix is the sole dev environment definition.
-`PKG_CONFIG_PATH` is set for openssl automatically by the devShell.
+`flake.nix` provides rustc, cargo, rustfmt, clippy, pkg-config, openssl, and ansible. `shell.nix` was removed; `flake.nix` is the only dev-environment definition. The devShell sets `PKG_CONFIG_PATH` for OpenSSL.
 
-**Build + copy in one step** (per `CLAUDE.md`):
+Build and copy in one step:
 
 ```bash
 # Both crates
@@ -28,38 +25,40 @@ cp target/x86_64-unknown-linux-musl/release/remote-monitor dist/remote-monitor-l
 cp target/x86_64-unknown-linux-musl/release/nervctf dist/nervctf-linux-x86_64-static
 ```
 
-Use the release musl build for verification, not `cargo build` (dev/native) — the musl binary is what gets deployed, so checking compilation and producing the artifact should be one step.
+Verify with the release musl build, not `cargo build` (dev/native). The musl binary is what gets deployed, so compiling and producing the artifact should be one step.
 
 ---
 
-## Cross-Compilation Gotchas (flake.nix)
+## Cross-compilation gotchas (`flake.nix`)
 
-Adding `musl64/aarch64/mingw64.stdenv.cc` to `packages` triggers setup hooks that each set `CC=<cross-compiler>`. Last in list wins → `CC=x86_64-w64-mingw32-gcc` pollutes native builds.
+Adding `musl64/aarch64/mingw64.stdenv.cc` to `packages` triggers setup hooks that each set `CC=<cross-compiler>`. The last one in the list wins, so `CC` ends up as `x86_64-w64-mingw32-gcc`, which pollutes native builds.
 
-**Fix:** Pin every target via `CC_<triple>` env var in devShell shellHook AND reset `CC` to native gcc. Must include:
+The fix is to pin every target through a `CC_<triple>` environment variable in the devShell `shellHook` and to reset `CC` to native gcc. This entry is required:
+
 ```nix
 CC_x86_64_unknown_linux_gnu = "${pkgs.stdenv.cc}/bin/cc";
 ```
-Otherwise ring/cc-rs compiles COFF objects for ELF targets → link failure.
 
-**Windows `libpthread.a`:** Inject via `NIX_LDFLAGS_x86_64_w64_mingw32` (the env var Nix's gcc-wrapper reads). `RUSTFLAGS -L` / `-C link-arg` do NOT reach the external cross-linker that cargo invokes.
+Without it, ring and cc-rs compile COFF objects for ELF targets, and the link fails.
+
+**Windows `libpthread.a`:** inject it through `NIX_LDFLAGS_x86_64_w64_mingw32`, the variable Nix's gcc-wrapper reads. `RUSTFLAGS -L` and `-C link-arg` do not reach the external cross-linker that cargo invokes.
 
 ---
 
-## Key Architecture Files
+## Key architecture files
 
 | File | Purpose |
-|------|---------|
-| `Cargo.toml` | Workspace manifest (members: src/nervctf, src/remote-monitor) |
+|---|---|
+| `Cargo.toml` | Workspace manifest (members: `src/nervctf`, `src/remote-monitor`) |
 | `src/nervctf/src/ctfd_api/client.rs` | `CtfdClient` with async reqwest |
-| `src/nervctf/src/ctfd_api/models/mod.rs` | All data types; `deserialize_ports` visitor for `internal_ports` compat |
-| `src/nervctf/src/challenge_manager/` | CRUD + sync logic |
-| `src/nervctf/src/main.rs` | CLI (clap), config loading |
-| `src/nervctf/src/utils.rs` | `Config` struct + `load_config()` for `.nervctf.yml` |
+| `src/nervctf/src/ctfd_api/models/mod.rs` | All data types; `deserialize_ports` visitor for `internal_ports` compatibility |
+| `src/nervctf/src/challenge_manager/` | CRUD and sync logic |
+| `src/nervctf/src/main.rs` | CLI (clap) and config loading |
+| `src/nervctf/src/utils.rs` | `Config` struct and `load_config()` for `.nervctf.yml` |
 | `src/nervctf/src/validator.rs` | Challenge validation; backend-specific checks |
 | `src/remote-monitor/src/main.rs` | axum 0.7 server; all HTTP handlers |
-| `src/remote-monitor/src/instance/mod.rs` | `provision()` — dispatches to backends |
-| `src/remote-monitor/src/instance/compose.rs` | Compose backend; `up()` / `down()` |
+| `src/remote-monitor/src/instance/mod.rs` | `provision()` dispatches to backends |
+| `src/remote-monitor/src/instance/compose.rs` | Compose backend; `up()` and `down()` |
 | `src/remote-monitor/src/instance/docker.rs` | Docker backend; `pick_free_ports()` |
 | `src/remote-monitor/src/db.rs` | SQLite via rusqlite; `Db = Arc<Mutex<Connection>>` |
 | `src/nervctf/assets/ctfd-plugin/__init__.py` | CTFd Flask plugin; `_to_connection()` |
@@ -67,61 +66,55 @@ Otherwise ring/cc-rs compiles COFF objects for ELF targets → link failure.
 
 ---
 
-## Known Dependency Conflict
+## Known dependency conflict
 
-axum 0.7 uses `http 1.x`; reqwest 0.11 uses `http 0.2.x`. They cannot share header/status types directly.
+axum 0.7 uses `http 1.x`; reqwest 0.11 uses `http 0.2.x`. They cannot share header or status types.
 
-**Bridge:** convert via `.as_str()` / `.as_bytes()` / string round-trip. See `remote-monitor/src/main.rs`.
+Convert between them with `.as_str()`, `.as_bytes()`, or a string round-trip. See `remote-monitor/src/main.rs`.
 
 ---
 
-## Config Loading Priority
+## Config loading priority
 
 1. CLI flags (`--monitor-url`, `--monitor-token`)
-2. Env vars (`CTFD_URL`, `CTFD_API_KEY`, `MONITOR_URL`, `MONITOR_TOKEN`)
-3. `.nervctf.yml` (walks up from `--challenges-dir`)
+2. Environment variables (`CTFD_URL`, `CTFD_API_KEY`, `MONITOR_URL`, `MONITOR_TOKEN`)
+3. `.nervctf.yml` (walked up from `--challenges-dir`)
 
 ---
 
-## CTFd Deployment Requirements (Operational)
+## CTFd deployment requirements (operational)
 
-- **CTFd version pinning:** The setup playbook pins CTFd to 3.7.3 at initial install only. The upgrade playbook warns if the installed version differs from 3.7.3 but does not abort. After any CTFd upgrade, run `nervctf probe` to verify that all NervCTF capabilities are still functional.
+**CTFd version pinning.** The setup playbook pins CTFd to 3.7.3 at first install only. The upgrade playbook warns when the installed version differs from 3.7.3 but does not abort. After any CTFd upgrade, run `nervctf probe` to confirm that all capabilities still work.
 
-- **Challenge Visibility** must be "Public" (not "Private") before `nervctf deploy`.
-  CTFd enforces visibility on `/api/v1/challenges` — Private mode redirects even valid API tokens to `/login`.
-  Set via CTFd Admin → Config → Visibility.
+**Challenge visibility** must be "Public", not "Private", before `nervctf deploy`. CTFd enforces visibility on `/api/v1/challenges`, and Private mode redirects even valid API tokens to `/login`. Set it in CTFd Admin → Config → Visibility.
 
-- **File upload permissions:** CTFd upload dir needs `chown -R 1001:1001 <CTFd>/.data/CTFd/uploads`
-  when using Docker. Otherwise `POST /api/v1/files` returns 500.
+**File upload permissions.** With Docker, the CTFd upload directory needs `chown -R 1001:1001 <CTFd>/.data/CTFd/uploads`. Otherwise `POST /api/v1/files` returns 500.
 
-- **File uploads:** all files for a challenge must be in ONE multipart request (multiple `file` parts).
-  One request per file → 500. Mirrors ctfcli's `_create_all_files()` pattern.
+**File uploads** must send every file for a challenge in one multipart request (multiple `file` parts). One request per file returns 500. This matches ctfcli's `_create_all_files()`.
 
-- **CTFd Pagination:** `GET /api/v1/challenges` is paginated (default 20/page).
-  `get_challenges()` loops via `meta.pagination.next` until exhausted. Without this, challenges
-  beyond page 1 always appear in `to_create` → duplicates on every re-deploy.
+**CTFd pagination.** `GET /api/v1/challenges` is paginated (20 per page by default). `get_challenges()` loops through `meta.pagination.next` until it is exhausted. Without the loop, challenges past page 1 always appear in `to_create`, so every re-deploy duplicates them.
 
 ---
 
-## Important Rust Type Notes
+## Rust type notes
 
 | Type | Note |
-|------|------|
-| `Challenge.hints` | `Option<Vec<HintContent>>` — not `Hint` (that's for CTFd API responses) |
+|---|---|
+| `Challenge.hints` | `Option<Vec<HintContent>>` — not `Hint`, which is used for CTFd API responses |
 | `Challenge.requirements` | `Option<Requirements>` enum (Simple or Advanced) |
-| `FlagContent::Detailed.data` | `Option<FlagData>` (optional) |
+| `FlagContent::Detailed.data` | `Option<FlagData>` |
 | `FlagData` | `rename_all = "snake_case"` → `CaseInsensitive = "case_insensitive"` |
 | `RequirementsQueue.resolve_dependencies` | `HashMap<String, HashSet<String>>` (owned strings) |
-| `internal_ports` | `Vec<u32>` with `alias = "internal_port"` + custom `deserialize_ports` visitor — accepts both scalar and array in YAML |
-| `extra_ports` | `Option<String>` in `InstanceRow`; JSON `{"<internal>": <host>}` for multi-port; `None` for single-port |
-| `service_ports` | `Option<HashMap<String, Vec<u32>>>` in `InstanceConfig`; mutually exclusive with `internal_ports` for compose backend |
+| `internal_ports` | `Vec<u32>` with `alias = "internal_port"` and a custom `deserialize_ports` visitor; accepts a scalar or an array in YAML |
+| `extra_ports` | `Option<String>` in `InstanceRow`; JSON `{"<internal>": <host>}` for multi-port, `None` for single-port |
+| `service_ports` | `Option<HashMap<String, Vec<u32>>>` in `InstanceConfig`; mutually exclusive with `internal_ports` for the compose backend |
 
 ---
 
-## remote-monitor Routes (current)
+## remote-monitor routes
 
 | Auth | Method | Path | Description |
-|------|--------|------|-------------|
+|---|---|---|---|
 | None | GET | `/health` | Health check |
 | None | GET | `/instance/:name` | HTML player page |
 | Monitor token | POST | `/api/v1/instance/build` | Build image |
@@ -135,61 +128,63 @@ axum 0.7 uses `http 1.x`; reqwest 0.11 uses `http 0.2.x`. They cannot share head
 | Monitor token | ANY | `/api/v1/diff` | Challenge diff |
 | Monitor token | ANY | `/api/v1/*path` | Transparent CTFd proxy |
 
-Player auth: CTFd `GET /api/v1/users/me` with bearer token. `AppState` wrapped in `Arc<AppState>`.
-`sqlite_to_ms(s)` helper converts SQLite datetime `"YYYY-MM-DD HH:MM:SS"` → Unix ms (used in plugin).
+Player auth uses CTFd's `GET /api/v1/users/me` with a bearer token. `AppState` is wrapped in `Arc<AppState>`. The `sqlite_to_ms(s)` helper converts a SQLite datetime `"YYYY-MM-DD HH:MM:SS"` to Unix milliseconds and is used by the plugin.
 
 ---
 
-## CTFd Plugin Notes
+## CTFd plugin notes
 
-- Named `nervctf_instance`, installed to `CTFd/plugins/nervctf_instance/`
-- `__init__.py`: `InstanceChallengeType` + Flask blueprint + `load()`
-- `models/challenge.py`: `InstanceChallenge(Challenges)` with `polymorphic_identity="instance"`
-- `assets/view.{html,js}`: player UI — Fetch/Extend/Terminate buttons, calls `/api/v1/containers/*`
-- `assets/create.{html,js}` + `update.{html,js}`: admin forms
-- Env vars: `NERVCTF_MONITOR_URL`, `NERVCTF_MONITOR_TOKEN` (written to CTFd `.env` by Ansible)
-- Plugin proxies to monitor using admin token + `team_id` — no CTFd user tokens exposed to monitor
-- `view.js` uses DOM API exclusively (no `innerHTML`) — passes XSS security hook
+- Named `nervctf_instance`; installed to `CTFd/plugins/nervctf_instance/`.
+- `__init__.py`: `InstanceChallengeType`, a Flask blueprint, and `load()`.
+- `models/challenge.py`: `InstanceChallenge(Challenges)` with `polymorphic_identity="instance"`.
+- `assets/view.{html,js}`: player UI with Fetch, Extend, and Terminate buttons, calling `/api/v1/containers/*`.
+- `assets/create.{html,js}` and `assets/update.{html,js}`: admin forms.
+- Environment variables: `NERVCTF_MONITOR_URL`, `NERVCTF_MONITOR_TOKEN` (written to CTFd's `.env` by Ansible).
+- The plugin proxies to the monitor using the admin token and `team_id`; CTFd user tokens are never exposed to the monitor.
+- `view.js` uses the DOM API only (no `innerHTML`), so it passes the XSS security hook.
 
 **`_to_connection(inst)` contract:**
-- Returns `{type, host, port}` always
-- Also sets `conn["ports"] = inst["extra_ports"]` when `extra_ports` present (multi-port display)
-- Routes also pass `connections` array when present (multi-service `service_ports` challenges)
+
+- always returns `{type, host, port}`;
+- sets `conn["ports"] = inst["extra_ports"]` when `extra_ports` is present (multi-port display);
+- the routes also pass a `connections` array when present (multi-service `service_ports` challenges).
 
 **`renderConnectionInfo(connection, parent)`** in `view.js`:
-- Checks `connection.ports` (dict) first — renders one entry per port
-- Falls back to `connection.port` (scalar) for single-port
-- Also handles `url_list`, `ssh`, `http`, `https`, `nc`/`tcp` types
+
+- checks `connection.ports` (a dict) first and renders one entry per port;
+- falls back to `connection.port` (a scalar) for single-port;
+- also handles the `url_list`, `ssh`, `http`, `https`, and `nc`/`tcp` types.
 
 **`_renderWithLabel(connection, parent, connections)`:**
-- When `connections` array is non-empty: renders each service with label (`app: http://...`)
-- Otherwise: renders "Instance Connection" header + single `renderConnectionInfo`
+
+- when the `connections` array is non-empty, renders each service with a label (`app: http://...`);
+- otherwise renders an "Instance Connection" header plus a single `renderConnectionInfo`.
 
 ---
 
-## Instance Challenge Type — Key Behaviors
+## Instance challenge type: key behaviours
 
-- `type: instance` deploys to CTFd as `standard` (no `extra.initial`) or `dynamic` (with `extra.initial`)
-- Container naming: `ctf-{sanitized_challenge}-{6 random chars}` (random suffix prevents orphan checker races)
-- Background expiry task runs every 30s; health check: alive if in EITHER compose project names OR docker container names
-- `pick_free_ports(n)`: atomically allocates N ports using an in-memory `allocated` HashSet alongside DB used-ports — prevents intra-instance collisions
-- `extra_ports` column: `None` for single-port; `{"<internal>": <host>}` JSON for all port pairs when >1 total
-- `get_used_ports` scans both `port` column and `extra_ports` JSON values
-- `service_ports` path in `provision()`: total port count = sum across all services; all allocated atomically; primary service = `compose_service` if in map, else first key
-- `compose::up()` receives `service_mappings: &HashMap<String, Vec<(u16, u32)>>` — fully resolved before calling, so compose.rs is unaware of config format
+- `type: instance` deploys to CTFd as `standard` (no `extra.initial`) or `dynamic` (with `extra.initial`).
+- Container naming: `ctf-{sanitized_challenge}-{6 random chars}`. The random suffix prevents orphan-checker races.
+- The background expiry task runs every 30s. An instance is alive if it appears in either the compose project names or the Docker container names.
+- `pick_free_ports(n)` allocates N ports atomically using an in-memory `allocated` HashSet alongside DB used-ports, which prevents collisions within one instance.
+- `extra_ports` column: `None` for single-port; JSON `{"<internal>": <host>}` with all port pairs when more than one.
+- `get_used_ports` scans both the `port` column and the `extra_ports` JSON values.
+- The `service_ports` path in `provision()` sums the port count across services, allocates all of them atomically, and picks the primary service as `compose_service` if it is in the map, otherwise the first key.
+- `compose::up()` receives `service_mappings: &HashMap<String, Vec<(u16, u32)>>`, fully resolved before the call, so `compose.rs` does not know about the config format.
 
 ---
 
-## Setup Command
+## Setup command
 
-- `setup.rs` finds plugin at `src/nervctf/assets/ctfd-plugin/` or next to exe
-- Generates `MONITOR_TOKEN` via `/dev/urandom` (32 hex bytes)
-- Detects CTFd running via TCP check on port 80
-- Finds remote-monitor binary (prefers musl targets)
-- Fallback for `ansible-playbook`: uses `nix develop {flake_dir} --command ...`
-- Playbook: deploys plugin via rsync, writes `NERVCTF_MONITOR_*` to CTFd `.env`
-- Playbook: installs LXD (snap) and Vagrant (hashicorp apt) — both `ignore_errors: true`
-- Writes `monitor_url` and `monitor_token` to `.nervctf.yml` after success
+- `setup.rs` finds the plugin at `src/nervctf/assets/ctfd-plugin/`, next to the executable, or from the copy embedded in the binary.
+- Generates `MONITOR_TOKEN` from `/dev/urandom` (32 bytes).
+- Resolves CTFd's published HTTP port from Compose rather than assuming port 80.
+- Finds the remote-monitor binary (musl targets preferred).
+- Runs a preflight playbook before provisioning: passwordless sudo, `python3`, `rsync`, and `git` on the relevant hosts.
+- The playbook deploys the plugin over rsync and writes `NERVCTF_MONITOR_*` to CTFd's `.env`.
+- The playbook installs LXD (snap) and Vagrant (HashiCorp apt); both steps use `ignore_errors: true`.
+- Writes the configuration to `.nervctf.yml` before running the playbook.
 
 ---
 
@@ -197,69 +192,66 @@ Player auth: CTFd `GET /api/v1/users/me` with bearer token. `AppState` wrapped i
 
 ### 2026-05-19 — Multi-port instance support
 
-**Problem:** `internal_port` was scalar; challenges could only expose one port per instance.
+**Problem:** `internal_port` was scalar, so a challenge could expose only one port per instance.
 
 **Changes:**
-- `models/mod.rs`: `internal_port: u32` → `internal_ports: Vec<u32>` with `alias` + `deserialize_ports` visitor (accepts both `1337` and `[80, 443]`)
-- `validator.rs`: updated checks for `internal_ports`
-- `docker.rs`: added `pick_free_ports(used, count)` — atomic multi-port allocator; `pick_free_port` is now a wrapper
-- `docker.rs`: `run_container` signature: `host_port + internal_port` → `port_mappings: &[(u16, u32)]`
-- `compose.rs`: `up()` signature updated to `port_mappings: &[(u16, u32)]`
-- `lxc.rs`: `launch` signature updated; loops adding `ctfport{i}` proxy devices
-- `vagrant.rs`: stub signature updated
-- `instance/mod.rs`: `provision()` reads `internal_ports` array (falls back to scalar); calls `pick_free_ports(n)`; builds `port_mappings`; stores `extra_ports` JSON; added `build_extra_ports_json()` helper
-- `db.rs`: migration `ALTER TABLE instances ADD COLUMN extra_ports TEXT`; `InstanceRow` gains `extra_ports: Option<String>`; `get_used_ports` rewritten to scan both columns; `insert_instance` gains `extra_ports: Option<&str>` param
-- `main.rs`: all instance responses include `"extra_ports"` field
 
----
+- `models/mod.rs`: `internal_port: u32` becomes `internal_ports: Vec<u32>` with an `alias` and a `deserialize_ports` visitor (accepts `1337` and `[80, 443]`).
+- `validator.rs`: checks updated for `internal_ports`.
+- `docker.rs`: added `pick_free_ports(used, count)`, the atomic multi-port allocator; `pick_free_port` is now a wrapper.
+- `docker.rs`: `run_container` signature changed from `host_port + internal_port` to `port_mappings: &[(u16, u32)]`.
+- `compose.rs`: `up()` signature updated to `port_mappings: &[(u16, u32)]`.
+- `lxc.rs`: `launch` signature updated; loops add `ctfport{i}` proxy devices.
+- `vagrant.rs`: stub signature updated.
+- `instance/mod.rs`: `provision()` reads the `internal_ports` array (falling back to the scalar), calls `pick_free_ports(n)`, builds `port_mappings`, stores the `extra_ports` JSON, and gained the `build_extra_ports_json()` helper.
+- `db.rs`: migration `ALTER TABLE instances ADD COLUMN extra_ports TEXT`; `InstanceRow` gains `extra_ports: Option<String>`; `get_used_ports` scans both columns; `insert_instance` gains an `extra_ports: Option<&str>` parameter.
+- `main.rs`: all instance responses include an `"extra_ports"` field.
 
-### 2026-05-19 — Health check false-positive deletions (bug fix)
+### 2026-05-19 — Health-check false-positive deletions (bug fix)
 
-**Problem:** Containers were randomly disappearing. `list_running_container_ids` fetched hex IDs but DB stores names → mismatch; compose projects never matched via `docker compose ls` for docker-backend containers.
+**Problem:** Containers disappeared at random. `list_running_container_ids` fetched hex IDs while the DB stored names, so they never matched, and compose projects never matched via `docker compose ls` for docker-backend containers.
 
 **Changes:**
-- `docker.rs`: renamed `list_running_container_ids` → `list_running_container_names`; format `{{.ID}}` → `{{.Names}}`
-- `main.rs` background expiry (~line 217): new dual-list logic — alive if found in EITHER compose project names OR docker container names; dead only when BOTH queries succeed and confirm absence
 
----
+- `docker.rs`: renamed `list_running_container_ids` to `list_running_container_names`; format changed from `{{.ID}}` to `{{.Names}}`.
+- `main.rs` background expiry (~line 217): new dual-list logic. An instance is alive if it appears in either the compose project names or the Docker container names; it is dead only when both queries succeed and confirm absence.
 
 ### 2026-05-19 — Docs and templates updated for `internal_ports`
 
-All user-facing docs and challenge templates updated to reflect the `internal_ports` array field.
+All user-facing docs and challenge templates updated for the `internal_ports` array.
 
-**Files:** `docs/instance-challenges.md`, `README.md`, all 12 templates (`docker/`, `compose/`, `lxc/`, `vagrant/`)
-
----
+**Files:** `docs/instance-challenges.md`, `README.md`, all 12 templates (`docker/`, `compose/`, `lxc/`, `vagrant/`).
 
 ### 2026-05-20 — `service_ports` multi-service compose port randomization
 
-**Goal:** Allow compose challenges with multiple independent services (e.g. `app` + `admin`) to each get their own randomly-allocated host ports.
+**Goal:** Let compose challenges with several independent services (for example `app` and `admin`) each get their own randomly allocated host ports.
 
-**Key design:** `compose::up()` receives a fully-resolved `HashMap<service, Vec<(host, internal)>>` — resolution happens in `provision()`, keeping compose.rs unaware of config format.
+**Key design:** `compose::up()` receives a fully resolved `HashMap<service, Vec<(host, internal)>>`. Resolution happens in `provision()`, so `compose.rs` stays unaware of the config format.
 
-**New field:** `service_ports: Option<HashMap<String, Vec<u32>>>` on `InstanceConfig` (serde `#[serde(default)]`). Mutually exclusive with `internal_ports`.
-
-**Changes:**
-- `models/mod.rs`: added `service_ports` field
-- `sync.rs`: test helper `base_instance_config()` gains `service_ports: None`
-- `compose.rs`: `up()` signature: `port_mappings + service` → `service_mappings: &HashMap<String, Vec<(u16, u32)>>` + `primary_service`; `add_service!` macro looks up each service in map
-- `instance/mod.rs` compose arm: two paths — Path A (`service_ports` present): allocates per-service; Path B (absent): wraps `internal_ports` into single-key map; both converge to same `compose::up()` call
-- `validator.rs`: compose backend — mutual-exclusion warning, empty-ports error, port-range errors for `service_ports`
-- `docs/instance-challenges.md`: new `service_ports` entry in full reference; new "Multi-service port randomization" section in Compose Backend
-- `templates/compose/`: all 3 templates gain commented `service_ports` example
-
----
-
-### 2026-05-20 — Multi-connection display in CTFd player UI
-
-**Goal:** Show all allocated ports in the CTFd challenge view. Two display modes:
-- Multi-port (`internal_ports: [80, 443]`): all ports under one "Instance Connection" header
-- Multi-service (`service_ports: {app: [80], admin: [8080]}`): each service labeled separately
-
-**Data flow:** `connections` array built in Rust from `service_ports` config + `extra_ports` DB data → passed through Python unchanged → rendered in JS.
+**New field:** `service_ports: Option<HashMap<String, Vec<u32>>>` on `InstanceConfig`, with serde `#[serde(default)]`. Mutually exclusive with `internal_ports`.
 
 **Changes:**
-- `main.rs`: added `load_config_val()` and `build_connections()` helpers; all 6 running-instance responses include `"connections"` field (null for non-service_ports); `plugin_renew_handler` consolidated double config load
-- `__init__.py`: `_to_connection()` wires `extra_ports` → `conn["ports"]`; all 3 player routes pass `connections` through
-- `view.js`: `_renderWithLabel(connection, parent, connections)` — new optional third arg; when non-empty array, renders labeled per-service rows; both call sites updated
-- `docs/instance-challenges.md`: API Responses section documents both `extra_ports` and `connections` with examples
+
+- `models/mod.rs`: added the `service_ports` field.
+- `sync.rs`: test helper `base_instance_config()` gains `service_ports: None`.
+- `compose.rs`: `up()` signature changed from `port_mappings + service` to `service_mappings: &HashMap<String, Vec<(u16, u32)>>` plus `primary_service`; the `add_service!` macro looks up each service in the map.
+- `instance/mod.rs` compose arm: two paths. Path A (`service_ports` present) allocates per service; Path B (absent) wraps `internal_ports` into a single-key map. Both call the same `compose::up()`.
+- `validator.rs`: compose backend checks for mutual exclusion, empty ports, and port range on `service_ports`.
+- `docs/instance-challenges.md`: added a `service_ports` entry to the full reference and a "Multi-service port randomization" section to the Compose backend.
+- `templates/compose/`: all three templates gained a commented `service_ports` example.
+
+### 2026-05-20 — Multi-connection display in the CTFd player UI
+
+**Goal:** Show all allocated ports in the CTFd challenge view, in two modes:
+
+- multi-port (`internal_ports: [80, 443]`): all ports under one "Instance Connection" header;
+- multi-service (`service_ports: {app: [80], admin: [8080]}`): each service labelled separately.
+
+**Data flow:** the `connections` array is built in Rust from the `service_ports` config and the `extra_ports` DB data, passed through Python unchanged, and rendered in JavaScript.
+
+**Changes:**
+
+- `main.rs`: added `load_config_val()` and `build_connections()`; all six running-instance responses include a `"connections"` field (null for non-`service_ports`); `plugin_renew_handler` no longer loads the config twice.
+- `__init__.py`: `_to_connection()` maps `extra_ports` to `conn["ports"]`; all three player routes pass `connections` through.
+- `view.js`: `_renderWithLabel(connection, parent, connections)` gained an optional third argument; a non-empty array renders labelled per-service rows. Both call sites updated.
+- `docs/instance-challenges.md`: the API Responses section documents `extra_ports` and `connections` with examples.

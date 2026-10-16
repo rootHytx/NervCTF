@@ -54,6 +54,12 @@ Download from [GitHub Releases](https://github.com/rootHytx/NervCTF/releases):
 
 Rename to `nervctf` and `remote-monitor`, place in your `PATH`.
 
+The `nervctf` binary embeds the CTFd plugin (`ctfd-plugin/`) and extracts it on
+demand, so no extra files are required. `nervctf setup` still needs Ansible
+(`ansible-playbook`) on the machine you run it from — Ansible's control node
+must be Linux or macOS, not Windows. Point the CLI at a non-PATH binary with
+`ANSIBLE_PLAYBOOK=/path/to/ansible-playbook`.
+
 ### Build from source
 
 ```sh
@@ -697,7 +703,10 @@ Set `runner_ip` and `runner_user` in `.nervctf.yml` to run containers on a separ
 | `state: Field may not be null` | CTFd requires `state` field | Run `nervctf fix` |
 | File upload 500 | Wrong ownership on uploads directory | `chown -R 1001:1001 <ctfd_path>/.data/CTFd/uploads` |
 | Monitor 401 | Token mismatch between CLI and server | Check `monitor_token` in `.nervctf.yml` matches `MONITOR_TOKEN` on server |
-| `ansible-playbook: not found` | Tool not in PATH | Run inside `nix develop .#` or install ansible |
+| `ansible-playbook: not found` | Tool not in PATH | Run inside `nix develop .#`, install ansible, or set `ANSIBLE_PLAYBOOK=/path/to/ansible-playbook` |
+| `Preflight failed ... passwordless-sudo=FAILED` | Deploy user lacks passwordless sudo (the playbooks use `become: yes`) | On that host: `echo '<user> ALL=(ALL) NOPASSWD:ALL' \| sudo tee /etc/sudoers.d/nervctf && sudo chmod 0440 /etc/sudoers.d/nervctf` |
+| `Preflight failed ... rsync=FAILED` / `git=FAILED` | Target host is missing a tool Ansible needs | `apt install rsync git` on the target |
+| `nervctf_instance_challenge doesn't exist` | Plugin not loaded by CTFd | Re-run `nervctf setup --upgrade` (plugin is embedded) and check CTFd logs |
 | Players get 403 on instance request | CTFd is in user-mode | Switch CTFd to team mode; `nervctf probe` confirms |
 | Dynamic challenges fail 500 in CTFd admin | Partial CTFd schema migration | Run `nervctf probe --refresh` to diagnose |
 | rsync permission denied | SSH key not passed to rsync | Set `ssh_key_path` in `.nervctf.yml` |

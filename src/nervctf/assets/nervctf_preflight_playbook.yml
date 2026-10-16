@@ -1,0 +1,57 @@
+---
+# NervCTF preflight — runs before provisioning and fails fast with an actionable
+# message when a target host would make the deployment unusable.
+#
+# Deliberately `gather_facts: false` / `become: false`: the provisioning plays use
+# `become: yes`, so a missing passwordless sudo otherwise surfaces as an opaque
+# "module result deserialization failed" instead of a clear error. `raw` is used
+# so the checks work even on a host without Python.
+- hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    ansible_python_interpreter: auto_silent
+
+  tasks:
+    - name: Check passwordless sudo (sudo -n true)
+      raw: sudo -n true
+      register: pf_sudo
+      changed_when: false
+      failed_when: false
+
+    - name: Check python3
+      raw: python3 --version
+      register: pf_python
+      changed_when: false
+      failed_when: false
+
+    - name: Check rsync
+      raw: rsync --version
+      register: pf_rsync
+      changed_when: false
+      failed_when: false
+
+    # Only the CTFd host clones CTFd, so git is mandatory there only.
+    - name: Check git (CTFd host only)
+      raw: git --version
+      register: pf_git
+      changed_when: false
+      failed_when: false
+      when: "'ctfd' in group_names"
+
+    - name: Verify preflight
+      assert:
+        that:
+          - pf_sudo.rc == 0
+          - pf_python.rc == 0
+          - pf_rsync.rc == 0
+          - (pf_git.rc | default(0)) == 0
+        fail_msg: >-
+          Preflight failed on {{ inventory_hostname }} ({{ ansible_host }}):
+          passwordless-sudo={{ 'ok' if pf_sudo.rc == 0 else 'FAILED' }},
+          python3={{ 'ok' if pf_python.rc == 0 else 'FAILED' }},
+          rsync={{ 'ok' if pf_rsync.rc == 0 else 'FAILED' }},
+          git={{ 'ok' if (pf_git.rc | default(0)) == 0 else 'FAILED' }}.
+          Passwordless sudo is mandatory — on that host run:
+          printf '%s ALL=(ALL) NOPASSWD:ALL\n' '{{ ansible_user | default("<user>") }}' | sudo tee /etc/sudoers.d/nervctf >/dev/null && sudo chmod 0440 /etc/sudoers.d/nervctf
+        success_msg: "Preflight OK: {{ inventory_hostname }}"

@@ -4,12 +4,29 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use tempfile::tempdir;
 
 use crate::{find_config_path, load_config, save_config};
 
 const PLAYBOOK: &str = include_str!("../assets/nervctf_playbook.yml");
 const UPGRADE_PLAYBOOK: &str = include_str!("../assets/nervctf_upgrade_playbook.yml");
+const PREFLIGHT_PLAYBOOK: &str = include_str!("../assets/nervctf_preflight_playbook.yml");
+
+/// The CTFd plugin, embedded at build time so a standalone/release binary can
+/// deploy it without the source tree. Keep in sync with `assets/ctfd-plugin/`;
+/// a file added there but not listed here will silently not be shipped.
+const CTFD_PLUGIN_FILES: &[(&str, &str)] = &[
+    ("__init__.py", include_str!("../assets/ctfd-plugin/__init__.py")),
+    ("models/__init__.py", include_str!("../assets/ctfd-plugin/models/__init__.py")),
+    ("models/challenge.py", include_str!("../assets/ctfd-plugin/models/challenge.py")),
+    ("assets/create.html", include_str!("../assets/ctfd-plugin/assets/create.html")),
+    ("assets/create.js", include_str!("../assets/ctfd-plugin/assets/create.js")),
+    ("assets/update.html", include_str!("../assets/ctfd-plugin/assets/update.html")),
+    ("assets/update.js", include_str!("../assets/ctfd-plugin/assets/update.js")),
+    ("assets/view.html", include_str!("../assets/ctfd-plugin/assets/view.html")),
+    ("assets/view.js", include_str!("../assets/ctfd-plugin/assets/view.js")),
+];
 
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
@@ -142,7 +159,8 @@ fn find_monitor_binary() -> Option<PathBuf> {
 }
 
 fn find_plugin_src() -> Option<PathBuf> {
-    // Check next to the current executable
+    // Prefer an on-disk copy (dev checkout, or a user-supplied copy next to the
+    // binary) so it can be edited without rebuilding.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("ctfd-plugin");
@@ -162,7 +180,115 @@ fn find_plugin_src() -> Option<PathBuf> {
             return Some(candidate);
         }
     }
-    None
+    // Fall back to the copy embedded in this binary.
+    match materialize_embedded_plugin() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            eprintln!("  [!] could not extract embedded CTFd plugin: {e}");
+            None
+        }
+    }
+}
+
+/// Extract the embedded CTFd plugin into a per-user cache directory and return
+/// its path. Written on every run (overwrite), so the directory stays in sync
+/// with the binary. Must remain on disk until the provisioning playbook finishes.
+fn materialize_embedded_plugin() -> Result<PathBuf> {
+    static PLUGIN_DIR: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(dir) = PLUGIN_DIR.get() {
+        return Ok(dir.clone());
+    }
+    let dir = plugin_cache_dir();
+    // The cache path is per-user; refuse to follow a symlink placed there.
+    if let Ok(meta) = fs::symlink_metadata(&dir) {
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(anyhow!(
+                "refusing to use plugin cache path '{}': not a plain directory",
+                dir.display()
+            ));
+        }
+    }
+    fs::create_dir_all(&dir)?;
+    for (rel, contents) in CTFD_PLUGIN_FILES {
+        let dest = dir.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dest, contents)?;
+    }
+    let _ = PLUGIN_DIR.set(dir.clone());
+    Ok(dir)
+}
+
+/// Stable location for the extracted embedded plugin: `$XDG_CACHE_HOME/nervctf/ctfd-plugin`,
+/// else `~/.cache/nervctf/ctfd-plugin`, else a per-process directory under the
+/// system temp dir.
+fn plugin_cache_dir() -> PathBuf {
+    if let Some(base) = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        return base.join("nervctf").join("ctfd-plugin");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("nervctf")
+            .join("ctfd-plugin");
+    }
+    std::env::temp_dir().join(format!("nervctf-ctfd-plugin-{}", std::process::id()))
+}
+
+/// True if `name` resolves to a file somewhere on `PATH`.
+fn command_exists(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+        })
+        .unwrap_or(false)
+}
+
+/// The controller-side tools the provisioning path depends on. Checked before
+/// any prompts or config writes so setup fails fast with an actionable message.
+fn require_local_prerequisites() -> Result<()> {
+    if !command_exists(&ansible_program()) {
+        return Err(anyhow!(
+            "`{ansible}` not found in PATH. `nervctf setup` drives provisioning through Ansible.\n\
+             Install it, or point the CLI at a specific binary with ANSIBLE_PLAYBOOK=/path/to/ansible-playbook:\n\
+             \x20 nix develop .#            (this repo's dev shell provides Ansible)\n\
+             \x20 pipx install ansible     (any Linux/macOS host)\n\
+             \x20 apt install ansible      (Debian/Ubuntu)\n\
+             Ansible cannot run on a Windows controller.",
+            ansible = ansible_program()
+        ));
+    }
+    for tool in ["ssh", "rsync"] {
+        if !command_exists(tool) {
+            return Err(anyhow!(
+                "`{tool}` not found in PATH — required to reach the target host and transfer files."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Name of the ansible-playbook executable: `ANSIBLE_PLAYBOOK` overrides the
+/// default if set (useful when it is outside PATH).
+fn ansible_program() -> String {
+    std::env::var("ANSIBLE_PLAYBOOK").unwrap_or_else(|_| "ansible-playbook".to_string())
+}
+
+/// Run the embedded preflight playbook against the inventory. Fails fast (and
+/// with a readable message) when a host would make provisioning unusable —
+/// notably a missing passwordless sudo for the `become: yes` plays.
+fn run_preflight(inventory: &str, evars: &[String]) -> Result<()> {
+    println!("\nRunning preflight checks...");
+    run_ansible_playbook(PREFLIGHT_PLAYBOOK, inventory, evars).map_err(|e| {
+        anyhow!(
+            "{e}\n\nPreflight failed — the deployment would not work in its current state. \
+             Fix the reported issue(s) on the target host(s) and re-run."
+        )
+    })
 }
 
 
@@ -252,6 +378,7 @@ fn public_key_contents(key: &str) -> Result<String> {
 }
 
 pub fn run_setup() -> Result<()> {
+    require_local_prerequisites()?;
     println!("==============================================");
     println!(" NervCTF Setup: Automated CTFd Environment");
     println!("----------------------------------------------");
@@ -476,6 +603,8 @@ pub fn run_setup() -> Result<()> {
         ));
     }
 
+    run_preflight(&inventory, &evars)?;
+
     println!("\nRunning Ansible playbook...");
     run_ansible_playbook(PLAYBOOK, &inventory, &evars)?;
 
@@ -532,13 +661,13 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
         format!("@{}", evars_path.to_str().unwrap()),
     ];
 
-    let status = Command::new("ansible-playbook")
+    let status = Command::new(ansible_program())
         .args(&args)
         .env("ANSIBLE_CONFIG", cfg_path.to_str().unwrap())
         .status()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow!("ansible-playbook not found in PATH. Install Ansible first:\n  pip install ansible\n  -- or --\n  apt install ansible")
+                anyhow!("`{}` not found in PATH. Install Ansible (pipx install ansible / apt install ansible) or set ANSIBLE_PLAYBOOK=/path/to/ansible-playbook", ansible_program())
             } else {
                 e.into()
             }
@@ -559,6 +688,7 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
 /// the remote-monitor Docker image, and restart the affected containers.
 /// Reads all connection details from the existing .nervctf.yml — no re-prompting.
 pub fn run_upgrade() -> Result<()> {
+    require_local_prerequisites()?;
     println!("==============================================");
     println!(" NervCTF Upgrade: Updating Deployed Services");
     println!("----------------------------------------------");
@@ -676,6 +806,8 @@ pub fn run_upgrade() -> Result<()> {
             ));
         }
     }
+
+    run_preflight(&inventory, &evars)?;
 
     println!("\nRunning upgrade playbook...");
     run_ansible_playbook(UPGRADE_PLAYBOOK, &inventory, &evars)?;

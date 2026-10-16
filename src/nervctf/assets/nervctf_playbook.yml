@@ -457,14 +457,26 @@
       become_user: "{{ docker_user }}"
       when: plugin_src is defined or monitor_token is defined
 
+    # CTFd's front-end is frequently published on a non-80 host port (e.g. nginx
+    # on 8080), so resolve the published port from Compose rather than assuming
+    # localhost:80. Prefer the ctfd/gunicorn mapping (8000), fall back to nginx.
+    - name: Resolve CTFd's published HTTP port
+      shell: |
+        port="$(docker compose -f {{ ctfd_path }}/docker-compose.yml port ctfd 8000 2>/dev/null | sed 's/.*://')"
+        if [ -z "$port" ]; then
+          port="$(docker compose -f {{ ctfd_path }}/docker-compose.yml port nginx 80 2>/dev/null | sed 's/.*://')"
+        fi
+        echo "${port:-80}"
+      register: ctfd_http_port
+      changed_when: false
+      become_user: "{{ docker_user }}"
+
     # Wait for CTFd's gunicorn workers to finish db.create_all() / Alembic migrations.
-    # A non-502/503 response from nginx means at least one gunicorn worker has completed
-    # its create_app() call and the schema is ready. Checking port 80 (nginx) is reliable
-    # because nginx only starts after the ctfd container, and only forwards once gunicorn
-    # accepts connections (which happens after schema init).
+    # A non-502/503 HTTP response means at least one gunicorn worker has completed its
+    # create_app() call and the schema is ready.
     - name: Wait for CTFd to finish database initialization
       uri:
-        url: "http://localhost/"
+        url: "http://localhost:{{ ctfd_http_port.stdout | trim }}/"
         status_code: [200, 301, 302, 401, 403]
         follow_redirects: no
         timeout: 10

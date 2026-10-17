@@ -144,7 +144,31 @@ runner_ip: 192.168.1.50
 runner_user: docker
 runner_domain: challenges.example.com  # hostname shown to players in connection strings
                                        # defaults to runner_ip
+
+# ── Event settings (optional) ─────────────────────────────────────────────────
+# Applied with `nervctf event`. `nervctf setup` also uses these to complete
+# CTFd's first-run setup.
+event:
+  name: "ACME CTF 2026"
+  description: "Annual capture-the-flag event."
+  start: "2026-10-01T09:00:00Z"
+  end: "2026-10-02T09:00:00Z"
+  user_mode: teams                  # teams | users
+  challenge_visibility: public
+  registration_visibility: public
+  score_visibility: public
+  account_visibility: public
+  verify_emails: false
+
+# ── First CTFd admin (written by nervctf setup) ───────────────────────────────
+# This file then contains the admin password; it is written with mode 0600.
+admin:
+  user: admin
+  email: admin@example.com
+  password: change-me
 ```
+
+The file can contain the admin password, so `nervctf setup` writes it with mode `0600`. Keep that in mind if you copy it between machines.
 
 ### Configuration precedence (highest wins)
 
@@ -191,7 +215,7 @@ nervctf setup --upgrade
 
 **First run:**
 
-1. Prompts for the host IP, SSH user, CTFd path, monitor port, token, and SSH key.
+1. Prompts for the host IP, SSH user, CTFd path, monitor port, token, SSH key, and the first CTFd admin username, email, and password.
 2. Saves everything to `.nervctf.yml`.
 3. Runs an embedded Ansible playbook that:
    - installs Docker and Docker Compose if they are missing;
@@ -201,7 +225,8 @@ nervctf setup --upgrade
    - writes `docker-compose.override.yml` with the monitor's environment;
    - restarts CTFd so the plugin loads;
    - polls the health endpoints until everything is up.
-4. Prints the admin dashboard URL and token.
+4. On first start, the plugin creates the admin account and writes the event name, description, user mode, and `setup` flag from the `admin:` and `event:` blocks. CTFd's setup wizard does not appear.
+5. Prints the admin dashboard URL and token.
 
 Before it runs the playbook, `setup` checks the controller for `ansible-playbook`, `ssh`, and `rsync`, and the target hosts for passwordless sudo, `python3`, `rsync`, and `git`. If any are missing, it stops with a message naming the fix.
 
@@ -212,6 +237,7 @@ Before it runs the playbook, `setup` checks the controller for `ansible-playbook
 - Restarts CTFd and the monitor.
 - Checks whether the installed CTFd version matches the tested version (3.7.3).
 - Does not re-provision CTFd or regenerate the token.
+- Prompts for the first-admin username, email, and password when the existing config predates the `admin:` block, then applies it on the next CTFd restart.
 
 | Flag | Description |
 |---|---|
@@ -331,6 +357,27 @@ Redis cache invalidation is always `DEGRADED`. NervCTF writes to MariaDB directl
 |---|---|
 | `--refresh` | Force a fresh probe from MariaDB instead of the cached result |
 | `--json` | Output raw JSON instead of the formatted table |
+
+---
+
+### `nervctf event`
+
+Applies the declarative `event:` block from `.nervctf.yml` to CTFd's settings table (`configs`, or `config` on builds that use the singular name) through the monitor.
+
+```sh
+nervctf event
+nervctf event --show
+```
+
+The managed keys are an allowlist: `ctf_name`, `ctf_description`, `start`, `end`, `user_mode`, `challenge_visibility`, `registration_visibility`, `score_visibility`, `account_visibility`, and `verify_emails`. The CLI maps the friendly YAML names (`name`, `description`) to those keys. The monitor detects whether the installed CTFd stores settings in `configs` or `config`.
+
+This command does not create an admin account. `nervctf setup` completes CTFd's first-run wizard when an `admin:` block is configured: the plugin creates the first admin and sets `setup = "true"`. On a database with no admin, `nervctf event` alone cannot remove the wizard.
+
+| Flag | Description |
+|---|---|
+| `--show` | Print the mapped settings without applying them |
+
+CTFd caches some settings. Restart CTFd after a bulk change if a value does not appear, or run `nervctf setup --upgrade`, which restarts the containers.
 
 ---
 
@@ -680,6 +727,17 @@ The monitor runs two loops independently of HTTP traffic.
 When a player submits a flag, the CTFd plugin calls the monitor's `/api/v1/plugin/attempt` endpoint. The monitor checks whether the flag was issued to a different team. If it was, it records a flag-sharing alert, which appears in the admin dashboard under "Attempts (alerts only)".
 
 Flag ownership is stored permanently in the `team_flags` SQLite table, so the monitor remembers which team owned a flag even after the instance expires.
+
+### Lifecycle event log
+
+The monitor appends instance lifecycle events to its SQLite `events` table: requested, running, stopped, solved, and expired. Read them through the admin endpoint:
+
+```sh
+curl -s -H "Authorization: Token $MONITOR_TOKEN" \
+  "http://<monitor_ip>:<monitor_port>/api/v1/admin/events?limit=50"
+```
+
+Filters: `type`, `challenge`, `team`, `since` (SQLite datetime), `limit` (default 200, max 5000), and `offset`. Flag submissions are recorded separately in `flag_attempts`.
 
 ---
 

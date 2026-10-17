@@ -190,8 +190,22 @@
           services:
             ctfd:
               environment:
-                - NERVCTF_MONITOR_URL=http://remote-monitor:{{ monitor_port }}
-                - NERVCTF_MONITOR_TOKEN={{ monitor_token }}
+                NERVCTF_MONITOR_URL: "http://remote-monitor:{{ monitor_port }}"
+                NERVCTF_MONITOR_TOKEN: {{ monitor_token | to_json }}
+          {% if event_name is defined %}
+                NERVCTF_EVENT_NAME: {{ event_name | to_json }}
+          {% endif %}
+          {% if event_description is defined %}
+                NERVCTF_EVENT_DESCRIPTION: {{ event_description | to_json }}
+          {% endif %}
+          {% if user_mode is defined %}
+                NERVCTF_USER_MODE: {{ user_mode | to_json }}
+          {% endif %}
+          {% if admin_user is defined and admin_email is defined and admin_password is defined %}
+                NERVCTF_ADMIN_USER: {{ admin_user | to_json }}
+                NERVCTF_ADMIN_EMAIL: {{ admin_email | to_json }}
+                NERVCTF_ADMIN_PASSWORD: {{ admin_password | to_json }}
+          {% endif %}
 
             remote-monitor:
               image: nervctf-monitor:latest
@@ -248,10 +262,12 @@
       become_user: "{{ docker_user }}"
       when: monitor_binary is defined
 
-    # Restart CTFd so it reloads the plugin from disk.
-    - name: Restart CTFd container (reloads plugin)
+    # Recreate the whole stack so the override's environment is applied and
+    # nginx re-resolves the ctfd container (a `restart` keeps both the old env
+    # and the old upstream IP, which produces 502s after ctfd is recreated).
+    - name: Recreate CTFd stack (applies env, reloads plugin, refreshes nginx)
       command:
-        cmd: docker compose restart ctfd
+        cmd: docker compose up -d --force-recreate
         chdir: "{{ ctfd_path }}"
       become_user: "{{ docker_user }}"
       when: plugin_src is defined

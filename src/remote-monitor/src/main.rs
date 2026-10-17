@@ -257,6 +257,11 @@ async fn main() -> Result<()> {
                 Ok(expired) => {
                     for (challenge_name, container_id, team_id, ctfd_flag_id) in expired {
                         info!("expiry: cleaning up {}/{}", challenge_name, team_id);
+                        let _ = db::log_event(
+                            &expiry_state.db, "instance.expired",
+                            Some(&challenge_name), Some(team_id), None, None,
+                            Some("expired or stuck provisioning"),
+                        );
                         let _ = db::delete_instance(&expiry_state.db, &challenge_name, team_id);
                         if let Some(flag_id) = ctfd_flag_id {
                             ctfd_db::delete_flag(&expiry_state.ctfd_pool, flag_id).await;
@@ -372,6 +377,8 @@ async fn main() -> Result<()> {
         .route("/api/v1/admin/probe", get(admin_probe_handler))
         .route("/api/v1/admin/tokens", get(list_tokens_handler).post(create_token_handler))
         .route("/api/v1/admin/tokens/:id", delete(revoke_token_handler))
+        .route("/api/v1/admin/event", get(admin_event_get).put(admin_event_set))
+        .route("/api/v1/admin/events", get(admin_events_handler))
         // Plugin routes (monitor token + explicit team_id) — used by CTFd plugin
         .route("/api/v1/plugin/info", get(plugin_info_handler))
         .route("/api/v1/plugin/request", post(plugin_request_handler))
@@ -1131,7 +1138,13 @@ async fn instance_request_handler(
         &state.public_host, &connection_type, &expires_at,
         Some(&pre_container_name),
     ) {
-        Ok(()) => {}
+        Ok(()) => {
+            let _ = db::log_event(
+                &state.db, "instance.requested",
+                Some(&body.challenge_name), Some(team_id), None, None,
+                Some(&format!("container={}", pre_container_name)),
+            );
+        }
         Err(e) => {
             // If a row already exists (race), treat as 409
             let msg = e.to_string();
@@ -1293,6 +1306,11 @@ async fn instance_stop_handler(
 
     match db::delete_instance(&state.db, &body.challenge_name, team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
+            let _ = db::log_event(
+                &state.db, "instance.stopped",
+                Some(&body.challenge_name), Some(team_id), None, None,
+                Some("stopped by player"),
+            );
             if let Some(cid) = container_id {
                 instance::cleanup_container(&cid, state.runner_ssh_target.as_deref()).await;
             }
@@ -1445,6 +1463,12 @@ async fn plugin_request_handler(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
 
+    let _ = db::log_event(
+        &state.db, "instance.requested",
+        Some(&body.challenge_name), Some(body.team_id), body.user_id, None,
+        Some(&format!("container={}", pre_container_name)),
+    );
+
     // Provision in background — compose up can take 30-60 s.
     // Semaphore limits concurrent provisions to prevent port-pick races and
     // avoid overwhelming the Docker daemon socket under high concurrency.
@@ -1539,6 +1563,11 @@ async fn plugin_stop_handler(
     }
     match db::delete_instance(&state.db, &body.challenge_name, body.team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
+            let _ = db::log_event(
+                &state.db, "instance.stopped",
+                Some(&body.challenge_name), Some(body.team_id), body.user_id, None,
+                Some("stopped via plugin"),
+            );
             if let Some(flag_id) = ctfd_flag_id {
                 ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
             }
@@ -1579,6 +1608,11 @@ async fn plugin_solve_handler(
     }
     match db::mark_instance_solved(&state.db, &body.challenge_name, body.team_id) {
         Ok(Some((container_id, ctfd_flag_id))) => {
+            let _ = db::log_event(
+                &state.db, "instance.solved",
+                Some(&body.challenge_name), Some(body.team_id), body.user_id, None,
+                body.submitted_flag.as_deref(),
+            );
             if let Some(flag_id) = ctfd_flag_id {
                 ctfd_db::delete_flag(&state.ctfd_pool, flag_id).await;
             }
@@ -1887,6 +1921,120 @@ async fn admin_config_handler(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"}))).into_response();
     }
     Json(json!({ "ctfd_url": state.ctfd_url })).into_response()
+}
+
+/// CTFd config keys that `nervctf event apply` may write. An allowlist keeps a
+/// bad or stale `.nervctf.yml` from blanking unrelated settings.
+const EVENT_CONFIG_KEYS: &[&str] = &[
+    "ctf_name",
+    "ctf_description",
+    "start",
+    "end",
+    "user_mode",
+    "challenge_visibility",
+    "registration_visibility",
+    "score_visibility",
+    "account_visibility",
+    "verify_emails",
+];
+
+/// `GET /api/v1/admin/event` — current values for the managed event keys.
+async fn admin_event_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    match ctfd_db::get_configs(&state.ctfd_pool, EVENT_CONFIG_KEYS).await {
+        Ok(values) => {
+            let map: serde_json::Map<String, Value> = values
+                .into_iter()
+                .map(|(k, v)| (k, Value::String(v)))
+                .collect();
+            ctfd_ok(Value::Object(map))
+        }
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `PUT /api/v1/admin/event` — upsert event settings from a flat JSON object.
+async fn admin_event_set(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let Some(obj) = body.as_object() else {
+        return ctfd_err(StatusCode::BAD_REQUEST, "expected a JSON object");
+    };
+    let mut values: Vec<(String, String)> = Vec::new();
+    for (key, value) in obj {
+        if !EVENT_CONFIG_KEYS.contains(&key.as_str()) {
+            return ctfd_err(
+                StatusCode::BAD_REQUEST,
+                &format!("unsupported event key '{}'", key),
+            );
+        }
+        let text = match value {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => b.to_string(),
+            Value::Number(n) => n.to_string(),
+            Value::Null => continue,
+            _ => {
+                return ctfd_err(
+                    StatusCode::BAD_REQUEST,
+                    &format!("event key '{}' must be a scalar", key),
+                )
+            }
+        };
+        values.push((key.clone(), text));
+    }
+    if values.is_empty() {
+        return ctfd_err(StatusCode::BAD_REQUEST, "no event settings provided");
+    }
+    match ctfd_db::set_configs(&state.ctfd_pool, &values).await {
+        Ok(n) => ctfd_ok(json!({"written": n})),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `GET /api/v1/admin/events` — lifecycle log.
+///
+/// Query parameters: `type`, `challenge`, `team`, `since` (SQLite datetime),
+/// `limit` (default 200, max 5000), `offset`.
+async fn admin_events_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !check_any_auth(&headers, &state.db).await {
+        return ctfd_err(StatusCode::UNAUTHORIZED, "Unauthorized");
+    }
+    let filter = db::EventFilter {
+        event_type: params.get("type").cloned().filter(|s| !s.is_empty()),
+        challenge_name: params.get("challenge").cloned().filter(|s| !s.is_empty()),
+        team_id: params.get("team").and_then(|s| s.parse::<i64>().ok()),
+        since: params.get("since").cloned().filter(|s| !s.is_empty()),
+        limit: params
+            .get("limit")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(200)
+            .clamp(1, 5000),
+        offset: params
+            .get("offset")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0),
+    };
+    let db = Arc::clone(&state.db);
+    match tokio::task::spawn_blocking(move || db::list_events(&db, &filter)).await {
+        Ok(Ok(rows)) => ctfd_ok(Value::Array(rows)),
+        Ok(Err(e)) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        Err(e) => ctfd_err(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 /// `GET /api/v1/admin/probe[?refresh=true]`

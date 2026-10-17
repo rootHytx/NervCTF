@@ -8,6 +8,7 @@ use nervctf::{
         CtfdClient,
     },
     directory_scanner::DirectoryScanner,
+    EventConfig,
     fix::run_fix,
     load_config,
     setup::{run_setup, run_upgrade},
@@ -135,6 +136,13 @@ enum Commands {
         /// Output raw JSON instead of the formatted table.
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+
+    /// Apply declarative CTFd event settings from the `event:` block in .nervctf.yml
+    Event {
+        /// Print the mapped settings without applying them
+        #[arg(long)]
+        show: bool,
     },
 }
 
@@ -268,6 +276,9 @@ async fn main() -> Result<()> {
         Commands::Probe { refresh, json } => {
             run_probe(&client, refresh, json).await?;
         }
+        Commands::Event { show } => {
+            run_event(&client, file_config.event.as_ref(), show).await?;
+        }
         Commands::Setup { .. } | Commands::Fix { .. } | Commands::Validate { .. } => {
             unreachable!("handled before credential resolution")
         }
@@ -354,6 +365,71 @@ async fn run_probe(client: &CtfdClient, refresh: bool, json_output: bool) -> any
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+// ── event ─────────────────────────────────────────────────────────────────────
+
+/// Map the friendly `event:` block to CTFd `configs` keys and PUT it to the monitor.
+async fn run_event(
+    client: &CtfdClient,
+    event: Option<&EventConfig>,
+    show: bool,
+) -> Result<()> {
+    let event = event.ok_or_else(|| {
+        anyhow!("no `event:` block in .nervctf.yml — add one before running `nervctf event apply`")
+    })?;
+
+    let mut payload = serde_json::Map::new();
+    if let Some(v) = &event.name {
+        payload.insert("ctf_name".into(), json!(v));
+    }
+    if let Some(v) = &event.description {
+        payload.insert("ctf_description".into(), json!(v));
+    }
+    if let Some(v) = &event.start {
+        payload.insert("start".into(), json!(v));
+    }
+    if let Some(v) = &event.end {
+        payload.insert("end".into(), json!(v));
+    }
+    if let Some(v) = &event.user_mode {
+        payload.insert("user_mode".into(), json!(v));
+    }
+    if let Some(v) = &event.challenge_visibility {
+        payload.insert("challenge_visibility".into(), json!(v));
+    }
+    if let Some(v) = &event.registration_visibility {
+        payload.insert("registration_visibility".into(), json!(v));
+    }
+    if let Some(v) = &event.score_visibility {
+        payload.insert("score_visibility".into(), json!(v));
+    }
+    if let Some(v) = &event.account_visibility {
+        payload.insert("account_visibility".into(), json!(v));
+    }
+    if let Some(v) = &event.verify_emails {
+        payload.insert("verify_emails".into(), json!(v));
+    }
+    if payload.is_empty() {
+        anyhow::bail!("`event:` block has no settings to apply");
+    }
+    let payload = serde_json::Value::Object(payload);
+
+    if show {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    let result: Option<serde_json::Value> = client
+        .execute::<serde_json::Value, _>(reqwest::Method::PUT, "/admin/event", Some(&payload))
+        .await?;
+    let written = result
+        .as_ref()
+        .and_then(|v| v.get("written"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    println!("event settings applied ({} key(s))", written);
     Ok(())
 }
 

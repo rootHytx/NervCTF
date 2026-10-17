@@ -606,12 +606,104 @@ def stop_instance():
 
 # ── Plugin entry point ────────────────────────────────────────────────────────
 
+def _maybe_complete_setup(app):
+    """Create the first admin and write CTFd's base settings when the instance
+    has not been set up yet.
+
+    Driven by NERVCTF_EVENT_* / NERVCTF_ADMIN_* env vars written by the setup
+    playbook. Runs only while CTFd's `setup` flag is absent or false, so it is a
+    no-op on later boots.
+    """
+    admin_user = os.environ.get("NERVCTF_ADMIN_USER")
+    admin_email = os.environ.get("NERVCTF_ADMIN_EMAIL")
+    admin_password = os.environ.get("NERVCTF_ADMIN_PASSWORD")
+    event_name = os.environ.get("NERVCTF_EVENT_NAME")
+    if not (admin_user and admin_email and admin_password and event_name):
+        return
+    try:
+        import bcrypt
+        from CTFd.models import Configs, Users, db
+    except Exception as exc:  # depends on the CTFd build
+        logger.warning("NervCTF auto-setup unavailable: %s", exc)
+        return
+
+    try:
+        with app.app_context():
+            setup = Configs.query.filter_by(key="setup").first()
+            if setup is not None and str(setup.value).lower() == "true":
+                return
+            if Users.query.filter_by(name=admin_user).first() is None:
+                # Detect how this build stores passwords. Some CTFd builds hash
+                # on assignment through a Users.password setter; others expect a
+                # pre-hashed value (this build uses passlib bcrypt_sha256).
+                probe = Users(
+                    name="__nervctf_probe__",
+                    email="__nervctf_probe__@example.invalid",
+                    password="__nervctf_probe__",
+                )
+                hashes_on_assignment = str(probe.password) != "__nervctf_probe__"
+                if hashes_on_assignment:
+                    password_value = admin_password
+                else:
+                    try:
+                        from passlib.hash import bcrypt_sha256
+                        password_value = bcrypt_sha256.hash(admin_password)
+                    except Exception:
+                        password_value = bcrypt.hashpw(
+                            admin_password.encode("utf-8"),
+                            bcrypt.gensalt(rounds=12),
+                        ).decode("utf-8")
+                admin_fields = {
+                    "name": admin_user,
+                    "email": admin_email,
+                    "password": password_value,
+                    "type": "admin",
+                    "verified": True,
+                    "hidden": True,
+                    "banned": False,
+                }
+                # Filter to columns the installed CTFd actually maps; the
+                # keyword-argument error on Configs shows this build is not
+                # stock, so do not assume every optional column exists.
+                columns = {column.name for column in Users.__table__.columns}
+                db.session.add(
+                    Users(**{k: v for k, v in admin_fields.items() if k in columns})
+                )
+            settings = {
+                "ctf_name": event_name,
+                "ctf_description": os.environ.get("NERVCTF_EVENT_DESCRIPTION", ""),
+                "user_mode": os.environ.get("NERVCTF_USER_MODE", "teams"),
+                "setup": "true",
+            }
+            for key, value in settings.items():
+                row = Configs.query.filter_by(key=key).first()
+                if row is None:
+                    # Do not pass `type`: some CTFd builds' Configs model has no
+                    # such attribute (the column may exist in the table, but the
+                    # ORM does not expose it).
+                    db.session.add(Configs(key=key, value=value))
+                else:
+                    row.value = value
+            db.session.commit()
+            logger.info("NervCTF completed CTFd first-run setup (admin=%s)", admin_user)
+    except Exception as exc:
+        # During `flask db upgrade` the core tables may not exist yet; that is
+        # expected and the next app boot retries once migrations have run.
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        logger.warning("NervCTF auto-setup failed: %s", exc)
+
+
 def load(app):
     from CTFd.models import db as _db
     from .models.challenge import InstanceChallenge  # noqa: F401 — registers model
 
     with app.app_context():
         _db.create_all()
+
+    _maybe_complete_setup(app)
 
     CHALLENGE_CLASSES["instance"] = InstanceChallengeType
     register_plugin_assets_directory(

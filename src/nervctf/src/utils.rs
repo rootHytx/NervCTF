@@ -3,6 +3,45 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Declarative CTFd event settings applied with `nervctf event apply`.
+/// Field names are the friendly YAML names; `run_event` maps them to CTFd
+/// `configs` keys (`name` -> `ctf_name`, and so on).
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct EventConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub challenge_visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_visibility: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_emails: Option<bool>,
+}
+
+/// First CTFd admin account. Used once to complete CTFd's first-run setup; the
+/// plugin ignores it after `setup` is true.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct AdminConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
 /// Configuration loaded from `.nervctf.yml` (merged with env vars and CLI flags).
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct Config {
@@ -47,6 +86,14 @@ pub struct Config {
     // Domain shown to players instead of the runner IP (backend still uses the IP).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runner_domain: Option<String>,
+
+    // Declarative event settings (applied with `nervctf event apply`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<EventConfig>,
+
+    // First CTFd admin account (applied by `nervctf setup` via the plugin).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin: Option<AdminConfig>,
 }
 
 /// Walk up from `start_dir` looking for `.nervctf.yml` or `.nervctf.yaml`.
@@ -115,5 +162,11 @@ pub fn find_config_path(start_dir: &Path) -> PathBuf {
 pub fn save_config(config: &Config, path: &Path) -> Result<()> {
     let content = serde_yaml::to_string(config).context("serializing config")?;
     fs::write(path, content)?;
+    // The file may hold the first-admin password; keep it owner-only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }

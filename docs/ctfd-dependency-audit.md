@@ -31,9 +31,10 @@ The CLI never calls CTFd's HTTP API directly. Every CLI operation goes to the mo
 | `files` | SELECT, INSERT, DELETE | `id, challenge_id, type, location` | `type` is hardcoded `'challenge'`; the file is written to disk separately |
 | `topics` | SELECT, INSERT IGNORE | `id, value` | Canonical topic rows |
 | `challenge_topics` | SELECT, INSERT IGNORE, DELETE | `challenge_id, topic_id` | Junction table |
-| `users` | SELECT | `token, banned, hidden, team_id, id, name` | Token auth and name cache |
+| `users` | SELECT, INSERT (first admin only) | `token, banned, hidden, team_id, id, name, type` | Token auth, name cache, and the plugin's first-run admin creation |
 | `teams` | SELECT | `id, name` | Team name cache |
 | `submissions` | SELECT (read-only) | `team_id, user_id, challenge_id, date, type` | Solve sync; only `type='correct'` rows are read |
+| `configs` / `config` | SELECT, INSERT, UPDATE | `key, value, type` | Event settings from `nervctf event`; `user_mode` and `ctf_version` are read by the probe. The monitor auto-detects which table name the build uses. |
 
 ### Tables accessed conditionally (schema-detected at runtime)
 
@@ -314,6 +315,8 @@ SOLVED
 | `dynamic_challenge` table | Yes | Medium | Correct for MariaDB |
 | `dynamic_challenge.function` column name | No | Medium | Hardcoded `function`; a rename causes a runtime SQL error |
 | `nervctf_instance_challenge` table | Yes, info_schema | Low | LEFT JOIN fallback |
+| `configs` / `config` settings table | Yes, info_schema | Low | `config_table()` picks whichever exists; the plugin uses the ORM |
+| Password hashing (`Users.password`) | Probed at first admin creation | Medium | Some builds use passlib `bcrypt_sha256` and hash on assignment; the plugin detects both behaviors |
 | `BaseChallenge.attempt()` return type | Partial (`TypeError` catch) | High | The dual path has a gap for a subscriptable `ChallengeResponse` |
 | `BaseChallenge.solve/fail` signatures | No | Medium | 4-arg form assumed |
 | Team versus user mode | Yes, at startup | Medium | User-mode warns at startup and returns 403 on player routes |
@@ -328,7 +331,7 @@ SOLVED
 ### 1. Critical — user-mode CTFd denies all instance access
 
 `validate_token()` treats `users.team_id IS NULL` as unauthorised and returns `None`, so every player instance route returns 403 "Not in a team". The operator gets no warning. **Affects:** `ctfd_db.rs:59`, `__init__.py:63-64`, all four player routes.
-**Fixed in v2.3.1:** `detect_ctfd_mode()` queries `configs WHERE key='user_mode'` right after pool creation and logs a `WARN` when user-mode is detected.
+**Fixed in v2.3.1:** `detect_ctfd_mode()` queries the settings table (`configs` or `config`) for `user_mode` right after pool creation and logs a `WARN` when user-mode is detected.
 
 ### 2. High — `BaseChallenge.attempt()` dual-path gap
 
@@ -342,7 +345,7 @@ The plugin catches `TypeError` (non-subscriptable) and falls back to `getattr(re
 ### 4. High — CTFd version pinned only at first setup
 
 The `version: "3.7.3"` git tag applies only when CTFd is not cloned yet, and the upgrade playbook has no version guard. A manual `git pull` on the server drifts every schema assumption. **Affects:** `nervctf_playbook.yml`.
-**Partly addressed in v2.4.0:** `nervctf probe` reports the live version from the `configs` table, and `nervctf deploy` compares it against `TESTED_CTFD_VERSION` (`3.7.3`), warning on a mismatch. Deploy does not block on version drift alone; the probe's capability fields are the compatibility signal.
+**Partly addressed in v2.4.0:** `nervctf probe` reports the live version from the settings table (`configs` or `config`), and `nervctf deploy` compares it against `TESTED_CTFD_VERSION` (`3.7.3`), warning on a mismatch. Deploy does not block on version drift alone; the probe's capability fields are the compatibility signal.
 
 ### 5. Medium — `challenges.next_id` assumed present (fixed)
 

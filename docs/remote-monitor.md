@@ -91,10 +91,10 @@ Where a column is absent, `build_full_query()` substitutes a literal `NULL` at t
 
 ### `detect_ctfd_mode()`
 
-Runs once at startup, right after the MariaDB pool is created:
+Runs once at startup, right after the MariaDB pool is created. The monitor first resolves whether the installed CTFd names its settings table `configs` or `config`, then queries:
 
 ```sql
-SELECT `value` FROM configs WHERE `key` = 'user_mode' LIMIT 1
+SELECT `value` FROM <settings_table> WHERE `key` = 'user_mode' LIMIT 1
 ```
 
 | Result | `CtfdMode` | Logged as |
@@ -157,6 +157,8 @@ In user-mode, `validate_token()` returns `None` for every user because `users.te
 | `GET` | `/api/v1/admin/probe` | CTFd compatibility probe; `?refresh=true` runs a fresh probe |
 | `GET/POST` | `/api/v1/admin/tokens` | List or create operator tokens |
 | `DELETE` | `/api/v1/admin/tokens/:id` | Revoke an operator token |
+| `GET/PUT` | `/api/v1/admin/event` | Read or upsert the managed CTFd event settings |
+| `GET` | `/api/v1/admin/events` | Lifecycle event log (`type`, `challenge`, `team`, `since`, `limit`, `offset`) |
 
 ### Plugin auth (admin token plus explicit `team_id`, called by the CTFd plugin)
 
@@ -178,6 +180,37 @@ In user-mode, `validate_token()` returns `None` for every user because `users.te
 | `GET` | `/api/v1/instance/info` | Get the caller's instance |
 | `POST` | `/api/v1/instance/renew` | Extend expiry |
 | `DELETE` | `/api/v1/instance/stop` | Destroy the caller's instance |
+
+---
+
+## Event settings and event log
+
+### `GET /api/v1/admin/event`
+
+Returns the managed CTFd settings as a flat JSON object. The monitor resolves the settings table (`configs` or `config`) at runtime.
+
+### `PUT /api/v1/admin/event`
+
+Upserts a flat JSON object. Keys are restricted to an allowlist: `ctf_name`, `ctf_description`, `start`, `end`, `user_mode`, `challenge_visibility`, `registration_visibility`, `score_visibility`, `account_visibility`, and `verify_emails`. Values must be scalars. Returns `{"written": N}`.
+
+Unknown keys are rejected with HTTP 400, so a stale config cannot blank unrelated settings.
+
+### `GET /api/v1/admin/events`
+
+Returns the lifecycle log, newest first.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `type` | none | `instance.requested`, `instance.running`, `instance.stopped`, `instance.solved`, `instance.expired` |
+| `challenge` | none | Challenge name |
+| `team` | none | Numeric CTFd team id |
+| `since` | none | SQLite datetime (`YYYY-MM-DD HH:MM:SS`) |
+| `limit` | 200 | Maximum rows, clamped to 1–5000 |
+| `offset` | 0 | Pagination offset |
+
+Each row includes `id`, `event_type`, `challenge_name`, `team_id`, `team_name`, `user_id`, `user_name`, `instance_id`, `detail`, and `created_at`.
+
+The table has no automatic retention limit. Prune it with `DELETE FROM events WHERE created_at < ...` if it grows too large.
 
 ---
 
@@ -250,7 +283,7 @@ Reads from CTFd MariaDB (read-only) and updates the local SQLite caches.
 
 ## SQLite schema
 
-The schema (`db.rs`) is reproduced in `ARCHITECTURE.md`. In short, the monitor stores instance configs, instances, flag attempts, a permanent `team_flags` history, read-only caches of CTFd solves and team/user names, operator tokens, browser sessions, and the singleton `ctfd_probe` row.
+The schema (`db.rs`) is reproduced in `ARCHITECTURE.md`. In short, the monitor stores instance configs, instances, flag attempts, a permanent `team_flags` history, read-only caches of CTFd solves and team/user names, operator tokens, browser sessions, the singleton `ctfd_probe` row, and the `events` lifecycle log.
 
 `Db = Arc<Mutex<Connection>>`, WAL mode is on, and migrations run on every `open()`.
 

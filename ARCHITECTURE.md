@@ -102,10 +102,14 @@ pub struct Config {
     pub runner_ip:                 Option<String>,   // split-machine mode
     pub runner_user:               Option<String>,   // split-machine mode
     pub runner_domain:             Option<String>,   // split-machine mode
+    pub event:                     Option<EventConfig>, // CTFd event settings
+    pub admin:                     Option<AdminConfig>, // first CTFd admin
 }
 ```
 
-`load_config(start_dir)` walks up looking for `.nervctf.yml`. `save_config(config, path)` serialises to YAML and skips `None` fields.
+`EventConfig` holds `name`, `description`, `start`, `end`, `user_mode`, the four visibility settings, and `verify_emails`. `AdminConfig` holds `user`, `email`, and `password`.
+
+`load_config(start_dir)` walks up looking for `.nervctf.yml`. `save_config(config, path)` serialises to YAML, skips `None` fields, and writes the file with mode `0600` because it can contain the admin password.
 
 In split-machine mode (`runner_ip` and `runner_user` set), `nervctf deploy` rsyncs challenge files to `{runner_user}@{runner_ip}` and the monitor runs container commands on the runner over SSH.
 
@@ -215,10 +219,17 @@ Commands:
   scan [--detailed]
   validate [--debug]
   probe [--refresh] [--json]
+  event [--show]                    Apply the `event:` block to CTFd settings
   fix [--dry-run]
 ```
 
 `--recreate` forces every challenge into the update queue, skipping the up-to-date check and the confirmation prompt. Use it to re-sync files to the runner or rebuild images.
+
+### Event settings and event log
+
+`nervctf event` maps the `event:` block to CTFd settings and `PUT`s them to `/api/v1/admin/event`. The monitor accepts only an allowlist: `ctf_name`, `ctf_description`, `start`, `end`, `user_mode`, `challenge_visibility`, `registration_visibility`, `score_visibility`, `account_visibility`, and `verify_emails`. It resolves the settings table name at runtime (`configs` or `config`).
+
+The monitor also appends lifecycle rows to its SQLite `events` table: `instance.requested`, `instance.running`, `instance.stopped`, `instance.solved`, and `instance.expired`. `GET /api/v1/admin/events` returns them with `type`, `challenge`, `team`, `since`, `limit`, and `offset` filters. Flag submissions are not duplicated there; they live in `flag_attempts`.
 
 ### Deploy flow (`deploy_challenges` in `main.rs`)
 
@@ -454,6 +465,17 @@ CREATE TABLE ctfd_probe (   -- singleton row (id = 1)
     cap_redis_sync        TEXT NOT NULL DEFAULT 'degraded',
     probe_notes           TEXT NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE events (   -- durable lifecycle log
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type     TEXT NOT NULL,
+    challenge_name TEXT,
+    team_id        INTEGER,
+    user_id        INTEGER,
+    instance_id    INTEGER,
+    detail         TEXT,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
 ```
 
 `Db = Arc<Mutex<Connection>>`. WAL mode is enabled and migrations run on every `open()`.
@@ -533,6 +555,8 @@ A SQLAlchemy polymorphic model with `__mapper_args__ = {"polymorphic_identity": 
 
 `load(app)` creates the table with `db.create_all()` so `nervctf_instance_challenge` exists.
 
+`_maybe_complete_setup(app)` also runs from `load()`. When CTFd's `setup` setting is absent or false and the `NERVCTF_ADMIN_*`/`NERVCTF_EVENT_*` environment variables are present, it creates the first admin and writes `ctf_name`, `ctf_description`, `user_mode`, and `setup = "true"`. It is a no-op after the first run, so the operator never sees CTFd's setup wizard.
+
 ### `assets/view.js`
 
 Uses the DOM API only (no `innerHTML`). Fetch, Extend, and Terminate buttons call `/api/v1/containers/*`. It shows the connection string and a countdown when an instance is running. The monitor returns `expires_at` as `"YYYY-MM-DD HH:MM:SS"` UTC; the plugin converts it to milliseconds in `_sqlite_to_ms()` before passing it to JavaScript.
@@ -567,8 +591,15 @@ Idempotent, target group `ctfd` (and optionally `runner`). Extra vars include `s
 services:
   ctfd:
     environment:
-      - NERVCTF_MONITOR_URL=http://remote-monitor:33133
-      - NERVCTF_MONITOR_TOKEN=<token>
+      NERVCTF_MONITOR_URL: "http://remote-monitor:33133"
+      NERVCTF_MONITOR_TOKEN: "<token>"
+      # Emitted only when the config has event:/admin: blocks:
+      NERVCTF_EVENT_NAME: "<event name>"
+      NERVCTF_EVENT_DESCRIPTION: "<description>"
+      NERVCTF_USER_MODE: "teams"
+      NERVCTF_ADMIN_USER: "<admin user>"
+      NERVCTF_ADMIN_EMAIL: "<admin email>"
+      NERVCTF_ADMIN_PASSWORD: "<admin password>"
   remote-monitor:
     image: nervctf-monitor:latest
     restart: unless-stopped
@@ -600,7 +631,7 @@ networks:
 
 ### `nervctf_upgrade_playbook.yml`
 
-Syncs the plugin, copies the new monitor binary, rebuilds the image, and restarts the monitor and CTFd. It does not re-provision CTFd or regenerate the token. It warns when the installed CTFd version differs from 3.7.3.
+Syncs the plugin, copies the new monitor binary, rebuilds the image, writes the override, then recreates the whole Compose stack with `docker compose up -d --force-recreate`. Recreating the stack both applies the override environment and makes nginx re-resolve the recreated `ctfd` container; a `restart` leaves the old upstream IP and produces 502s. The playbook does not re-provision CTFd or regenerate the token. It warns when the installed CTFd version differs from 3.7.3.
 
 ---
 
@@ -609,14 +640,15 @@ Syncs the plugin, copies the new monitor binary, rebuilds the image, and restart
 `nervctf setup` runs an interactive wizard:
 
 1. Check the controller for `ansible-playbook` (respecting `ANSIBLE_PLAYBOOK`), `ssh`, and `rsync`.
-2. Prompt for the challenges directory, monitor IP, SSH user, runner IP and user, CTFd path, monitor port, token, and SSH key.
+2. Prompt for the challenges directory, monitor IP, SSH user, runner IP and user, CTFd path, monitor port, token, SSH key, and the first CTFd admin username, email, and password.
 3. Reuse an existing `monitor_token` or generate one (32 bytes from `/dev/urandom`).
 4. Store the private key path in `ssh_key_path` and pass the matching public key to the playbook.
-5. Save `.nervctf.yml`.
+5. Save `.nervctf.yml` with mode `0600`.
 6. Locate the remote-monitor binary (musl targets preferred) and the CTFd plugin (on disk or the embedded copy).
-7. Run the preflight playbook, then the main playbook.
+7. Run the preflight playbook, then the main playbook. The playbook writes the event/admin settings into the CTFd container environment.
+8. On first start, the plugin creates the admin and sets `ctf_name`, `ctf_description`, `user_mode`, and `setup = "true"`, so CTFd's first-run wizard does not appear.
 
-`nervctf setup --upgrade` reads everything from `.nervctf.yml`, confirms, runs the preflight, and runs the upgrade playbook.
+`nervctf setup --upgrade` reads everything from `.nervctf.yml`, prompts only for the admin block when an older config lacks it, confirms, runs the preflight, and runs the upgrade playbook.
 
 ---
 

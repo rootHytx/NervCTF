@@ -217,6 +217,22 @@ fn init_schema(conn: &Connection) -> Result<()> {
             probe_notes           TEXT NOT NULL DEFAULT '[]'
         );"
     );
+    // Migration: durable lifecycle event log.
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS events (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type     TEXT NOT NULL,
+            challenge_name TEXT,
+            team_id        INTEGER,
+            user_id        INTEGER,
+            instance_id    INTEGER,
+            detail         TEXT,
+            created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_created   ON events(created_at);
+        CREATE INDEX IF NOT EXISTS idx_events_type      ON events(event_type);
+        CREATE INDEX IF NOT EXISTS idx_events_challenge ON events(challenge_name);"
+    );
     Ok(())
 }
 
@@ -426,6 +442,13 @@ pub fn insert_instance(
             params![challenge_name, team_id, f],
         )?;
     }
+    // Lifecycle log: the instance reached running. Kept on the same connection to
+    // avoid re-locking the mutex. Best effort: logging must never break provisioning.
+    let _ = conn.execute(
+        "INSERT INTO events (event_type, challenge_name, team_id, user_id, detail)
+         VALUES ('instance.running', ?1, ?2, ?3, ?4)",
+        params![challenge_name, team_id, user_id, container_id],
+    );
     Ok(())
 }
 
@@ -645,6 +668,92 @@ pub fn insert_flag_attempt(
         ],
     )?;
     Ok(())
+}
+
+// ── Lifecycle event log ──────────────────────────────────────────────────────
+
+/// Append one lifecycle event. `detail` is free-form text or JSON.
+pub fn log_event(
+    db: &Db,
+    event_type: &str,
+    challenge_name: Option<&str>,
+    team_id: Option<i64>,
+    user_id: Option<i64>,
+    instance_id: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    conn.execute(
+        "INSERT INTO events (event_type, challenge_name, team_id, user_id, instance_id, detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![event_type, challenge_name, team_id, user_id, instance_id, detail],
+    )?;
+    Ok(())
+}
+
+/// Filters accepted by `list_events`. `None` means "no filter".
+#[derive(Default)]
+pub struct EventFilter {
+    pub event_type: Option<String>,
+    pub challenge_name: Option<String>,
+    pub team_id: Option<i64>,
+    pub since: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+pub fn list_events(db: &Db, filter: &EventFilter) -> Result<Vec<Value>> {
+    let conn = db.lock().map_err(|_| anyhow!("db lock poisoned"))?;
+    let mut sql = String::from(
+        "SELECT e.id, e.event_type, e.challenge_name,
+                e.team_id, ct.name, e.user_id, cu.name,
+                e.instance_id, e.detail, e.created_at
+         FROM events e
+         LEFT JOIN ctfd_teams ct ON ct.id = e.team_id
+         LEFT JOIN ctfd_users cu ON cu.id = e.user_id
+         WHERE 1 = 1",
+    );
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(ref t) = filter.event_type {
+        sql.push_str(" AND e.event_type = ?");
+        values.push(rusqlite::types::Value::Text(t.clone()));
+    }
+    if let Some(ref c) = filter.challenge_name {
+        sql.push_str(" AND e.challenge_name = ?");
+        values.push(rusqlite::types::Value::Text(c.clone()));
+    }
+    if let Some(t) = filter.team_id {
+        sql.push_str(" AND e.team_id = ?");
+        values.push(rusqlite::types::Value::Integer(t));
+    }
+    if let Some(ref s) = filter.since {
+        sql.push_str(" AND e.created_at >= ?");
+        values.push(rusqlite::types::Value::Text(s.clone()));
+    }
+    sql.push_str(" ORDER BY e.id DESC LIMIT ? OFFSET ?");
+    values.push(rusqlite::types::Value::Integer(filter.limit.max(1)));
+    values.push(rusqlite::types::Value::Integer(filter.offset.max(0)));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+        Ok(serde_json::json!({
+            "id": row.get::<_, i64>(0)?,
+            "event_type": row.get::<_, String>(1)?,
+            "challenge_name": row.get::<_, Option<String>>(2)?,
+            "team_id": row.get::<_, Option<i64>>(3)?,
+            "team_name": row.get::<_, Option<String>>(4)?,
+            "user_id": row.get::<_, Option<i64>>(5)?,
+            "user_name": row.get::<_, Option<String>>(6)?,
+            "instance_id": row.get::<_, Option<i64>>(7)?,
+            "detail": row.get::<_, Option<String>>(8)?,
+            "created_at": row.get::<_, String>(9)?,
+        }))
+    })?;
+    let mut result = Vec::new();
+    for r in rows {
+        result.push(r?);
+    }
+    Ok(result)
 }
 
 pub fn list_flag_attempts(db: &Db, limit: i64) -> Result<Vec<Value>> {

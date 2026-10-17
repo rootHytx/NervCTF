@@ -295,6 +295,12 @@ Before any remote writes, `nervctf deploy` fetches the cached probe result (no `
 
 ---
 
+## 9. Event settings
+
+`nervctf event` maps the `event:` block to CTFd setting keys and calls `execute::<Value, _>(Method::PUT, "/admin/event", Some(&payload))`. The monitor enforces the key allowlist and resolves whether the installed CTFd stores settings in `configs` or `config`. See `docs/remote-monitor.md` for the endpoint contract.
+
+---
+
 ## References
 
 - `src/nervctf/src/ctfd_api/client.rs`

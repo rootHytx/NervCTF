@@ -21,20 +21,40 @@ pub enum CtfdMode {
     Unknown,
 }
 
-/// Queries CTFd's `configs` table to detect team-mode vs user-mode.
-/// Returns `Unknown` if the `configs` table is inaccessible or the key is absent.
+/// Resolve CTFd's settings table name. CTFd builds have shipped both `configs`
+/// and `config`; assuming one breaks mode detection and event settings on the
+/// other. The returned value is a fixed string, never caller input.
+async fn config_table(conn: &mut mysql_async::Conn) -> &'static str {
+    let has_configs: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'configs'",
+            (),
+        )
+        .await
+        .unwrap_or(None);
+    if has_configs.unwrap_or(0) > 0 {
+        "configs"
+    } else {
+        "config"
+    }
+}
+
+/// Queries CTFd's settings table to detect team-mode vs user-mode.
+/// Returns `Unknown` if the table is inaccessible or the key is absent.
 pub async fn detect_ctfd_mode(pool: &mysql_async::Pool) -> CtfdMode {
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(_) => return CtfdMode::Unknown,
     };
-    let row: Option<String> = conn
-        .exec_first(
-            "SELECT `value` FROM configs WHERE `key` = 'user_mode' LIMIT 1",
-            (),
-        )
-        .await
-        .unwrap_or(None);
+    let table = config_table(&mut conn).await;
+    let sql = format!("SELECT `value` FROM `{}` WHERE `key` = 'user_mode' LIMIT 1", table);
+    let row: Option<String> = match conn.exec_first(sql.as_str(), ()).await {
+        Ok(v) => v,
+        // A failed query is not the same as "no user_mode row": report Unknown
+        // instead of silently defaulting to team mode.
+        Err(_) => return CtfdMode::Unknown,
+    };
     match row.as_deref() {
         Some("1") | Some("true") => CtfdMode::UserMode,
         Some("0") | Some("false") | Some("") | None => CtfdMode::TeamMode,
@@ -996,13 +1016,12 @@ pub async fn run_probe(pool: &mysql_async::Pool) -> ProbeResult {
         .unwrap_or_default();
     dynamic_cols.sort();
 
-    // Step 4: detect CTFd version from the configs table.
+    // Step 4: detect CTFd version from the settings table (`configs` or `config`).
     let (ctfd_version_tag, ctfd_version_source) = {
+        let table = config_table(&mut conn).await;
+        let sql = format!("SELECT `value` FROM `{}` WHERE `key` = 'ctf_version' LIMIT 1", table);
         let row: Option<String> = conn
-            .exec_first(
-                "SELECT `value` FROM configs WHERE `key` = 'ctf_version' LIMIT 1",
-                (),
-            )
+            .exec_first(sql.as_str(), ())
             .await
             .unwrap_or(None);
         match row {
@@ -1232,5 +1251,103 @@ pub async fn sync_users_and_teams(pool: &Pool, db: &Db) -> Result<()> {
         .map_err(|e| anyhow!("ctfd_db: sync_users_and_teams: sqlite: {}", e))?;
     tracing::debug!("ctfd_db: sync_users_and_teams: {} teams, {} users", nt, nu);
     Ok(())
+}
+
+// ── CTFd configs (event settings) ────────────────────────────────────────────
+
+/// Read a set of CTFd settings values. Missing keys are omitted.
+pub async fn get_configs(pool: &Pool, keys: &[&str]) -> Result<Vec<(String, String)>> {
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: get_configs: get_conn: {}", e))?;
+    let table = config_table(&mut conn).await;
+    let sql = format!("SELECT `value` FROM `{}` WHERE `key` = ? LIMIT 1", table);
+    let mut out = Vec::new();
+    for key in keys {
+        let value: Option<String> = conn
+            .exec_first(sql.as_str(), (*key,))
+            .await
+            .map_err(|e| anyhow!("ctfd_db: get_configs: query {}: {}", key, e))?;
+        if let Some(v) = value {
+            out.push(((*key).to_string(), v));
+        }
+    }
+    Ok(out)
+}
+
+/// Upsert CTFd settings values. Uses the `type` column when the installed CTFd
+/// schema has it. Returns the number of keys written.
+pub async fn set_configs(pool: &Pool, values: &[(String, String)]) -> Result<usize> {
+    if values.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = pool.get_conn().await
+        .map_err(|e| anyhow!("ctfd_db: set_configs: get_conn: {}", e))?;
+    let table = config_table(&mut conn).await;
+
+    let type_probe = format!(
+        "SELECT COUNT(*) FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{}' AND COLUMN_NAME = 'type'",
+        table
+    );
+    let has_type: Option<i64> = conn
+        .exec_first(type_probe.as_str(), ())
+        .await
+        .map_err(|e| anyhow!("ctfd_db: set_configs: probe type column: {}", e))?;
+    let has_type = has_type.unwrap_or(0) > 0;
+
+    let lookup_sql = format!("SELECT id FROM `{}` WHERE `key` = ? LIMIT 1", table);
+    let update_with_type = format!("UPDATE `{}` SET `value` = ?, `type` = ? WHERE `id` = ?", table);
+    let update_plain = format!("UPDATE `{}` SET `value` = ? WHERE `id` = ?", table);
+    let insert_with_type = format!(
+        "INSERT INTO `{}` (`key`, `value`, `type`) VALUES (?, ?, ?)",
+        table
+    );
+    let insert_plain = format!("INSERT INTO `{}` (`key`, `value`) VALUES (?, ?)", table);
+
+    let mut written = 0usize;
+    for (key, value) in values {
+        // Mirror CTFd's own column typing so booleans and integers round-trip.
+        let col_type = if value == "true" || value == "false" {
+            "boolean"
+        } else if value.parse::<i64>().is_ok() {
+            "int"
+        } else {
+            "string"
+        };
+        // The settings `key` has no guaranteed unique constraint, so use an
+        // explicit select-then-update/insert rather than ON DUPLICATE KEY.
+        let existing: Option<i64> = conn
+            .exec_first(lookup_sql.as_str(), (key.as_str(),))
+            .await
+            .map_err(|e| anyhow!("ctfd_db: set_configs: lookup {}: {}", key, e))?;
+        if let Some(id) = existing {
+            if has_type {
+                conn.exec_drop(
+                    update_with_type.as_str(),
+                    (value.as_str(), col_type, id),
+                )
+                .await
+                .map_err(|e| anyhow!("ctfd_db: set_configs: update {}: {}", key, e))?;
+            } else {
+                conn.exec_drop(update_plain.as_str(), (value.as_str(), id))
+                    .await
+                    .map_err(|e| anyhow!("ctfd_db: set_configs: update {}: {}", key, e))?;
+            }
+        } else if has_type {
+            conn.exec_drop(
+                insert_with_type.as_str(),
+                (key.as_str(), value.as_str(), col_type),
+            )
+            .await
+            .map_err(|e| anyhow!("ctfd_db: set_configs: insert {}: {}", key, e))?;
+        } else {
+            conn.exec_drop(insert_plain.as_str(), (key.as_str(), value.as_str()))
+                .await
+                .map_err(|e| anyhow!("ctfd_db: set_configs: insert {}: {}", key, e))?;
+        }
+        written += 1;
+    }
+    tracing::info!("ctfd_db: set_configs: wrote {} key(s) to {}", written, table);
+    Ok(written)
 }
 

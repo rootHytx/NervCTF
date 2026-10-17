@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Input, Password, Select};
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -7,7 +7,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use tempfile::tempdir;
 
-use crate::{find_config_path, load_config, save_config};
+use crate::{find_config_path, load_config, save_config, AdminConfig, Config};
 
 const PLAYBOOK: &str = include_str!("../assets/nervctf_playbook.yml");
 const UPGRADE_PLAYBOOK: &str = include_str!("../assets/nervctf_upgrade_playbook.yml");
@@ -377,6 +377,45 @@ fn public_key_contents(key: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Add the event and first-admin settings to the Ansible extra-vars. The
+/// playbooks write them into the CTFd container environment, where the plugin
+/// consumes them only while CTFd has not been set up.
+fn push_event_and_admin_evars(config: &Config, evars: &mut Vec<String>) {
+    // The plugin needs an event name to complete CTFd's first-run setup. If the
+    // config has no `event:` block, pass a default so setup never leaves CTFd
+    // stuck on the wizard.
+    let (name, description, user_mode) = match config.event {
+        Some(ref ev) => (
+            ev.name.as_deref(),
+            ev.description.as_deref(),
+            ev.user_mode.as_deref(),
+        ),
+        None => (Some("NervCTF"), Some(""), None),
+    };
+    if let Some(v) = name {
+        evars.push(format!("event_name={}", v));
+    }
+    if let Some(v) = description {
+        evars.push(format!("event_description={}", v));
+    }
+    if let Some(v) = user_mode {
+        evars.push(format!("user_mode={}", v));
+    }
+    if let Some(ref ad) = config.admin {
+        // Emit the admin block only when all three fields are present; a partial
+        // block must not reach the plugin.
+        if let (Some(user), Some(email), Some(password)) =
+            (ad.user.as_deref(), ad.email.as_deref(), ad.password.as_deref())
+        {
+            if !user.is_empty() && !email.is_empty() && !password.is_empty() {
+                evars.push(format!("admin_user={}", user));
+                evars.push(format!("admin_email={}", email));
+                evars.push(format!("admin_password={}", password));
+            }
+        }
+    }
+}
+
 pub fn run_setup() -> Result<()> {
     require_local_prerequisites()?;
     println!("==============================================");
@@ -525,6 +564,50 @@ pub fn run_setup() -> Result<()> {
     let ssh_key_path = private_key_path(&selected_key);
     let ssh_pubkey = public_key_contents(&selected_key)?;
 
+    // ── CTFd first-run admin ──────────────────────────────────────────────────
+    // Stored in .nervctf.yml and passed to the CTFd container. The plugin uses
+    // it only while CTFd's `setup` flag is absent or false, so `setup --upgrade`
+    // can recreate the admin if the database is reset.
+    let existing_admin = config.admin.clone().unwrap_or_default();
+    let admin_user = prompt_with_default(
+        "CTFd admin username",
+        Some(existing_admin.user.as_deref().unwrap_or("admin")),
+    )?;
+    let admin_email = prompt_with_default(
+        "CTFd admin email",
+        Some(existing_admin.email.as_deref().unwrap_or("admin@example.com")),
+    )?;
+    let admin_password = {
+        let has_existing = existing_admin
+            .password
+            .as_deref()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        let input = Password::new()
+            .with_prompt(if has_existing {
+                "CTFd admin password (blank = keep existing)"
+            } else {
+                "CTFd admin password"
+            })
+            .allow_empty_password(true)
+            .interact()?;
+        if input.is_empty() {
+            existing_admin.password.clone().unwrap_or_default()
+        } else {
+            input
+        }
+    };
+    if admin_password.is_empty() {
+        return Err(anyhow!(
+            "CTFd admin password is required to create the first admin"
+        ));
+    }
+    config.admin = Some(AdminConfig {
+        user: Some(admin_user),
+        email: Some(admin_email),
+        password: Some(admin_password),
+    });
+
     // ── Save config before deployment ─────────────────────────────────────────
     config.challenges_path = Some(base_dir.clone());
     config.monitor_ip = Some(monitor_ip.clone());
@@ -592,6 +675,7 @@ pub fn run_setup() -> Result<()> {
             evars.push(format!("runner_domain={}", domain));
         }
     }
+    push_event_and_admin_evars(&config, &mut evars);
     let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",
         monitor_ip, monitor_user
@@ -686,7 +770,8 @@ fn run_ansible_playbook(playbook: &str, inventory: &str, evars: &[String]) -> Re
 
 /// Upgrade an existing NervCTF deployment: push the updated CTFd plugin, rebuild
 /// the remote-monitor Docker image, and restart the affected containers.
-/// Reads all connection details from the existing .nervctf.yml — no re-prompting.
+/// Reads connection details from the existing .nervctf.yml. Prompts only for the
+/// admin block when an older config predates it, then applies it on restart.
 pub fn run_upgrade() -> Result<()> {
     require_local_prerequisites()?;
     println!("==============================================");
@@ -701,7 +786,7 @@ pub fn run_upgrade() -> Result<()> {
     println!("==============================================\n");
 
     let cwd = std::env::current_dir()?;
-    let (config, config_file) = load_config(&cwd);
+    let (mut config, config_file) = load_config(&cwd);
 
     // Require an existing config — upgrade makes no sense without a prior setup.
     let config_file = config_file.ok_or_else(|| {
@@ -710,6 +795,29 @@ pub fn run_upgrade() -> Result<()> {
         )
     })?;
     println!("Using config: {}", config_file.display());
+
+    // Older configs predate the first-admin block. Collect it now so the plugin
+    // can complete CTFd's first-run setup on the next restart.
+    if config.admin.is_none() {
+        let admin_user = prompt_with_default("CTFd admin username", Some("admin"))?;
+        let admin_email =
+            prompt_with_default("CTFd admin email", Some("admin@example.com"))?;
+        let admin_password = Password::new()
+            .with_prompt("CTFd admin password")
+            .interact()?;
+        if admin_password.is_empty() {
+            return Err(anyhow!(
+                "CTFd admin password is required to create the first admin"
+            ));
+        }
+        config.admin = Some(AdminConfig {
+            user: Some(admin_user),
+            email: Some(admin_email),
+            password: Some(admin_password),
+        });
+        save_config(&config, &config_file)?;
+        println!("  [ok] admin settings saved to {}", config_file.display());
+    }
 
     let monitor_ip = config.monitor_ip.as_deref().ok_or_else(|| {
         anyhow!("monitor_ip not set in .nervctf.yml — run `nervctf setup` to fix.")
@@ -793,6 +901,7 @@ pub fn run_upgrade() -> Result<()> {
             evars.push(format!("runner_domain={}", domain));
         }
     }
+    push_event_and_admin_evars(&config, &mut evars);
 
     let mut inventory = format!(
         "[ctfd]\n{} ansible_user={} ansible_ssh_common_args='-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'\n",

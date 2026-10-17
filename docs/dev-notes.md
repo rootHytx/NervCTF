@@ -139,7 +139,7 @@ Player auth uses CTFd's `GET /api/v1/users/me` with a bearer token. `AppState` i
 - `models/challenge.py`: `InstanceChallenge(Challenges)` with `polymorphic_identity="instance"`.
 - `assets/view.{html,js}`: player UI with Fetch, Extend, and Terminate buttons, calling `/api/v1/containers/*`.
 - `assets/create.{html,js}` and `assets/update.{html,js}`: admin forms.
-- Environment variables: `NERVCTF_MONITOR_URL`, `NERVCTF_MONITOR_TOKEN` (written to CTFd's `.env` by Ansible).
+- Environment variables: `NERVCTF_MONITOR_URL` and `NERVCTF_MONITOR_TOKEN` (written to CTFd's `.env` by Ansible), plus the first-run setup vars `NERVCTF_EVENT_NAME`, `NERVCTF_EVENT_DESCRIPTION`, `NERVCTF_USER_MODE`, `NERVCTF_ADMIN_USER`, `NERVCTF_ADMIN_EMAIL`, and `NERVCTF_ADMIN_PASSWORD` (written to the CTFd service environment by the playbooks; consumed only while `setup` is absent or false).
 - The plugin proxies to the monitor using the admin token and `team_id`; CTFd user tokens are never exposed to the monitor.
 - `view.js` uses the DOM API only (no `innerHTML`), so it passes the XSS security hook.
 
@@ -182,9 +182,18 @@ Player auth uses CTFd's `GET /api/v1/users/me` with a bearer token. `AppState` i
 - Resolves CTFd's published HTTP port from Compose rather than assuming port 80.
 - Finds the remote-monitor binary (musl targets preferred).
 - Runs a preflight playbook before provisioning: passwordless sudo, `python3`, `rsync`, and `git` on the relevant hosts.
+- Prompts for the first CTFd admin username, email, and password, and saves them under `admin:` in `.nervctf.yml`. The file is written with mode `0600`.
+- Passes `NERVCTF_ADMIN_*` and `NERVCTF_EVENT_*` to the playbooks, which write them into the CTFd service environment. The plugin consumes them once, while `setup` is absent or false.
 - The playbook deploys the plugin over rsync and writes `NERVCTF_MONITOR_*` to CTFd's `.env`.
 - The playbook installs LXD (snap) and Vagrant (HashiCorp apt); both steps use `ignore_errors: true`.
 - Writes the configuration to `.nervctf.yml` before running the playbook.
+- `run_upgrade` prompts for the admin block only when an older config lacks it, then recreates the whole Compose stack. Recreating (not restarting) applies the override environment and refreshes nginx's upstream IP.
+
+## CTFd settings table and password storage
+
+- CTFd builds have shipped both `configs` and `config` as the settings table. `ctfd_db::config_table()` checks `information_schema` and uses whichever exists. The plugin uses the ORM instead, which maps the table automatically.
+- Some builds store passwords with passlib's `bcrypt_sha256` (`$bcrypt-sha256$...`) and hash on assignment through the `Users.password` setter. `_maybe_complete_setup()` constructs a transient `Users` instance to detect that behavior: if assignment hashes, it passes the plaintext; otherwise it hashes with `bcrypt_sha256`. Raw `bcrypt` is only a fallback.
+- `Configs` in some builds has no `type` attribute. The plugin sets only `key` and `value`; the monitor probes the column before using it.
 
 ---
 

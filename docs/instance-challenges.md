@@ -147,42 +147,9 @@ Without `extra:`, the challenge deploys as `standard` with the given `value`.
 
 ## Deploy flow
 
-When `nervctf deploy` processes a `type: instance` challenge:
+`nervctf deploy` creates the challenge in CTFd, then builds from the challenge directory (single-machine) or after rsyncing it to the runner (split-machine), and registers the config with `POST /api/v1/instance/register`. Registry images skip the build.
 
-1. Create or update the challenge in CTFd (direct MariaDB write).
-2. Build, depending on backend and mode.
-
-**Single-machine mode** (no `runner_ip`):
-
-| Backend | Action |
-|---|---|
-| `docker` (local path) | Pack the challenge directory as tar.gz → `POST /api/v1/instance/build` → monitor runs `docker build` |
-| `compose` (relative path) | Pack the challenge directory as tar.gz → `POST /api/v1/instance/build-compose` → monitor runs `docker compose build` |
-| `docker` (registry ref) | No build; the image is pulled at provision time |
-
-**Split-machine mode** (`runner_ip` set):
-
-| Backend | Action |
-|---|---|
-| `docker` (local path) | rsync the challenge directory to the runner → `POST /api/v1/instance/build` |
-| `compose` (relative path) | rsync the challenge directory to the runner → `POST /api/v1/instance/build-compose-remote` → monitor runs `docker compose build` over SSH |
-
-3. `POST /api/v1/instance/register` to register the `InstanceConfig` on the monitor.
-
-### Split-machine mode
-
-With `runner_ip` set, challenge containers run on a separate worker node. The CLI rsyncs challenge files to the runner, and the monitor runs every Docker and Compose command on the runner over SSH (`RUNNER_SSH_TARGET`).
-
-```yaml
-# .nervctf.yml
-runner_ip: 192.168.1.50
-runner_user: docker                    # default: docker
-runner_domain: challenges.example.com  # optional
-```
-
-`runner_domain` lets you show players a DNS name instead of the raw IP. The backend (SSH connections and `RUNNER_SSH_TARGET`) always uses `runner_ip`; only `PUBLIC_HOST` — the value in player connection strings — is replaced with the domain.
-
-Bind-mount paths in `docker-compose.yml` must use the path as seen on the runner filesystem, not inside the monitor container. The runner stores challenge files at the same path used during rsync.
+With `runner_ip` set, the CLI rsyncs challenge files to the runner and the monitor runs every Docker and Compose command there over SSH (`RUNNER_SSH_TARGET`). `runner_domain` only changes the player-facing host; the backend always uses `runner_ip`. Bind mounts in `docker-compose.yml` must use the runner filesystem path.
 
 ---
 

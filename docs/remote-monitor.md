@@ -293,6 +293,8 @@ The schema (`db.rs`) is reproduced in `ARCHITECTURE.md`. In short, the monitor s
 
 At startup, right after the CTFd mode check, the monitor runs a one-shot compatibility probe against MariaDB. It fingerprints the schema and computes a capability status for each feature, persists the result to SQLite, and exposes it over REST so operators can inspect it without restarting.
 
+The `nervctf deploy` gate reads this persisted row before its first write. `nervctf probe --refresh` overwrites it; refresh after a CTFd upgrade so the gate evaluates the new schema.
+
 ### `ctfd_probe` table
 
 A singleton row (`id = 1`), overwritten on every probe. Its columns are listed in `ARCHITECTURE.md`.

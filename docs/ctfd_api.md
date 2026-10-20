@@ -251,6 +251,8 @@ The monitor handles only the routes in section 2. There is no catch-all proxy; u
 
 The `probe` subcommand calls `GET /api/v1/admin/probe` on the remote monitor and prints a capability matrix showing CTFd schema compatibility and operational status.
 
+Run `probe --refresh` after a CTFd upgrade. The deploy gate reads the cached result, so a stale cache would otherwise evaluate the previous schema.
+
 ### Usage
 
 ```

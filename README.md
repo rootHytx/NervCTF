@@ -2,7 +2,7 @@
 
 Run a CTFd competition from YAML. Deploy challenges with one command, provision per-team container instances, and detect flag sharing. The CLI talks to a monitor service that writes CTFd's MariaDB directly, so no CTFd API key is needed.
 
-> Tested against CTFd 3.7.3. Run `nervctf probe` after a CTFd upgrade.
+> Tested against CTFd 3.7.3. After a CTFd upgrade, run `nervctf probe --refresh` before the next deploy.
 
 ## How it works
 
@@ -27,11 +27,13 @@ nix develop .# --command cargo build --release
 ## Quick start
 
 ```sh
-nervctf setup       # provision CTFd, the plugin, and the monitor
-nervctf validate    # check challenge files locally
-nervctf deploy      # sync challenges to CTFd
-nervctf probe       # check CTFd compatibility
+nervctf setup
+nervctf validate
+nervctf probe --refresh   # optional: inspect (and refresh) CTFd compatibility
+nervctf deploy
 ```
+
+`deploy` reads the monitor's cached probe before its first write and aborts if dynamic scoring is broken. Run `probe --refresh` after a CTFd upgrade so that cache reflects the new schema; a plain `probe` shows the cached result.
 
 `setup` prompts for the host, SSH user, CTFd path, monitor port, token, SSH key, and the first CTFd admin account. It writes `.nervctf.yml` with mode `0600`, then completes CTFd's first-run setup, so the CTFd wizard does not appear.
 

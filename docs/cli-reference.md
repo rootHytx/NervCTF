@@ -132,6 +132,8 @@ nervctf probe [--refresh] [--json]
 
 Asks the monitor for its CTFd compatibility report. The monitor caches the result at startup; `--refresh` re-runs it against MariaDB.
 
+`deploy` reads this cached result before its first write. After a CTFd upgrade, run `probe --refresh` before `deploy`; otherwise deploy uses the probe from the monitor's startup, which may describe the old schema.
+
 | Capability | Covered |
 |---|---|
 | `cap_challenge_crud` | Challenge INSERT/UPDATE/DELETE |
